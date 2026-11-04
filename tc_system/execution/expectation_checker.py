@@ -342,3 +342,76 @@ def check_expectation(tc_record: dict, execution_result: dict) -> str:
         return status
     # Successful command delivery is necessary, never sufficient, for PASS.
     return verify_tc(tc_record, execution_result)["status"]
+
+
+def _status_line(out: str) -> str:
+    """The one output line that says what happened (full text, not cut)."""
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    for line in lines:
+        if any(m in line for m in ERROR_STATUS_MARKERS) or HOST_ERROR_RE.search(line) \
+                or KERNEL_ABORT_RE.search(line) or any(m in line for m in HOST_CRASH_MARKERS):
+            return line
+    return lines[0] if lines else "(출력 없음)"
+
+
+def error_cause(tc_record: dict, execution_result: dict) -> dict | None:
+    """Which step made a TC ERROR, and whose problem it is (Korean `kind`).
+
+    ERROR means "nothing was learned about the drive"; without naming the step
+    and the reason the terminal showed only "실행/인자 오류" and left the reader
+    to dig through the logs to decide whether to care.
+    """
+    steps = tc_record.get("steps", [])
+    results = {r["step_index"]: r for r in execution_result.get("step_results", [])}
+    for i, status in enumerate(check_step_expectations(tc_record, execution_result)):
+        r = results.get(i)
+        if status != "ERROR" or (r and r.get("blocked_reason")):
+            continue
+        step = steps[i]
+        out, code = str((r or {}).get("stdout", "")), (r or {}).get("exit_code")
+        actual = completion_status(r) if r else None
+        if not r or not r.get("started", True):
+            kind, detail = "환경", "SSH 배치가 중간에 끊겨 이 스텝은 장비에 전송되지 않음"
+        elif code in HOST_CRASH_EXIT_CODES or any(m in out for m in HOST_CRASH_MARKERS):
+            kind, detail = "호스트 도구", f"nvme-cli가 호스트에서 비정상 종료(exit {code}): {_status_line(out)}"
+        elif HOST_ERROR_RE.search(out):
+            kind, detail = "환경", f"호스트/장치 노드 오류: {_status_line(out)}"
+        elif expected_status(step) != "SUCCESS" and actual:
+            kind, detail = ("판정 보류", f"{expected_status(step)} 거부를 기대했는데 {actual}로 거부됨 — "
+                                         f"다른 필드(NSID 등)가 원인일 수 있어 결함으로 보지 않음: {_status_line(out)}")
+        elif _INVALID_STATUS_RE.search(out):
+            kind, detail = "인자", f"컨트롤러가 우리가 만든 인자를 거부: {_status_line(out)}"
+        else:
+            kind, detail = "판정 불가", f"완료 상태를 읽을 수 없음(exit {code}): {_status_line(out)}"
+        return {"step_index": i, "step": step.get("name") or step.get("opcode"), "phase": step.get("phase"),
+                "kind": kind, "detail": detail}
+    return None
+
+
+def describe_outcome(tc: dict) -> dict:
+    """{"verdict", "cause", "next"} in Korean: what the result means, why, and
+    what the tool does about it - the three things a reader has to decide on."""
+    status = tc.get("status")
+    execution = tc.get("execution") or {}
+    verification = tc.get("verification") or {}
+    if status == "PASS":
+        return {"verdict": "스펙 요구사항 검증 통과", "cause": None, "next": "조치 없음"}
+    if status == "FAIL":
+        violated = [c for c in execution.get("criteria_results", []) if c.get("result") == "violated"]
+        cause = "; ".join(f"{c.get('criterion')}: {c.get('detail')}" for c in violated[:3]) or None
+        return {"verdict": "장비 결함 후보 — 스펙과 다른 동작이나 행이 관측됨", "cause": cause,
+                "next": "LLM 판정(verdict)과 원시 응답을 엔지니어가 확인"}
+    if status == "UNSUPPORTED":
+        return {"verdict": "드라이브가 이 커맨드를 구현하지 않음(INVALID_OPCODE)", "cause": None,
+                "next": "선택(O) 기능이면 정상. 필수(M)라면 결함 후보이니 스펙의 M/O 표를 확인"}
+    if status == "UNVERIFIED":
+        issues = verification.get("issues") or []
+        return {"verdict": "명령은 정상 완료됐지만 요구사항을 입증하지 못함 — 결함 아님",
+                "cause": "; ".join(issues) or None,
+                "next": "커버리지에 넣지 않고, 다음 실행에서 다른 요구사항/방식으로 다시 시도"}
+    cause = execution.get("error_cause")
+    where = (f"스텝 {cause['step_index']} {cause['step']}({cause['phase']}) — [{cause['kind']}] {cause['detail']}"
+             if cause else (execution.get("args_rejected") or execution.get("host_tool_crash")))
+    return {"verdict": "장비 결함으로 보지 않음 — 우리 쪽 인자/환경 문제로 이 TC는 검증되지 않음",
+            "cause": where,
+            "next": "커버리지에 넣지 않고 다음 실행에서 다시 시도(3회 넘게 실패하면 후순위로 밀림)"}

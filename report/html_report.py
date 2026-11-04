@@ -3,6 +3,7 @@ import json
 
 import config
 from report import components as c
+from tc_system.execution.expectation_checker import describe_outcome
 from tc_system.verification import verify_tc
 
 SOURCE_LABELS = {"qst": "QST", "pulsefz": "PULSEFZ", "tc_exec": "TC 자동생성 실행 결과"}
@@ -63,6 +64,10 @@ def _tc_evidence(tc):
             _json(req["results"]),
         ])
     body = '<p><strong>시나리오</strong>: ' + c.esc((tc.get("scenario") or {}).get("description", "")) + '</p>'
+    outcome = describe_outcome(tc)
+    for label, key in (("판단", "verdict"), ("원인", "cause"), ("다음", "next")):
+        if outcome.get(key):
+            body += f'<p><strong>{label}</strong>: ' + c.esc(outcome[key]) + '</p>'
     notes = (tc.get("scenario") or {}).get("out_of_scope", [])
     if notes:
         body += '<p><strong>이 TC가 검증하지 않는 범위</strong></p><ul>' + "".join(

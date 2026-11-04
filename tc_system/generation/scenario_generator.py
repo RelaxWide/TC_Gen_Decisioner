@@ -25,7 +25,8 @@ SCENARIO_SCHEMA = {
                        "If steps_plan has only the action step, this can repeat description."),
     "requirements": (
         'array of {"description": Korean string, "evidence_id": supplied evidence ID, '
-        '"quote": exact verbatim spec text (at least 20 characters), "checks": [check objects]}. '
+        '"quote": one contiguous English sentence or table row copied exactly from that evidence block '
+        '(never translated or paraphrased; at least 20 characters), "checks": [check objects]}. '
         'Each requirement needs executable checks. A check has "kind" and zero-based "step". '
         'Allowed kinds: completion (compare with step.expected_status); '
         'result_bits (CQE DW0: mask, value, operator eq/ne/le/ge); '

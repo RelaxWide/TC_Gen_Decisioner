@@ -11,7 +11,7 @@ from shared.ids import stable_id
 from tc_system.coverage.coverage_state import compute_coverage, pick_next_targets
 from tc_system.coverage.spec_coverage_index import SpecCoverageIndexFile
 from tc_system.execution.expectation_checker import (check_expectation, check_execution, check_step_expectations,
-                                                      device_hung, evaluate_criteria, host_tool_crash,
+                                                      device_hung, error_cause, evaluate_criteria, host_tool_crash,
                                                       rejected_arguments, unsupported_opcode)
 from shared.llm_client import LLMCallError
 from tc_system.execution.ssh_runner import DestructiveStepBlocked, device_responsive, probe_device_capabilities
@@ -425,6 +425,9 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
             "dmesg_text": execution.get("dmesg_text", ""),
             "batch_stderr": execution.get("batch_stderr", ""),
             "timed_out": execution.get("timed_out", False),
+            # Which step made an ERROR and whose problem it is - shown by the
+            # terminal and the report so the reader need not dig through logs.
+            "error_cause": error_cause(tc, execution) if tc["status"] == "ERROR" else None,
         }
         executed.append(tc)
 

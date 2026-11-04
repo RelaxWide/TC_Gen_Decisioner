@@ -6,6 +6,7 @@ successful assertion. Citations prove provenance, not the model's interpretation
 the report exposes the quote, encoded request, observation and comparison.
 """
 import re
+import unicodedata
 
 from shared.ids import stable_id
 from shared.spec_evidence import plain_text
@@ -33,6 +34,35 @@ HOST_ERROR_RE = re.compile(
 # the command - a hang caught by the kernel instead of by the SSH timeout
 # (nvme_core.io_timeout defaults to 30s, the same as one step's SSH budget).
 KERNEL_ABORT_RE = re.compile(r"Interrupted system call|Input/output error", re.I)
+
+
+MIN_QUOTE_CHARS = 20   # letters/digits in the whole quote
+MIN_SEGMENT_CHARS = 8  # letters/digits in each "..."-separated piece
+
+
+def _quote_key(text):
+    """Letters and digits only, case-folded. The evidence carries table pipes,
+    OCR'd LaTeX ("LBA $ _{s} $"), curly quotes and en dashes; a model copying
+    the sentence writes "LBAs", "'" and "-". Same words in the same order is
+    what provenance needs - a translation or paraphrase still fails."""
+    text = unicodedata.normalize("NFKC", plain_text(text)).casefold()
+    return re.sub(r"[^0-9a-z]", "", text)
+
+
+def quote_in(quote, text):
+    """True when `quote` (pieces joined by "..." allowed, in order) occurs in `text`."""
+    quote = unicodedata.normalize("NFKC", str(quote or ""))
+    pieces = [_quote_key(p) for p in re.split(r"\.\.\.+", quote)]
+    pieces = [p for p in pieces if p]
+    if sum(map(len, pieces)) < MIN_QUOTE_CHARS or any(len(p) < MIN_SEGMENT_CHARS for p in pieces):
+        return False
+    haystack, pos = _quote_key(text), 0
+    for piece in pieces:
+        found = haystack.find(piece, pos)
+        if found < 0:
+            return False
+        pos = found + len(piece)
+    return True
 
 
 def integer(value):
@@ -257,13 +287,22 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
     requirements = structured.get("requirements")
     if not isinstance(requirements, list) or not requirements:
         raise ValueError("a scenario needs at least one cited, executable requirement")
-    for req in requirements:
+    for n, req in enumerate(requirements):
         if not isinstance(req, dict):
             raise ValueError("requirement must be an object")
-        block = evidence_by_id.get(req.get("evidence_id"))
         quote = plain_text(req.get("quote", ""))
-        if block is None or len(quote) < 20 or quote not in plain_text(block["text"]):
-            raise ValueError("requirement quote does not occur in its supplied evidence")
+        block = evidence_by_id.get(req.get("evidence_id"))
+        if block is None or not quote_in(quote, block["text"]):
+            # The quote is what proves provenance; a wrong evidence_id label on
+            # a quote that is in another supplied block is just a mislabel.
+            block = next((e for e in evidence if e.get("evidence_id") and quote_in(quote, e["text"])), None)
+            if block is None:
+                raise ValueError(
+                    f"requirements[{n}].quote was not found in the supplied evidence: {quote[:120]!r}. "
+                    "Copy one contiguous English sentence or table row exactly as written in an "
+                    "evidence block (no translation or paraphrase; join pieces only with '...') "
+                    "and give that block's evidence_id")
+            req["evidence_id"] = block["evidence_id"]
         if not isinstance(req.get("description"), str) or not req["description"].strip():
             raise ValueError("requirement needs a description")
         checks = req.get("checks")
@@ -422,8 +461,7 @@ def verify_tc(tc, execution):
     for req in contract["requirements"]:
         checks = [evaluate_check(c, steps, results) for c in req.get("checks", [])]
         block = evidence.get(req.get("evidence_id"))
-        grounded = bool(block and len(plain_text(req.get("quote", ""))) >= 20 and
-                        plain_text(req["quote"]) in plain_text(block["text"]))
+        grounded = bool(block and quote_in(req.get("quote", ""), block["text"]))
         if not grounded or issues or not preconditions_ok:
             status = "UNVERIFIED"
         elif any(c["result"] == "violated" for c in checks):

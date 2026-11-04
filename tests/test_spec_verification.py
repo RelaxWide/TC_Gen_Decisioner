@@ -496,3 +496,51 @@ class TestComparedDataIsTheSameData(unittest.TestCase):
 
     def test_a_zero_filled_write_is_never_satisfied(self):
         self.assertEqual(self._evaluate(_io("0x02", slba=0), write_payload=None)["result"], "unevaluated")
+
+
+
+# --- Quote provenance: same words in order, not byte-identical formatting ---
+
+class TestQuoteMatching(unittest.TestCase):
+    def setUp(self):
+        self.text = spec_evidence.clause_catalog()["nvm:4.2.1"]["text"]
+
+    def test_ocr_latex_and_table_pipes_do_not_break_a_faithful_quote(self):
+        from tc_system.verification import quote_in
+        self.assertIn("LBA $ _{s} $", self.text)  # what the evidence really contains
+        self.assertTrue(quote_in("Return tracked allocated LBAs in the specified range", self.text))
+        self.assertTrue(quote_in("MNDW: This is a 0\u2019s based value \u2013 in dwords.",
+                                 "MNDW: This is a 0's based value - in dwords."))
+
+    def test_translation_or_paraphrase_still_fails(self):
+        from tc_system.verification import quote_in
+        self.assertFalse(quote_in("지정된 범위에서 추적된 할당 LBA를 반환한다", self.text))
+        self.assertFalse(quote_in("Returns the allocated LBAs that are tracked in a range", self.text))
+
+    def test_pieces_joined_with_an_ellipsis_must_appear_in_order(self):
+        from tc_system.verification import quote_in
+        self.assertTrue(quote_in("The Get LBA Status command requests ... the LBA Status Descriptor List", self.text))
+        self.assertFalse(quote_in("the LBA Status Descriptor List ... The Get LBA Status command requests", self.text))
+        self.assertFalse(quote_in("Get LBA Status ... is", self.text))  # tiny pieces prove nothing
+
+    def test_a_mislabelled_evidence_id_is_corrected_not_rejected(self):
+        tc, _ = fixture()
+        evidence = [{"evidence_id": "other", "text": "unrelated text " * 5},
+                    {"evidence_id": "source", "text": QUOTE}]
+        structured = {"steps_plan": [{"opcode_name": "Get Features", "phase": "action", "expected_status": "SUCCESS",
+                                      "field_constraints": [{"field": "cdw10", "mask": "0x7ff", "value": "0x37d"}]}],
+                      "requirements": [{"evidence_id": "other", "quote": QUOTE, "description": "d",
+                                        "checks": [{"kind": "completion", "step": 0}]}],
+                      "preconditions": [], "precondition_checks": []}
+        ops = [{"name": "Get Features", "raw_opcode": "0x0a", "command_set": "ADMIN"}]
+        validate_plan_contract(structured, evidence, "base:5.2.11", ops)
+        self.assertEqual(structured["requirements"][0]["evidence_id"], "source")
+
+    def test_an_unfound_quote_names_itself_so_the_retry_can_fix_it(self):
+        structured = {"steps_plan": [{"opcode_name": "Get Features", "phase": "action", "expected_status": "SUCCESS",
+                                      "field_constraints": [{"field": "cdw10", "mask": "0x7ff", "value": "0x37d"}]}],
+                      "requirements": [{"evidence_id": "source", "quote": "An invented sentence absent from it.",
+                                        "description": "d", "checks": [{"kind": "completion", "step": 0}]}]}
+        ops = [{"name": "Get Features", "raw_opcode": "0x0a", "command_set": "ADMIN"}]
+        with self.assertRaisesRegex(ValueError, r"requirements\[0\]\.quote .*An invented sentence"):
+            validate_plan_contract(structured, [{"evidence_id": "source", "text": QUOTE}], "base:5.2.11", ops)

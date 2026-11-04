@@ -401,5 +401,45 @@ class TestCheckStepExpectationsContinued(unittest.TestCase):
         self.assertEqual(check_expectation(TC, result), "UNVERIFIED")
 
 
+
+class TestOutcomeIsExplained(unittest.TestCase):
+    """ERROR used to print only "실행/인자 오류" + "스펙 검증: UNVERIFIED"."""
+
+    def _tc(self, stdout, code=22, expected="SUCCESS"):
+        from tc_system.execution.expectation_checker import check_expectation, error_cause
+        tc = {"steps": [{"name": "Get Log Page", "phase": "action", "opcode": "0x02", "direction": "read",
+                         "data_len": 512, "expected_status": expected}]}
+        execution = {"step_results": [{"step_index": 0, "exit_code": code, "stdout": stdout, "started": True}]}
+        tc["status"] = check_expectation(tc, execution)
+        tc["execution"] = {"error_cause": error_cause(tc, execution)}
+        return tc
+
+    def test_rejected_arguments_name_the_step_and_the_controller_status(self):
+        from tc_system.execution.expectation_checker import describe_outcome
+        tc = self._tc("NVMe status: INVALID_FIELD: A reserved coded value or an unsupported value(0x2)")
+        self.assertEqual(tc["status"], "ERROR")
+        self.assertEqual(tc["execution"]["error_cause"]["kind"], "인자")
+        outcome = describe_outcome(tc)
+        self.assertIn("장비 결함으로 보지 않음", outcome["verdict"])
+        self.assertIn("스텝 0 Get Log Page(action)", outcome["cause"])
+        self.assertIn("INVALID_FIELD", outcome["cause"])
+        self.assertIn("다시 시도", outcome["next"])
+
+    def test_host_errors_are_the_environment(self):
+        tc = self._tc("/dev/nvme0: No such file or directory", code=2)
+        self.assertEqual(tc["execution"]["error_cause"]["kind"], "환경")
+
+    def test_a_different_rejection_in_a_negative_test_is_held(self):
+        tc = self._tc("NVMe status: INVALID_NS: x(0xb)", expected="INVALID_FIELD")
+        self.assertEqual(tc["execution"]["error_cause"]["kind"], "판정 보류")
+
+    def test_every_status_gets_a_verdict_and_a_next_step(self):
+        from tc_system.execution.expectation_checker import describe_outcome
+        for status in ("PASS", "FAIL", "UNSUPPORTED", "UNVERIFIED", "ERROR"):
+            with self.subTest(status=status):
+                outcome = describe_outcome({"status": status})
+                self.assertTrue(outcome["verdict"] and outcome["next"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ import textwrap
 import time
 
 from shared.run_log import capture_to_file
+from tc_system.execution.expectation_checker import describe_outcome
 from tc_system.execution.ssh_runner import DestructiveStepBlocked, passthru_cmd
 from tc_system.pipeline import run_pipeline
 
@@ -128,27 +129,27 @@ def _print_result(index, total, tc):
 
     execution = tc.get("execution") or {}
     verification = tc.get("verification") or {}
-    print(f"     스펙 검증: {verification.get('status', 'UNVERIFIED')}")
-    for req in verification.get("requirements", []):
-        _dual_label("     ", req["status"], req["description"])
-        for check in req.get("results", []):
-            _dual_label("       ", check["result"], check["detail"])
-    for issue in verification.get("issues", []):
-        _dual_label("     ", "미검증 사유", issue)
+    # What it means, why, and what happens next - in that order. A bare
+    # "실행/인자 오류" + "스펙 검증: UNVERIFIED" left the reader to work out
+    # whether the drive or the harness was at fault.
+    outcome = describe_outcome(tc)
+    _dual_label("     ", "판단", outcome["verdict"])
+    _dual_label("     ", "원인", outcome["cause"], width=110)
+    _dual_label("     ", "다음", outcome["next"])
+    if status in ("PASS", "FAIL", "UNVERIFIED"):
+        # The commands completed, so the requirement checks were evaluated.
+        print(f"     스펙 검증: {verification.get('status', 'UNVERIFIED')}")
+        for req in verification.get("requirements", []):
+            _dual_label("     ", req["status"], req["description"])
+            for check in req.get("results", []):
+                _dual_label("       ", check["result"], check["detail"])
+    else:
+        # ERROR/UNSUPPORTED: nothing was evaluated; per-check "unevaluated"
+        # lines would only repeat that. Show what the TC set out to verify.
+        for req in verification.get("requirements", []):
+            _dual_label("     ", "검증하려던 요구사항", req["description"])
     for note in (tc.get("scenario") or {}).get("out_of_scope", []):
         _dual_label("     ", "검증 범위 밖", note)
-    reason = execution.get("args_rejected") or execution.get("host_tool_crash")
-    _dual_label("     ", "사유", reason, width=110)
-    if status == "UNSUPPORTED":
-        # evaluate_criteria runs the generic rules regardless of status, so
-        # "exit code != 0" always fires here too — that's expected for an
-        # unimplemented command and not a real violation, so it's not shown.
-        print("     (미지원 응답 관측 — 필수/선택 기능의 스펙 적합성을 뜻하지 않음)")
-    elif status == "FAIL":
-        violated = [c for c in execution.get("criteria_results", []) if c["result"] == "violated"]
-        for c in violated:
-            _dual_line(f"     위반: {c['criterion']} — {_one_line(c['detail'], width=100)}",
-                       f"     위반: {c['criterion']} — {c['detail']}")
 
     # Printed for either FAIL or ERROR — both get judged (pipeline.py routes
     # anything not already caught as a host crash/rejection to judge_failure_context
