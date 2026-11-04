@@ -9,11 +9,11 @@ Good enough for command-name-shaped queries; not a replacement for the real
 vector search once that's wired in.
 """
 import json
+import re
 from functools import lru_cache
 
 import config
 
-_RELEVANT_CONTENT_CHARS = 2000
 
 
 def _resolve_index_dir():
@@ -77,13 +77,18 @@ def search_chunks(query_text: str, top_k: int = 5, doc_filter: list[str] | None 
     scored.sort(key=lambda sc: sc[0], reverse=True)
     results = []
     for score, chunk in scored[:top_k]:
+        title = _doc_title(chunk)
+        prefix = ("nvm" if "NVM-Command-Set" in title else "mi" if "Management-Interface" in title
+                  else "base" if "Base-Specification" in title else "tcg")
+        sections = [f"{prefix}:{s}" for s in re.findall(r"^#{1,6}\s*(\d+(?:\.\d+)*)\s+", chunk.get("content", ""), re.M)]
         results.append({
             "chunk_id": chunk.get("doc_id"),
             "doc": _doc_title(chunk),
-            "section_id": chunk.get("doc_id"),
+            "section_id": sections[0] if len(sections) == 1 else None,
+            "section_ids": sections,
             "title": chunk.get("title"),
             "covers_commands": chunk.get("covers_commands") or [],
-            "text": chunk.get("content", "")[:_RELEVANT_CONTENT_CHARS],
+            "text": chunk.get("content", ""),
             "score": round(score, 2),
         })
     return results

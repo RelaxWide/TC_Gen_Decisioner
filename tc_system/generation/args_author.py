@@ -16,6 +16,11 @@ Power Management) while still emitting a valid value. Keep it for the report,
 do not rely on it.
 """
 import re
+import json
+
+from shared.spec_evidence import format_evidence
+from tc_system.command_fields import verify_selectors, validate_transfer
+from tc_system.verification import validate_fixed_fields, integer, payload_for_step
 
 from shared.llm_client import LLMCallError, generate_llm_response
 from shared.rag_client import generate_rag_response
@@ -34,67 +39,25 @@ def _opcode_data_transfer(raw_opcode: str) -> str | None:
     return _OPCODE_DIRECTION_BITS.get(int(raw_opcode, 16) & 0b11)
 
 
-# Fields the HOST chooses and writes into CDW10 bits 7:0 before sending the
-# command — a genuine, stable NVMe convention for all of these (Get Log
-# Page's LID, Get/Set Features' FID, Identify's CNS, and CDW10[7:0] as a
-# generic sub-operation selector on the single-purpose admin commands that
-# define "Management Operation"/"Directive Operation"/etc.), so a mismatch
-# here is an unambiguous authoring mistake, not a question of interpretation.
-# Validate this empirically against real hardware before trusting it for a
-# newly-added field name — same caveat as this project's other hard-coded
-# per-command conventions (direction bits, nsid allow-list).
-#
-# "Event Type" is deliberately NOT in this set: it classifies events the
-# controller already logged, discovered only by parsing the *returned* log
-# payload — there is no CDW10/11/12 bit pattern that says "only give me
-# Event Type 02h entries." A clause requiring a specific Event Type can still
-# be linked to its opcode (see build_spec_index.py's `link_field_values`) so
-# it shows up in coverage, but it can never be marked `field_value_verified`
-# the way a request-side field can.
-#
-# "Action Type" is deliberately NOT in this set either, for a different
-# reason: it IS host-selected, but not in CDW10. Get LBA Status — the only
-# command whose clauses carry it in the index — defines ATYPE as Command
-# Dword 13 bits 31:24 (checked against the spec chunks), while CDW10 is the
-# low half of the Starting LBA. Checking it against CDW10 bits 7:0 forced the
-# model to overwrite SLBA with the ATYPE value, so every such TC went out
-# malformed. This harness only sends CDW10-12 (`ssh_runner.passthru_cmd`), so
-# there is no CDW13 to verify it in at all.
-REQUEST_SELECTABLE_FIELDS = {
-    "Log Page Identifier", "Feature Identifier", "CNS", "Management Operation",
-    "Directive Operation", "Directive Type", "Configuration Identifier",
-}
-
-
-def _verify_field_values(cdw10: str, required_field_values: list[dict] | None) -> bool:
-    """Returns True only if every entry in `required_field_values` is both
-    request-selectable (see `REQUEST_SELECTABLE_FIELDS`) and matches the
-    value actually placed in CDW10 bits 7:0 — the deterministic signal
-    `expectation_checker` uses to tell "this drive doesn't implement this
-    specific value" (a real finding) apart from "we authored a malformed
-    argument" (our bug). Still deterministically checks — and rejects on
-    mismatch — every selectable entry even when an unselectable one (like
-    Event Type) means the overall clause can't be fully verified; getting a
-    checkable field wrong is a real, catchable mistake either way."""
-    if not required_field_values:
-        return False
-    cdw10_byte = int(cdw10, 16) & 0xFF
-    all_selectable = True
-    for entry in required_field_values:
-        if entry["field_name"] not in REQUEST_SELECTABLE_FIELDS:
-            all_selectable = False
-            continue
-        if cdw10_byte != int(entry["hex_value"], 16):
-            raise ArgsAuthoringError(
-                f"clause requires {entry['field_name']}={entry['hex_value']} in CDW10 bits 7:0, "
-                f"but cdw10={cdw10} encodes 0x{cdw10_byte:02X}")
-    return all_selectable
+# Compatibility helper for callers with the original CDW10-only API. Runtime
+# authoring uses verify_selectors with the actual command set/opcode/registers.
+def _verify_field_values(cdw10, required_field_values):
+    names = {e["field_name"] for e in required_field_values or []}
+    opcode = "0x06" if "CNS" in names else "0x0A" if "Feature Identifier" in names else "0x02"
+    try:
+        return verify_selectors({"cdw10": cdw10}, {"command_set": "ADMIN", "raw_opcode": opcode},
+                                required_field_values)
+    except ValueError as exc:
+        raise ArgsAuthoringError(str(exc)) from exc
 
 
 ARGS_SCHEMA = {
     "cdw10": 'hex string, e.g. "0x00000001" — the CDW10 value for this command',
     "cdw11": 'hex string, e.g. "0x00000000"',
     "cdw12": 'hex string, e.g. "0x00000000"',
+    "cdw13": 'hex string, zero if reserved',
+    "cdw14": 'hex string, zero if reserved',
+    "cdw15": 'hex string, zero if reserved',
     "data_len": "integer — bytes this command transfers, 0 if it transfers none",
     "direction": '"read" (device-to-host), "write" (host-to-device), or "none"',
     "nsid": "integer — the command's Namespace Identifier field; see system prompt for the allowed values",
@@ -107,8 +70,8 @@ ARGS_SCHEMA = {
 
 SYSTEM_PROMPT = (
     "You are an NVMe firmware test engineer. Given specification text for one command, "
-    "produce a concrete set of command dword values that a real NVMe controller will accept. "
-    "Choose the simplest well-defined variant of the command. Never use reserved or "
+    "produce the concrete command dword values required by TEST_INTENT. "
+    "Choose the specified variant, even when it deliberately expects rejection. Avoid reserved or "
     "vendor-specific field values. If the command requires a data buffer, give its correct "
     "length in bytes; if it transfers no data, use data_len 0 and direction \"none\".\n\n"
     "CRITICAL: when a CDW field encodes a transfer length as a NUMBER OF DWORDS "
@@ -139,19 +102,20 @@ SYSTEM_PROMPT = (
     "this real target (not spec generalities) — ground field values in it: keep LBA addresses "
     "inside the reported namespace size, pick only a Sanitize action its SANICAP bits actually "
     "report, and keep a Power State value within its reported range.\n\n"
-    "FIRMWARE: Firmware Image Download sends a zero-filled dummy buffer — there is no real signed "
-    "firmware image to transmit, so do not describe the downloaded content as valid firmware in "
-    "field_breakdown. For Firmware Commit, choose the Commit Action (CDW10 bits 2:0) deliberately: "
-    "0 only stages the dummy image into the slot without activating it; 1/2/3/6/7 activate it "
-    "(immediately or at the next reset). This harness treats an activating commit that the "
-    "controller accepts (rather than rejecting the invalid image) as the serious finding it is, "
-    "so pick whichever Commit Action the clause under test actually calls for — do not default to "
-    "0 just to avoid activation.\n\n"
-    "REQUIRED_FIELD_VALUE: if the prompt includes a required_field_value line, this exact clause "
-    "is about one specific value of an enumerated field (e.g. Log Page Identifier, Feature "
-    "Identifier, CNS, Management Operation) — put that exact value in CDW10 bits 7:0, not a "
-    "different well-defined value for the same command. This is what makes this TC about THIS "
-    "clause specifically rather than some other value of the same command."
+    "FIRMWARE: Firmware Commit CDW10 CA is bits 5:3; FS is bits 2:0. CA=0 replaces "
+    "without activation, 1 replaces/activates on reset, 2 activates an EXISTING slot, "
+    "3 replaces/activates immediately, 6 replaces a boot partition, 7 marks it active. "
+    "Do not infer invalid image acceptance without evidence of the actual preceding download.\n\n"
+    "TEST_INTENT: the scenario, this step's role, checks and field_constraints define the test. "
+    "Preserve them exactly, INCLUDING during retries. Never switch FID/LID/CNS, address or expected "
+    "outcome to make a different command succeed. Negative tests deliberately expect an error; "
+    "do not turn them into positive tests. If the fixed constraints cannot be encoded, report the "
+    "conflict rather than substituting another test. prior_steps are planned values, NOT measured "
+    "facts or proof that a prior command succeeded.\n\n"
+    "REQUIRED_FIELD_VALUE: encode the clause's selector in its actual spec-defined register. "
+    "LID/FID/CNS are CDW10[7:0]; Directive DOPER=CDW11[7:0], DTYPE=CDW11[15:8]; "
+    "Get LBA Status ATYPE=CDW13[31:24]. Event Type is an observed log value, not a CDW selector."
+
 )
 
 
@@ -160,7 +124,9 @@ class ArgsAuthoringError(RuntimeError):
 
 
 def _normalize_hex(value, field: str) -> str:
-    text = str(value).strip()
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ArgsAuthoringError(f"{field} is not a 32-bit hex value: {value!r}")
+    text = hex(value) if isinstance(value, int) else value.strip()
     # Case-insensitive on the prefix: a reply of "0XABCD" would otherwise get a
     # second prefix glued on ("0x0XABCD") and be rejected as malformed.
     if not text.lower().startswith("0x"):
@@ -171,10 +137,11 @@ def _normalize_hex(value, field: str) -> str:
 
 
 def _author_once(prompt: str, opcode_entry: dict, active_nsid: int,
-                  required_field_values: list[dict] | None = None) -> dict:
+                  required_field_values: list[dict] | None = None, test_intent: dict | None = None) -> dict:
     try:
-        structured = generate_llm_response(prompt, system=SYSTEM_PROMPT,
-                                            response_schema=ARGS_SCHEMA, caller="args_author")["structured"]
+        llm = generate_llm_response(prompt, system=SYSTEM_PROMPT,
+                                            response_schema=ARGS_SCHEMA, caller="args_author")
+        structured = llm["structured"]
     except LLMCallError as exc:
         raise ArgsAuthoringError(f"LLM could not author args: {exc}") from exc
 
@@ -198,7 +165,7 @@ def _author_once(prompt: str, opcode_entry: dict, active_nsid: int,
             f"direction={direction!r} conflicts with opcode {opcode_entry['raw_opcode']}'s own "
             f"encoded transfer direction (bits 1:0 require {expected!r})")
     try:
-        nsid = int(structured["nsid"])
+        nsid = integer(structured["nsid"])
     except (TypeError, ValueError) as exc:
         raise ArgsAuthoringError(f"invalid nsid: {structured['nsid']!r}") from exc
     # Hardcoding nsid=0 for every admin command (as this once did) broke any
@@ -217,7 +184,7 @@ def _author_once(prompt: str, opcode_entry: dict, active_nsid: int,
             f"0 (not namespace-specific), {active_nsid} (this target's active namespace), "
             "or 4294967295/0xFFFFFFFF (all namespaces)")
     try:
-        data_len = int(structured["data_len"])
+        data_len = integer(structured["data_len"])
     except (TypeError, ValueError) as exc:
         raise ArgsAuthoringError(f"invalid data_len: {structured['data_len']!r}") from exc
     if not 0 <= data_len <= MAX_DATA_LEN:
@@ -238,30 +205,29 @@ def _author_once(prompt: str, opcode_entry: dict, active_nsid: int,
     if not isinstance(shared_facts, dict):
         raise ArgsAuthoringError(f"shared_facts must be an object: {shared_facts!r}")
 
-    cdw10 = _normalize_hex(structured["cdw10"], "cdw10")
-    # Raises ArgsAuthoringError (caught by the same retry-with-feedback loop
-    # as every other check here) if a request-selectable entry's value isn't
-    # actually in CDW10 bits 7:0 — see _verify_field_values's own docstring
-    # for why an unselectable entry (Event Type) doesn't block this check for
-    # the entries that ARE selectable.
-    field_value_verified = _verify_field_values(cdw10, required_field_values)
-
-    return {
-        "cdw10": cdw10,
-        "cdw11": _normalize_hex(structured["cdw11"], "cdw11"),
-        "cdw12": _normalize_hex(structured["cdw12"], "cdw12"),
-        "data_len": data_len,
-        "direction": direction,
-        "nsid": nsid,
-        "shared_facts": dict(shared_facts),
-        "field_breakdown": str(structured["field_breakdown"]),
-        "field_value_verified": field_value_verified,
-    }
+    fields = {f"cdw{i}": _normalize_hex(structured.get(f"cdw{i}", "0x0"), f"cdw{i}")
+              for i in range(10, 16)}
+    fields.update(nsid=nsid, data_len=data_len, direction=direction)
+    try:
+        field_value_verified = verify_selectors(fields, opcode_entry, required_field_values)
+        validate_fixed_fields(fields, (test_intent or {}).get("field_constraints", []))
+        validate_transfer(fields, opcode_entry, lba_bytes=(test_intent or {}).get("lba_bytes"))
+        payload_hex = (test_intent or {}).get("payload_hex")
+        if payload_hex is not None and direction == "write":
+            # Caught here, inside the one-retry loop, instead of later in
+            # tc_writer where it skipped the whole target with no second try.
+            payload_for_step({"direction": direction, "data_len": data_len, "payload_hex": payload_hex})
+    except ValueError as exc:
+        raise ArgsAuthoringError(str(exc)) from exc
+    return dict(fields, shared_facts=dict(shared_facts),
+                field_breakdown=str(structured["field_breakdown"]),
+                field_value_verified=field_value_verified, llm_response_id=llm["response_id"])
 
 
 def author_args(section: dict, opcode_entry: dict, active_nsid: int,
                  prior_steps: list[dict] | None = None, rejected: dict | None = None,
-                 device_facts: str | None = None, required_field_values: list[dict] | None = None) -> dict:
+                 device_facts: str | None = None, required_field_values: list[dict] | None = None,
+                 test_intent: dict | None = None) -> dict:
     """`active_nsid` is the one real namespace this harness is wired to test
     (derived from the target's configured device path) — the model is told
     this and must pick 0, this value, or the explicit broadcast FFFFFFFFh,
@@ -292,7 +258,11 @@ def author_args(section: dict, opcode_entry: dict, active_nsid: int,
     self-report, the same way direction/nsid are checked rather than trusted."""
     rag = generate_rag_response(
         f"{opcode_entry['name']} command CDW fields and data buffer requirements",
-        top_k=4, doc_filter=[section["spec_doc"]])
+        top_k=4, doc_filter=[section["spec_doc"]], section=section, command_name=opcode_entry["name"],
+        # The command's own Command Dword figures first: a leaf clause such as
+        # "Return Allocated LBAs (Action Type 02h)" carries the value, not the
+        # register layout it has to be encoded into.
+        layout_ref=opcode_entry.get("section_ref"), purpose="args")
     if not rag["chunks"]:
         raise ArgsAuthoringError(f"no spec context found for {opcode_entry['name']}")
 
@@ -300,8 +270,10 @@ def author_args(section: dict, opcode_entry: dict, active_nsid: int,
         f"command={opcode_entry['name']} opcode={opcode_entry['raw_opcode']} "
         f"command_set={opcode_entry['command_set']} clause={section['section_id']} "
         f"active_nsid={active_nsid}\n\n"
-        "spec_context=\n" + "\n\n".join(c["text"] for c in rag["chunks"])
+        "spec_context=\n" + format_evidence(rag["chunks"])
     )
+    if test_intent:
+        prompt += "\n\nTEST_INTENT=" + json.dumps(test_intent, ensure_ascii=False)
     if device_facts:
         prompt += f"\n\ndevice_facts=\n{device_facts}"
     if required_field_values:
@@ -309,8 +281,8 @@ def author_args(section: dict, opcode_entry: dict, active_nsid: int,
         prompt += f"\n\nrequired_field_value={values_str}"
     if prior_steps:
         lines = "\n".join(
-            f"  step{p['step']}({p['phase']}, {p['opcode_name']}): {p['facts']}"
-            for p in prior_steps if p.get("facts")
+            f"  step{p['step']}({p['phase']}, {p['opcode_name']}): facts={p['facts']} encoded_fields={p.get('encoded_fields', {})}"
+            for p in prior_steps if p.get("facts") or p.get("encoded_fields")
         )
         if lines:
             prompt += (
@@ -325,11 +297,11 @@ def author_args(section: dict, opcode_entry: dict, active_nsid: int,
             f"  rejected: cdw10={step['cdw10']} cdw11={step['cdw11']} cdw12={step['cdw12']} "
             f"nsid={step['nsid']} data_len={step['data_len']} direction={step['direction']}\n"
             f"  controller said: {rejected['reason']}\n"
-            "Pick different, explicitly-defined field values — a reserved or unsupported "
+            "Keep TEST_INTENT and every field constraint unchanged. Correct only other fields — a reserved or unsupported "
             "identifier in any field causes exactly this rejection."
         )
     try:
-        return _author_once(prompt, opcode_entry, active_nsid, required_field_values=required_field_values)
+        return _author_once(prompt, opcode_entry, active_nsid, required_field_values=required_field_values, test_intent=test_intent)
     except ArgsAuthoringError as exc:
         # The mistake here (bad direction, bad nsid, out-of-range length, ...)
         # is the LLM's own and was never sent anywhere — nothing about the
@@ -344,4 +316,4 @@ def author_args(section: dict, opcode_entry: dict, active_nsid: int,
             f"\n\nYour previous reply was INVALID: {exc}\n"
             "Fix exactly that problem and reply again with the full set of values."
         )
-        return _author_once(retry_prompt, opcode_entry, active_nsid, required_field_values=required_field_values)
+        return _author_once(retry_prompt, opcode_entry, active_nsid, required_field_values=required_field_values, test_intent=test_intent)

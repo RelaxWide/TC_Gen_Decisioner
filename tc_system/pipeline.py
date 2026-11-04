@@ -1,4 +1,5 @@
 import shutil
+from copy import deepcopy
 from datetime import datetime, timezone
 
 import config
@@ -9,16 +10,25 @@ from shared.file_store import load_json, save_json_atomic
 from shared.ids import stable_id
 from tc_system.coverage.coverage_state import compute_coverage, pick_next_targets
 from tc_system.coverage.spec_coverage_index import SpecCoverageIndexFile
-from tc_system.execution.expectation_checker import (check_expectation, check_step_expectations,
-                                                      evaluate_criteria, host_tool_crash,
+from tc_system.execution.expectation_checker import (check_expectation, check_execution, check_step_expectations,
+                                                      device_hung, evaluate_criteria, host_tool_crash,
                                                       rejected_arguments, unsupported_opcode)
 from shared.llm_client import LLMCallError
 from tc_system.execution.ssh_runner import DestructiveStepBlocked, device_responsive, probe_device_capabilities
 from tc_system.execution.tc_executor import SSHTCExecutor
-from tc_system.generation.device_capabilities import summarize_device_capabilities
+from tc_system.generation.device_capabilities import in_use_lba_bytes, summarize_device_capabilities
 from tc_system.generation.scenario_generator import generate_scenario
 from tc_system.generation.tc_writer import build_tc, namespace_id_from_device_path, reauthor_steps
 from tc_system.store import tc_store
+from tc_system.verification import verify_tc
+
+
+def _execute_attempt(tc, executor, attempts):
+    tc["active_attempt_id"] = stable_id("attempt", tc["tc_id"], str(len(attempts)))
+    result = executor.execute(tc)
+    attempts.append({"attempt_id": tc["active_attempt_id"], "steps": deepcopy(tc["steps"]),
+                     "execution": deepcopy(result)})
+    return result
 
 
 def _build_tc_exec_failure_context(tc: dict, execution: dict) -> dict:
@@ -53,6 +63,9 @@ def _build_tc_exec_failure_context(tc: dict, execution: dict) -> dict:
             "step_statuses": tc.get("step_statuses", []),
             "dmesg_signals": dmesg_signals,
             "dmesg_captured_scoped": execution.get("dmesg_captured_scoped", True),
+            "test_definition": {"scenario": tc.get("scenario"), "steps": tc["steps"],
+                                "contract": tc.get("verification_contract"),
+                                "verification": tc.get("verification")},
         },
         dmesg_file=None,
         dmesg_excerpt=execution["dmesg_text"],
@@ -90,38 +103,11 @@ def _resolve_steps_plan(index, steps_plan: list[dict], available_opcodes: list[d
         else:
             section = index.get_section(opcode_entry["section_ref"]) or fallback_section
         resolved.append({"section": section, "opcode_entry": opcode_entry,
-                          "phase": entry["phase"], "role": entry.get("role", "")})
+                          "phase": entry["phase"], "role": entry.get("role", ""),
+                          "field_constraints": entry.get("field_constraints", []),
+                          "expected_status": entry.get("expected_status", "SUCCESS"),
+                          "payload_hex": entry.get("payload_hex")})
     return resolved
-
-
-def _reset_tc_exec_judgments() -> None:
-    """Each run starts the TC_EXEC judgment trail fresh instead of
-    accumulating every verdict ever produced across every invocation —
-    `data/verdicts/tc_exec.json` otherwise only ever grows. `tc_store.json`/
-    `coverage_state.json` are deliberately NOT touched here: coverage is
-    meant to accumulate across runs; only the detailed judgment history
-    (which is cheap to regenerate by re-judging) resets. Any TC record whose
-    `verdict_id`/`failure_context_id` pointed at what was just deleted has
-    that stale reference cleared too, so nothing in the store points at a
-    file that no longer exists.
-    """
-    save_json_atomic(config.VERDICTS_DIR / "tc_exec.json", [])
-    tc_exec_dir = config.FAILURE_CONTEXTS_DIR / "tc_exec"
-    if tc_exec_dir.exists():
-        for f in tc_exec_dir.glob("*.json"):
-            f.unlink()
-    records = tc_store.load_all()
-    changed = False
-    for tc in records:
-        # Both pops must run unconditionally — `or` short-circuiting here
-        # would skip clearing failure_context_id whenever verdict_id was
-        # already non-None, leaving exactly the dangling reference this
-        # function exists to clean up.
-        had_verdict = tc.pop("verdict_id", None) is not None
-        had_fc = tc.pop("failure_context_id", None) is not None
-        changed = changed or had_verdict or had_fc
-    if changed:
-        tc_store.save_all(records)
 
 
 def _reset_coverage() -> None:
@@ -129,13 +115,11 @@ def _reset_coverage() -> None:
     `--reset-coverage`, for when the physical drive under test changed.
 
     Coverage is meant to accumulate across runs *of the same device*
-    (that's the whole point of `_reset_tc_exec_judgments` leaving these two
+    (normal runs leave these two
     files alone). But nothing in them records which physical drive a TC's
     result came from, so swapping in a different drive without this makes
     the new drive silently inherit the old one's accumulated coverage —
-    including UNSUPPORTED verdicts, which are drive-specific — and
-    `pick_next_targets` sees nothing left to offer even though the new
-    device has never actually been touched.
+    including UNSUPPORTED observations, which are drive-specific.
 
     The previous files are copied to `<tc_store's folder>/coverage_backups/
     <UTC timestamp>/` first, not just overwritten — a mistaken
@@ -148,11 +132,22 @@ def _reset_coverage() -> None:
     backup_dir = (config.TC_STORE_PATH.parent / "coverage_backups"
                   / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     backup_dir.mkdir(parents=True, exist_ok=True)
-    for path in (config.TC_STORE_PATH, config.COVERAGE_STATE_PATH):
+    for path in (config.TC_STORE_PATH, config.COVERAGE_STATE_PATH, config.TARGET_SKIPS_PATH):
         if path.exists():
             shutil.copy2(path, backup_dir / path.name)
     save_json_atomic(config.TC_STORE_PATH, [])
     save_json_atomic(config.COVERAGE_STATE_PATH, {})
+    save_json_atomic(config.TARGET_SKIPS_PATH, [])
+
+
+def _record_skip(skipped: list, section: dict, opcode_entry: dict, reason: str, kind: str) -> None:
+    """A target that was tried but never reached the device. Persisted so the
+    next `pick_next_targets` counts it as an attempt and moves on."""
+    entry = {"section_id": section["section_id"], "opcode": opcode_entry["opcode"], "reason": reason}
+    skipped.append(entry)
+    log = load_json(config.TARGET_SKIPS_PATH, default=[])
+    log.append(dict(entry, kind=kind, at=datetime.now(timezone.utc).isoformat()))
+    save_json_atomic(config.TARGET_SKIPS_PATH, log)
 
 
 # What one bad LLM reply can raise on its way through generation or judging.
@@ -198,7 +193,8 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
     """
     if reset_coverage:
         _reset_coverage()
-    _reset_tc_exec_judgments()
+    # Keep per-attempt evidence and judgments across runs. IDs already identify
+    # individual attempts; deleting the trail made later audits impossible.
     index = SpecCoverageIndexFile(config.active_coverage_index_path())
     target = config.get_ssh_target()
     # The one real namespace this harness is configured to test, derived from
@@ -209,21 +205,30 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
         # Best-effort and run exactly once per batch, not once per TC: a probe
         # failure (unreachable target, an nvme-cli version missing a
         # subcommand) must never block the run it only exists to speed up.
-        device_facts = summarize_device_capabilities(
-            probe_device_capabilities(target["nvme_ctrl"], target["nvme_ns"]))
+        probe = probe_device_capabilities(target["nvme_ctrl"], target["nvme_ns"])
+        device_facts = summarize_device_capabilities(probe)
+        # Measured, not assumed: NVM Read/Write/Compare buffers are checked
+        # against NLB x this before anything reaches the wire.
+        lba_bytes = in_use_lba_bytes(probe)
     except Exception:
-        device_facts = None
+        device_facts, lba_bytes = None, None
     executor = executor or SSHTCExecutor(allow_destructive=allow_destructive)
     # ADMIN/NVM combos are allowed in one chain, so the model is always shown
     # the whole table, not just the primary target's own command_set.
     available_opcodes = index.list_opcodes()
 
     existing = tc_store.load_all()
-    targets = pick_next_targets(index, existing, count)
+    targets = pick_next_targets(index, existing, count,
+                                skip_records=load_json(config.TARGET_SKIPS_PATH, default=[]))
     total = len(targets)
 
     generated, executed, failed, host_crashes, unsupported, skipped = [], [], [], [], [], []
     for i, (section, opcode_entry) in enumerate(targets, start=1):
+        attempts = []
+        section = dict(section, previous_requirements=[
+            {"requirement_id": r["requirement_id"], "quote": r["quote"], "description": r["description"]}
+            for old in existing for r in (old.get("verification") or {}).get("requirements", [])
+            if r.get("section_id") == section["section_id"] and r.get("status") in ("PASS", "FAIL")])
         # Distinct per attempt: a stable (section, opcode) id would overwrite the
         # previous record on a re-run, orphaning its FailureContext and verdict.
         attempt_at = datetime.now(timezone.utc).isoformat()
@@ -232,7 +237,7 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
             scenario = generate_scenario(section, opcode_entry, available_opcodes, device_facts=device_facts)
             resolved_steps = _resolve_steps_plan(index, scenario["steps_plan"], available_opcodes, section)
             tc = build_tc(tc_id, resolved_steps, scenario, target["nvme_ctrl"], target["nvme_ns"], active_nsid,
-                           device_facts=device_facts)
+                           device_facts=device_facts, lba_bytes=lba_bytes)
         except _LLM_REPLY_ERRORS as exc:
             # A transient malformed/incomplete reply for this one target must
             # not take down the rest of the batch (measured: one missing key
@@ -240,7 +245,7 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
             # losing every target after it even though they were unrelated).
             # Nothing was built or sent to the device, so this section is
             # simply offered again next run.
-            skipped.append({"section_id": section["section_id"], "opcode": opcode_entry["opcode"], "reason": str(exc)})
+            _record_skip(skipped, section, opcode_entry, str(exc), "generation_failed")
             if on_skip:
                 on_skip(i, total, section, opcode_entry, str(exc))
             continue
@@ -265,21 +270,21 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
                 "allow_placeholder_args=True (CLI: --allow-placeholder-args) to execute it anyway "
                 "for plumbing experiments — those records are excluded from the coverage claim."
             )
-            skipped.append({"section_id": section["section_id"], "opcode": opcode_entry["opcode"], "reason": reason})
+            _record_skip(skipped, section, opcode_entry, reason, "placeholder_args")
             if on_skip:
                 on_skip(i, total, section, opcode_entry, reason)
             continue
         generated.append(tc)
 
         try:
-            execution = executor.execute(tc)
-        except DestructiveStepBlocked as exc:
+            execution = _execute_attempt(tc, executor, attempts)
+        except (DestructiveStepBlocked, ValueError) as exc:
             # A chain the model built on its own (a destructive setup/verify
             # step it chose, or the action target itself) hit the gate that
             # exists for --no-destructive — unrelated to this one target's
             # own correctness, so it must not take the rest of the batch with
             # it either.
-            skipped.append({"section_id": section["section_id"], "opcode": opcode_entry["opcode"], "reason": str(exc)})
+            _record_skip(skipped, section, opcode_entry, str(exc), "blocked_before_wire")
             if on_skip:
                 on_skip(i, total, section, opcode_entry, str(exc))
             continue
@@ -298,7 +303,9 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
         # retry would overwrite it with whatever a second attempt does (if the
         # device recovered in between, a PASS), and the batch is sent to a
         # device that just stopped answering.
-        timed_out = bool(execution.get("timed_out"))
+        # Includes the kernel cancelling the command (EINTR/EIO), the same
+        # hang seen one layer lower than the SSH timeout.
+        timed_out = device_hung(execution)
 
         if broken_idx is not None and not precedes_destructive and not timed_out:
             if rejection is not None and rejection[0] == broken_idx:
@@ -308,27 +315,36 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
                 # step's about-to-change shared_facts, which would otherwise
                 # go stale. For a single-step TC this degenerates to exactly
                 # today's one-step reauthor.
-                retry_steps = reauthor_steps(tc, resolved_steps,
-                                              {"step_index": broken_idx, "reason": rejection[1]}, active_nsid,
-                                              device_facts=device_facts)
+                try:
+                    retry_steps = reauthor_steps(tc, resolved_steps,
+                                                  {"step_index": broken_idx, "reason": rejection[1]}, active_nsid,
+                                                  device_facts=device_facts)
+                except _LLM_REPLY_ERRORS:
+                    retry_steps = None
                 # Only adopted if it will actually be sent. Assigning it to
                 # tc["steps"] first (as this once did) left a placeholder
                 # retry that was never executed stored as the TC's steps —
                 # paired with the *previous* execution's results, and with the
                 # criteria/status checks below reading the new steps' cdw10/
                 # field_value_verified against that old output.
-                if not any(s.get("args_source") == "placeholder" for s in retry_steps):
+                if retry_steps is not None and not any(s.get("args_source") == "placeholder" for s in retry_steps):
                     # `tc["retried"]` is purely a display aid for
                     # run_tc_pipeline.py — without it, the "실행할 명령" block
                     # printed before execution (built from the pre-retry steps)
                     # silently disagrees with the final cdw10/data_len printed
                     # after, with nothing on screen explaining why.
-                    tc["retried"] = {"kind": "args_rejected", "step_index": broken_idx,
-                                      "step_name": tc["steps"][broken_idx].get("name"), "reason": rejection[1]}
-                    tc["steps"] = retry_steps
-                    execution = executor.execute(tc)
-                    step_statuses = check_step_expectations(tc, execution)
-                    rejection = rejected_arguments(execution, tc)
+                    candidate = deepcopy(tc)
+                    candidate["retried"] = {"kind": "args_rejected", "step_index": broken_idx,
+                                            "step_name": tc["steps"][broken_idx].get("name"), "reason": rejection[1]}
+                    candidate["steps"] = retry_steps
+                    try:
+                        retry_execution = _execute_attempt(candidate, executor, attempts)
+                    except (DestructiveStepBlocked, ValueError):
+                        retry_execution = None
+                    if retry_execution is not None:
+                        tc, execution = candidate, retry_execution
+                        step_statuses = check_step_expectations(tc, execution)
+                        rejection = rejected_arguments(execution, tc)
             elif step_statuses[broken_idx] == "UNSUPPORTED" and broken_idx != action_idx:
                 # A setup/verify command that simply doesn't exist on this
                 # drive — no argument fix helps, and the dependent steps
@@ -347,7 +363,7 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
                                                            available_opcodes, section)
                     replanned_tc = build_tc(tc_id, replanned_steps, replanned_scenario,
                                              target["nvme_ctrl"], target["nvme_ns"], active_nsid,
-                                             device_facts=device_facts)
+                                             device_facts=device_facts, lba_bytes=lba_bytes)
                 except _LLM_REPLY_ERRORS:
                     # The replan is "nice to have, falls back to what's
                     # already been measured" — same as a replan that itself
@@ -359,8 +375,8 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
                     replanned_tc = None
                 if replanned_tc is not None and not replanned_tc["uses_placeholder_args"]:
                     try:
-                        replanned_execution = executor.execute(replanned_tc)
-                    except DestructiveStepBlocked:
+                        replanned_execution = _execute_attempt(replanned_tc, executor, attempts)
+                    except (DestructiveStepBlocked, ValueError):
                         # The replanned chain (the model's own new choice of
                         # setup/verify commands) introduced a destructive step
                         # under --no-destructive. The gate raises before
@@ -389,6 +405,9 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
             # INVALID_OPCODE and host crashes are never retried.
 
         criteria_results = evaluate_criteria(tc, execution)
+        tc["attempts"] = attempts
+        tc["verification"] = verify_tc(tc, execution)
+        tc["execution_status"] = check_execution(tc, execution)
         tc["status"] = check_expectation(tc, execution)
         tc["step_statuses"] = step_statuses
         crash = host_tool_crash(execution)
@@ -403,6 +422,9 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
             "args_rejected": rejection[1] if rejection else None,
             "unsupported": unsupported_opcode(execution),
             "dmesg_captured_scoped": execution.get("dmesg_captured_scoped", True),
+            "dmesg_text": execution.get("dmesg_text", ""),
+            "batch_stderr": execution.get("batch_stderr", ""),
+            "timed_out": execution.get("timed_out", False),
         }
         executed.append(tc)
 
@@ -416,6 +438,9 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
             host_crashes.append(tc)
         elif tc["status"] in ("FAIL", "ERROR"):
             fc = _build_tc_exec_failure_context(tc, execution)
+            fc_path = config.FAILURE_CONTEXTS_DIR / "tc_exec" / f"{fc['failure_context_id']}.json"
+            save_json_atomic(fc_path, fc)
+            tc["failure_context_id"] = fc["failure_context_id"]
             try:
                 verdict = judge_failure_context(fc)
             except _LLM_REPLY_ERRORS:
@@ -423,14 +448,12 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
                 # judging succeeds — an LLM hiccup here must not crash the
                 # batch over a result that already happened. tc_store still
                 # gets this TC with its real status, just without a
-                # classification; nothing currently re-judges it later, so
-                # it stays unjudged until a future run happens to re-pick
-                # this exact (section, opcode) and judges a fresh FAIL/ERROR.
+                # classification. The saved FailureContext can be re-judged
+                # with run_judge --source tc_exec.
                 verdict = None
             if verdict is not None:
                 # judge_failure_context fills fc["spec_grounding"] in place, so save
                 # after judging — not before — or the stored context keeps queried=false.
-                fc_path = config.FAILURE_CONTEXTS_DIR / "tc_exec" / f"{fc['failure_context_id']}.json"
                 save_json_atomic(fc_path, fc)
                 verdict_path = config.VERDICTS_DIR / "tc_exec.json"
                 verdicts = load_json(verdict_path, default=[])
@@ -457,7 +480,7 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
         # device stopped answering, and without this every remaining target
         # would spend its own full timeout (SECONDS_PER_STEP x steps) finding
         # that out again.
-        if risky_steps or execution.get("timed_out"):
+        if risky_steps or device_hung(execution):
             # Sanitize/Namespace Management can make /dev/nvme0n1 disappear
             # for a while; Lockdown/Security Send can make the controller
             # reject subsequent admin commands without removing the device

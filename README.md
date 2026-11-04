@@ -22,7 +22,8 @@ tc_system/               TC 생성/실행/판정 + 커버리지
 report/                  HTML 리포트 생성
 specs/                   TC 시스템이 쓰는 커버리지 인덱스(seed)
 data/                    파이프라인 산출물(FailureContext, Verdict, TC, 커버리지) — 재생성 가능
-tests/                   유닛 테스트
+tests/                   테스트 코드 전부 — 유닛 테스트(장비·SSH·LLM 호출 없음) + 감사 재현 스크립트
+docs/                    스펙 검증 설계 문서, 리뷰 기록
 config.py                경로/설정 중앙 관리
 secrets.local.json       SSH 타겟 자격증명 (git에 올리지 말 것)
 run_ingest.py / run_judge.py / run_tc_pipeline.py / run_report.py   CLI 진입점
@@ -82,7 +83,7 @@ TC 1건당 LLM 호출이 2~3회(시나리오 + 인자 + 거부 시 재생성) �
 
 판정(`judge_failure_context`) 호출이 같은 이유로 실패해도 배치는 안 멈춥니다 — FAIL/ERROR라는 장비 쪽 결과는 그대로 저장되고, LLM 분류(`verdict_id`)만 비워진 채로 남습니다. 다만 로그 판단 쪽(`run_judge.py`)과 달리 TC 실행 쪽은 미판정 건을 다음 실행에서 자동으로 다시 판정하는 스윕이 없어서, 같은 조항이 다시 타겟으로 뽑혀 새 FAIL/ERROR가 나야 그제서야 다시 판정됩니다.
 
-**커버리지는 기본적으로 실행마다 쌓입니다** — "하루에 한 번씩 돌려서 조금씩 올린다"는 운용을 염두에 둔 설계라, 이미 커버된 조항은 두 번 다시 타겟으로 안 나옵니다(`data/verdicts/`만 매 실행 리셋되고 `tc_store.json`/`coverage_state.json`은 쌓임 — 5-4 참고). 그런데 `tc_store.json`에는 "이 결과가 어떤 물리 디바이스에서 나왔는지"가 전혀 안 적혀 있어서, **테스트 대상 드라이브를 바꾸면 새 드라이브가 이전 드라이브의 누적 결과를 그대로 물려받습니다** — 특히 UNSUPPORTED는 드라이브(모델)마다 다를 수 있는데도 그대로 남습니다. 드라이브를 바꿨으면:
+**커버리지와 판정 증거는 실행마다 쌓입니다** — 기존 실행 이력으로 조항을 영구 완료 처리하지 않으며 판정 기록도 보존합니다. 그런데 `tc_store.json`에는 "이 결과가 어떤 물리 디바이스에서 나왔는지"가 전혀 안 적혀 있어서, **테스트 대상 드라이브를 바꾸면 새 드라이브가 이전 드라이브의 누적 결과를 그대로 물려받습니다** — 특히 UNSUPPORTED는 드라이브(모델)마다 다를 수 있는데도 그대로 남습니다. 드라이브를 바꿨으면:
 ```
 python run_tc_pipeline.py --count 12 --reset-coverage
 ```
@@ -101,14 +102,14 @@ python run_tc_pipeline.py --count 12 --reset-coverage
 ### 5-2. TC 생성/실행
 1. 아직 안 덮인 (Spec 섹션, opcode) 타겟을 커버리지 인덱스에서 선정 — 이게 그 TC의 **action 스텝**(아래 참고)이 됨
 2. 시나리오 생성(RAG+LLM) → 실행 스텝 작성(opcode, cdw, direction, destructive 여부)
-3. (가드 통과 시) SSH로 실제 장비에 `sudo nvme admin-passthru`/`io-passthru` 전송 → 전/후 `dmesg` 캡처 → `expectation_checker`가 exit code/타임아웃/컨트롤러 에러상태/"성공했지만 데이터 전송 안 함" 규칙으로 PASS/FAIL/ERROR 판정
+3. 전체 체인 검증 후 SSH로 단계를 순차 실행하고 사전조건을 확인합니다. 명령 상태와 근거·검증식 기반 PASS/FAIL/UNVERIFIED를 별도로 기록합니다.
 4. FAIL이면 로그 판단과 동일한 `judge` 모듈로 라우팅 → 커버리지 갱신
 
 ### 5-2a. 복합(멀티스텝) TC — Write→Read 같은 시퀀스
 
 TC는 커맨드 1개가 아니라 **여러 커맨드를 순서대로 엮은 체인**일 수 있습니다(`scenario_generator.py`의 `steps_plan`). LLM에게 조항 선정 타겟 1개(`opcode_entry`)와 **같은 command_set 제한 없이 전체 60개 opcode 이름 목록**(ADMIN/NVM 섞는 조합도 허용)을 주고, `{opcode_name, role, phase}` 객체 배열을 받습니다. `phase`는 `setup`(action 전에 실행, 사전조건 — Write 후 Read처럼) / `action`(지금 커버리지가 노리는 그 타겟, 정확히 1개) / `verify`(action 후 확인). 사전조건이나 확인이 여러 개 필요하면(PM 상태 전환 등) `setup`/`verify`를 여러 개 써도 되고, 스텝 수에 고정 캡은 없습니다 — 스텝 1개(`action`만)가 흔하고 정상입니다.
 
-받은 `steps_plan`은 재시도 없이 즉시 검증합니다: `action`이 정확히 1개이고 지금 타겟과 일치하는지, 모든 이름이 실존 커맨드인지, `setup`이 action보다 앞에 `verify`가 뒤에 오는지. 하나라도 틀리면 **1회 재시도 없이** 그냥 단일스텝(action만)으로 폴백합니다 — 장비에 아무것도 안 나간 생성 단계 실수라 재시도 비용을 쓰지 않습니다. (risk_class로 거르는 건 의도적으로 안 합니다 — Write가 setup으로 Read action보다 더 위험한 게 바로 이 기능의 핵심 예시라서, 그런 체크를 넣으면 그 예시부터 막힙니다. 진짜 안전 경계는 `execute_tc_steps`의 `DestructiveStepBlocked`입니다.)
+받은 `steps_plan`은 action의 유일성·타겟 일치·실존 명령·단계 순서와 스펙 인용·검증식·고정 필드를 함께 검증합니다. 실패하면 이유를 전달해 1회 재생성하고, 다시 실패하면 해당 타겟을 건너뜁니다. 원래 요구사항을 단일 명령으로 축소하는 폴백은 하지 않습니다. 전체 명령 체인의 실행 전 검증과 기존 destructive 게이트를 적용합니다.
 
 **스텝 간 값 공유(`shared_facts`)**: 각 스텝의 `author_args` 호출이 LBA/NLB/Feature ID처럼 "다음 스텝이 재사용해야 할 의미있는 값"을 명시적으로 돌려주고(`{"lba": "0x5", "nlb": "0"}` 식), 이후 스텝들은 **이전 스텝 전체의 기록**(평평하게 병합한 dict가 아니라 스텝별 리스트 — PM 상태 A→B 전환처럼 같은 키가 여러 번 바뀌는 과정이 안 사라지게)을 프롬프트로 받아 "다른 값을 요구하지 않는 한 그대로 재사용하라"는 지시를 받습니다. 이게 없으면 Write가 LBA 5에 쓰고 Read가 LBA 9를 읽는 식으로, 체인이 서로 무관한 명령 두 개가 되어 버립니다. (바이트 자체가 실제로 일치하는지 비교하는 건 아직 안 함 — 다음 단계로 보류.)
 
@@ -118,7 +119,7 @@ TC는 커맨드 1개가 아니라 **여러 커맨드를 순서대로 엮은 체�
 
 **action 스텝의 section은 `pick_next_targets`가 원래 고른 그 section을 그대로 씁니다** — opcode 테이블의 대표 `section_ref`로 다시 조회하지 않습니다(`pipeline._resolve_steps_plan`). opcode의 `section_ref`는 그 커맨드의 "대표" 조항(예: Migration Send → `base:5.2.17`)일 뿐이고, 같은 opcode를 공유하는 더 구체적인 형제/하위 조항(`base:5.2.17.1` "Migration Send Management Operations" 등)도 `pick_next_targets`가 독립적인 타겟으로 고릅니다 — 실측으로 103개 reachable 조항 중 43개가 이런 관계였습니다. action 스텝의 section을 `section_ref`로 재조회하면(예전 버그) 커버리지가 항상 대표 조항으로만 기록되어, 원래 고른 세부 조항은 구조적으로 영원히 커버될 수 없고 다음 실행에서도 똑같은 커맨드를 다른 타겟 이름으로 영원히 재시험하게 됩니다(실측: 같은 배치 안에서 "TC_MigrationSend_base_5_2_17"이 두 번 찍혀 중복처럼 보였던 사례). setup/verify 스텝은 사전 할당된 타겟이 없어서 여전히 `section_ref`로 조회합니다.
 
-**커버리지는 스텝별로 독립 집계**됩니다(`coverage_state._covering_entries`) — Write(PASS)→Read(ERROR) 체인이면 Write의 조항은 커버된 걸로, Read의 조항·opcode만 제외되고 다음 실행에 다시 타겟으로 제시됩니다. TC 전체에 스칼라 status 하나만 보던 예전 방식은 "한 스텝이 잘못됐다고 이미 증명된 다른 스텝의 증거까지 버리는" 문제가 있어서 바뀌었습니다. TC 이름은 체인 길이와 무관하게 항상 **action 스텝 하나 기준**(`TC_<ActionName>_<조항>`)이고, 체인 전체 설명은 별도 `chain_summary` 필드/터미널의 "체인 요약" 줄로 봅니다.
+**스텝별 실행 이력과 요구사항 검증은 별도 집계**합니다. 선행조건이 실패한 체인은 action 성공만으로 스펙 PASS가 되지 않습니다. TC 이름은 action 기준이며 전체 계획은 `chain_summary`로 확인합니다.
 
 **"조항이 제대로 커버됐는가"의 최종 판단은 여전히 기계적 규칙만 씁니다** — LLM에게 이 판단 자체를 맡기지 않습니다(커버리지 %의 재현성을 지키기 위함). LLM의 홀리스틱 의견을 보조 신호로 추가하는 건 아직 미정입니다.
 
@@ -150,24 +151,11 @@ TC는 커맨드 1개가 아니라 **여러 커맨드를 순서대로 엮은 체�
 
 **opcode 60개**도 스펙의 opcode 표에서 파싱합니다(기억이 아니라). 파괴적 커맨드가 자동 실행되는 만큼 매핑이 틀리면 의도와 다른 명령이 나가므로, 파싱 시 M/O/P 플래그 열 + 조항 제목 교차검증을 요구하고, 알려진 값 16건 spot-check와 opcode 키 충돌 검사를 통과하지 못하면 **인덱스를 생성하지 않고 중단**합니다. (실제로 느슨한 정규식이 `Firmware Commit`을 `0Dh`로, Feature ID 표를 opcode로 잘못 읽는 것을 이 검증이 잡았습니다.)
 
-**집계 기준** — 드라이브에 대한 답을 얻었는지로 판단합니다:
+**집계 기준** — 명령 실행 이력과 스펙 요구사항 검증을 분리합니다. 인용 근거·검증식·관측값이 있어야 요구사항 PASS/FAIL을 집계하며, 단순 명령 성공이나 INVALID_OPCODE는 스펙 준수의 증거가 아닙니다. 기존 PASS 기록도 검증 계약이 없으면 `UNVERIFIED`로 표시합니다. 생성된 요구사항 수가 검증 통계의 분모이며 전체 스펙 대비 준수율이 아닙니다.
 
-| 상태 | 집계 | 의미 |
-|---|---|---|
-| `PASS` | 포함 | 조항대로 동작 확인 |
-| `FAIL` | 포함 | 실행됐고 오동작 — 경로는 탔음 |
-| `UNSUPPORTED` | **포함** | 컨트롤러가 `INVALID_OPCODE` — 옵션 커맨드 미구현. 이것도 드라이브에 대한 **유효한 결론**이므로 커버리지로 인정 |
-| `ERROR` | 제외 | **우리 쪽 버그** — `INVALID_*` 계열 전체(인자가 예약값/비트 위치 오류 등), nvme-cli 호스트 크래시, SSH 실패. 스펙에 대해 아무것도 입증 못 했으므로 다음 실행에서 재시도 |
+**자기교정** — 거부된 인자를 한 번 재생성하되 시나리오의 FID/SEL·주소 등 고정 필드를 유지합니다. 기대한 음성 응답은 재시도하지 않습니다. 최초 실행과 재시도 결과를 모두 보존합니다. [검증 계약과 지원 범위](docs/spec_verification.md)를 참고하세요.
 
-`INVALID_OPCODE`만 발견으로 보고 나머지 `INVALID_*`는 전부 우리 버그로 처리합니다. 실측에서 LLM이 Get Log Page의 LID를 비트 31:16에 넣어(실제 07:00) `INVALID_LOG_PAGE`가 돌아왔는데, `INVALID_FIELD`만 보던 시점에는 이게 **펌웨어 FAIL로 집계**됐습니다. 예외가 하나 있습니다 — 그 스텝이 요청한 세부 값(LID/FID/CNS 등)이 CDW10에 올바르게 들어갔다고 **이미 결정론적으로 확인된** 경우(`field_value_verified=True`)는, 같은 `INVALID_*` 거부라도 "이 값은 미지원"이라는 유효한 결론(UNSUPPORTED)으로 집계됩니다 — 바로 위 "커맨드별 세부 값 단위 커버리지" 참고.
-
-**분모가 둘인 이유**: 1,292개 조항 중 opcode가 연결되어 실제로 명령을 보낼 수 있는 건 258개입니다(나머지는 산문·데이터 구조·범위 기술, 또는 위에서 설명한 이유로 opcode 연결을 제거한 보일러플레이트). 그래서 `전체 스펙 대비 %`는 테스트가 완벽해도 20.0%가 상한입니다. 진척도는 **`테스트 가능 조항 커버리지`(분모 258)** 로 읽고, 전체 스펙 수치는 스펙의 실제 크기를 보여주는 참고값으로 봅니다. 리포트는 둘 다 표시합니다.
-
-리포트는 PASS로 커버 / FAIL로만 커버 / 미지원 확인을 분리 표시합니다.
-
-**자기교정**: `INVALID_FIELD`가 오면 컨트롤러의 거부 문구를 LLM에 피드백해 인자를 1회 재생성합니다. 실측에서 Get Features(`FID=0x00` 예약값 → `0x01` Arbitration), Get Log Page(잘못된 LSP → `LID=0x01, NUMDL=0x80`)가 이 경로로 교정되어 PASS했습니다. `INVALID_OPCODE`는 재시도하지 않습니다 — 인자를 고쳐도 미구현 커맨드는 성공할 수 없습니다.
-
-**방향 비트 검증** (`tc_system/generation/args_author.py`): opcode 바이트의 비트 1:0이 그 커맨드 자신의 전송방향(00=데이터 없음, 01=host→device, 10=device→host)을 인코딩합니다. 실측에서 opcode 0x2A(bits=10, "read")에 `direction="write"`로 인자를 지었다가 nvme-cli가 경고(`write flag set but write direction bit is not set in the opcode`)만 찍고 그대로 전송 — 컨트롤러가 응답을 안 해서 SSH 배치 타임아웃(~125초)까지 그대로 날린 사례가 4건 있었습니다. 이제 `author_args`가 LLM이 고른 `direction`을 opcode 자신의 비트와 맞춰보고, `direction="none"`이 아니면서 불일치하면 **장비에 보내기 전에** 거부합니다(수 ms 안에 실패). `direction="none"`(데이터 버퍼 없이 CDW0으로만 값을 받는 Get Features 같은 경우)은 opcode 비트와 무관하게 항상 허용됩니다 — 실제로 PASS했던 사례라서.
+**방향 비트 검증** (`tc_system/generation/args_author.py`): opcode 바이트의 비트 1:0이 그 커맨드 자신의 전송방향(00=데이터 없음, 01=host→device, 10=device→host)을 인코딩합니다. 실측에서 opcode 0x2A(bits=10, "read")에 `direction="write"`로 인자를 지었다가 nvme-cli가 경고(`write flag set but write direction bit is not set in the opcode`)만 찍고 그대로 전송 — 컨트롤러가 응답을 안 해서 SSH 배치 타임아웃(~125초)까지 그대로 날린 사례가 4건 있었습니다. 이제 `author_args`가 LLM이 고른 `direction`을 opcode 자신의 비트와 맞춰보고, `direction="none"`이 아니면서 불일치하면 **장비에 보내기 전에** 거부합니다(수 ms 안에 실패). `direction="none"`은 Get Features 같은 데이터 버퍼 없는 명령에 사용할 수 있습니다. Identify/Get Log Page 등은 별도 길이 검증을 통과해야 합니다 — 실제로 PASS했던 사례라서.
 
 이 불일치는 장비로 나가기 전에 로컬에서 잡힌 LLM 자신의 실수이므로(컨트롤러가 거부한 게 아니라, 애초에 보내지도 않음), 컨트롤러 거부 피드백 루프와 같은 방식으로 **그 틀린 이유를 LLM에게 알려주고 그 TC 1건만 1회 재시도**합니다 — 재시도까지 또 틀리면 그제서야 placeholder 폴백으로 떨어져 그 타겟만 건너뛰어집니다(배치 전체는 안 멈춤). (실측: opcode 0x1D에서 같은 유형의 실수가 재발 — `direction="read"`로 지었다가 bits가 "write"를 요구 — 1회 재시도로 복구되는지 확인이 핵심입니다. 한 번의 LLM 실수가 나머지 19건의 실행까지 막는 걸 막기 위함.)
 
@@ -180,7 +168,7 @@ TC는 커맨드 1개가 아니라 **여러 커맨드를 순서대로 엮은 체�
 
 **TC 사이에 남는 상태 변화 — Sanitize/Namespace Management/Lockdown**: TC 하나의 멀티스텝 체인 안에서는 `shared_facts`로 상태를 넘기지만, **배치 안의 TC와 TC 사이**는 아무것도 추적하지 않았습니다. Sanitize/Format/Namespace Management처럼 `/dev/nvme0n1` 자체를 한동안 없애버리는 커맨드도 있고, Lockdown/Security Send처럼 디바이스 노드는 그대로인데 이후 admin 커맨드가 전부 거부되게 만드는 커맨드도 있습니다 — 실측으로 한 TC의 Write/Read가 "`/dev/nvme0n1: No such file or directory`"로 떨어졌는데, 이게 펌웨어 결함이 아니라 **바로 앞 TC의 상태 변경 커맨드 때문**이었던 사례가 있었습니다. 그래서 `destructive`/`firmware_state`/`lockout_risk` 스텝이 하나라도 섞인 TC가 끝나면, 다음 타겟으로 넘어가기 전에 `ssh_runner.device_responsive`(가벼운 `nvme id-ctrl` 1회 왕복)로 **디바이스가 여전히 명령에 응답하는지** 확인합니다. 응답이 없으면(디바이스 노드가 없거나 타임아웃이거나 거부당하거나) 남은 타겟을 전부 `skipped`로 건너뛰고 배치를 끝냅니다 — 똑같이 떨어질 게 뻔한 나머지 타겟들을 굳이 다 돌리지 않습니다. 파일 존재 여부만 보는 게 아니라 실제 커맨드를 보내서 응답을 확인하므로, 디바이스 노드가 사라지는 경우와 Lockdown처럼 노드는 있는데 커맨드만 거부되는 경우를 **둘 다** 잡습니다. (어떤 커맨드가 정확히 뭘 망가뜨리는지까지 의미적으로 모델링하지는 않습니다 — 범용적인 "죽었나 살았나" 확인으로 충분하다고 판단했습니다.)
 
-**Firmware Download/Commit — 더미 이미지로도 테스트 가능하게**: Firmware Image Download(0x11)는 실제 서명된 펌웨어 이미지가 없어도 테스트할 수 있습니다 — `direction="write"`로 분류돼 있어서 위의 Write-stdin 수정이 자동으로 0으로 채운 더미 버퍼를 "펌웨어 이미지 조각"으로 보내줍니다. Firmware Commit(0x10)의 Commit Action(CDW10 bits 2:0)에 대해서는 **일부러 제약을 걸지 않았습니다** — CA=0(스테이징만, 활성화 안 함)으로 고정하면 "진짜 이미지가 아닌데 컨트롤러가 그걸 활성화하라고 했을 때 제대로 거부하는지"를 영원히 테스트 못 하게 되고, 펌웨어가 이미지를 제대로 검증하는 게 정상이라면 거부해야 하므로 그 자체로 의미 있는 테스트입니다. 대신 `expectation_checker.py`에 **`firmware commit activated an unvalidated dummy image`** 규칙을 추가해서, CA가 활성화 액션(1/2/3/6/7)인 Firmware Commit이 **성공(exit 0)** 하면 위반으로 잡습니다 — 거부 문구가 정확히 뭔지는 안 보고 "성공했는지"만 봅니다(문구는 nvme-cli/펌웨어 버전마다 다를 수 있어서). CA=0으로 성공하는 건 위반이 아닙니다(스테이징만 하고 활성화 안 하므로 내용이 더미여도 무해). `args_author`의 프롬프트에도 "다운로드되는 내용은 더미다, CA=0으로만 고르지 말고 조항이 요구하는 대로 골라라"를 명시해서, 시나리오 서술이 "진짜 이미지"인 것처럼 안 쓰이게 했습니다. (활성화 커밋이 실제로 성공하면 — 디바이스가 다음 리셋에 깨진 이미지로 부팅을 시도할 위험이 있는데, 바로 위의 디바이스 헬스체크가 이 TC 바로 다음에 자동으로 돌아서 안전망 역할을 합니다.)
+**Firmware Download/Commit**: CA는 CDW10 bits 5:3, FS는 bits 2:0입니다. 성공한 0 바이트 더미 다운로드 증거가 있는 CA=1/3 활성화 성공을 검출합니다. CA=2의 기존 이미지 활성화를 더미 활성화로 단정하지 않습니다. 자세한 판정과 실행 범위는 [검증 문서](docs/spec_verification.md)를 참고하세요.
 
 **디바이스 역량 사전 조회 — UNSUPPORTED/INVALID_FIELD 낭비 줄이기**: 실측(`data/tc_store.json`)에서 TC 103건 중 **UNSUPPORTED가 54건(약 52%)으로 가장 큰 비중**이었습니다. 지금까지 `generate_scenario`/`author_args`는 이 드라이브가 실제로 뭘 지원하는지 전혀 모른 채 스펙 표만 보고 커맨드/값을 고르고, 미지원이든 범위 밖 값이든 **매번 LLM 호출 + SSH 왕복을 거쳐서야** 알아냈습니다. 그래서 `run_pipeline`이 시작할 때 **딱 1회** `nvme id-ctrl`/`id-ns`/`effects-log`를 실제 장비에 던져서(`tc_system/execution/ssh_runner.py`의 `probe_device_capabilities`) OACS/ONCS/SANICAP 비트, NPSS, NSZE, 현재 LBA 포맷 섹터 크기, (버전이 지원하면) Commands Supported and Effects 로그를 읽고, 이를 한국어 힌트 문단으로 포맷해(`tc_system/generation/device_capabilities.py`의 `summarize_device_capabilities`) 매 TC의 시나리오/인자 생성 프롬프트에 `device_facts=` 블록으로 끼워넣습니다.
 
@@ -234,13 +222,13 @@ lines[-1]["step_commands"]                      # 마지막 배치가 실제로 
 ```
 가 그대로 찍힙니다 — `verdict_id`로 `data/verdicts/tc_exec.json`에서 판정(classification/confidence/rationale)을, `failure_context_id`로 `data/failure_contexts/tc_exec/<id>.json`에서 원본 증거(로그 발췌, dmesg, 위반 기준)를 바로 찾을 수 있습니다. (예전에는 `verdict_id`만 FAIL일 때만 찍혀서, ERROR로 판정된 건이나 FailureContext 파일 자체를 찾으려면 `data/verdicts/tc_exec.json`을 열어 `failure_context_id` 필드를 수동으로 봐야 했습니다.)
 
-**`data/verdicts/tc_exec.json`/`data/failure_contexts/tc_exec/`는 실행마다 새로 시작합니다** — `run_tc_pipeline.py`를 실행할 때마다 `pipeline.run_pipeline`이 맨 처음에 이 둘을 비우고 시작합니다(`_reset_tc_exec_judgments`). 예전엔 매 실행마다 쌓이기만 해서 지난 실행들의 판정이 계속 누적됐습니다. `data/tc_store.json`/`data/coverage_state.json`(커버리지는 실행마다 누적되는 게 맞음)은 건드리지 않고, 리셋된 verdict/FailureContext를 가리키던 TC 레코드의 `verdict_id`/`failure_context_id` 필드만 같이 비웁니다(죽은 참조가 안 남게). 이번 실행에서 FAIL/ERROR가 다시 나오면 그 TC는 또 판정을 받습니다.
+**판정과 FailureContext는 실행 간 보존합니다.** judge 호출 전에 FailureContext를 먼저 저장하여 LLM 실패 후에도 재판정할 수 있습니다. 재시도마다 명령과 원시 실행 결과를 `attempts`에 기록합니다.
 
 ## 6. 테스트
 
 ```
 python -m unittest discover -s tests -v
 ```
-253개, 전부 실제 로그 샘플/실측 기반(가짜 데이터로 통과시키지 않음). 파서의 엣지케이스(윈도우 겹침, 다중 크래시 중 종단 판별), **`build_spec_index.py`의 세부 값 단위 opcode 상속(1단계/2단계-빈 그룹 건너뛰기/3단계 복합 체인/다중값·부모-자식 동시 제목 스킵/멱등성)**(`tests/test_build_spec_index.py`), **`required_field_value`가 CDW10 bits 7:0에 결정론적으로 검증되고 불일치 시 재시도되는지, 허용 필드 밖(Event Type 등)은 검증을 생략하는지**, **세부 값이 검증된 스텝의 거부가 UNSUPPORTED로(ERROR가 아니라) 집계되고 체인 안 다른 스텝의 진짜 ERROR를 가리지 않는지**, 커버리지 집계 규칙(스텝별 독립 집계 포함), 판정 규칙(FAIL/PASS/ERROR 경계, 스텝별 `check_step_expectations`, **긴 상태 텍스트가 더 이상 잘리지 않는지**, **Firmware Commit이 더미(미검증) 이미지를 활성화 Commit Action으로 성공시키면 위반으로 잡히는지**), SSH 실행기의 입력 검증·파괴적 커맨드 차단·명령/타이밍 로깅·스텝당 타임아웃·디바이스 헬스체크(`device_responsive`)·**디바이스 역량 조회(`probe_device_capabilities`)**, nvme-cli 진단 출력(OACS/ONCS/SANICAP/NPSS/NSZE/Commands Supported and Effects) 파싱이 미지원·빈 입력에도 raise 없이 빈 힌트로 떨어지는지(`tests/test_device_capabilities.py`), RAG 검색 품질(실측 점수), LLM 응답 파싱·confidence 정규화·스키마 키 누락 시 1회 재시도, "우리 버그(INVALID_FIELD·호스트 크래시·opcode 방향비트/nsid 불일치 및 그 1회 재시도) vs 유효한 발견(INVALID_OPCODE)" 분류, 멀티스텝 `steps_plan` 검증/폴백/재계획, `shared_facts` 스텝 간 전달과 재시도 시 캐스케이드 재생성, `pipeline.run_pipeline`의 재시도/재계획 분기와 LLM 응답 실패 시 그 타겟만 건너뛰고 배치는 계속되는지, **action 스텝이 항상 원래 타겟팅된 section을 유지하는지**(`_resolve_steps_plan`, opcode의 대표 `section_ref`로 덮어쓰이지 않는지), 재시도/재계획이 일어났다는 사실이 `tc["retried"]`에 기록되는지, **파괴적/firmware_state/lockout_risk 스텝이 섞인 TC 다음에 디바이스 헬스체크가 돌고, 죽어 있으면 남은 타겟을 전부 건너뛰는지**(`TestDeviceHealthCheckAfterRiskySteps`), **`--reset-coverage`가 백업을 남기고 커버리지를 지우는지, 안 주면 그대로 누적되는지**(`TestResetCoverageFlag`), **placeholder 인자/`--no-destructive` 충돌/replan·judge의 LLM 실패가 배치 전체를 멈추지 않고 그 타겟만 `on_skip`으로 건너뛰는지**, 디바이스 역량 힌트가 시나리오/인자 생성 프롬프트까지 실제로 전달되는지와 조회 실패 시 `None`으로 degrade되는지, **매 실행마다 `tc_exec` 판정 기록이 새로 시작되는지**(통합 테스트, `tests/test_pipeline.py`), 네임스페이스 id 경로 파싱, HTML escape, **Write 스텝의 `data_len`만큼 stdin에 0-버퍼가 명시적으로 들어가는지**(SSH 배치가 stdin 블로킹으로 영원히 멈추던 버그), 그리고 통합 실행 로그 파일(`logs/tc_pipeline_*.log`)의 콘솔 미러링/복원/장애 허용과 **모든 줄에 `[HH:MM:SS]` 타임스탬프가 붙는지**(빈 줄은 스탬프 없이 그대로 남는지 포함)를 검증한다.
+기존 파서·생성·판정·SSH·커버리지 회귀 테스트와 스펙 검증 계약 테스트를 실행합니다. 실제 로그 기반 사례 및 분기별 합성 응답을 사용하며 장비·SSH·LLM 호출은 모킹합니다. 검증 범위는 [스펙 검증 문서](docs/spec_verification.md)를 참고하세요.
 
 테스트는 **네트워크를 타지 않는다** — LLM 클라이언트는 순수 함수(JSON 추출, confidence 정규화)만 테스트하고, 실제 LLM 경로는 `run_judge.py`를 돌려서 확인한다.

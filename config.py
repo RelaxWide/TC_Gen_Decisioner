@@ -11,6 +11,9 @@ FAILURE_CONTEXTS_DIR = DATA_DIR / "failure_contexts"
 VERDICTS_DIR = DATA_DIR / "verdicts"
 TC_STORE_PATH = DATA_DIR / "tc_store.json"
 COVERAGE_STATE_PATH = DATA_DIR / "coverage_state.json"
+# Targets skipped before anything reached the device (generation/argument
+# failure, destructive gate). Counted as attempts so target selection rotates.
+TARGET_SKIPS_PATH = DATA_DIR / "target_skips.json"
 INGEST_STATE_QST_PATH = DATA_DIR / "ingest_state_qst.json"
 INGEST_STATE_PULSEFZ_PATH = DATA_DIR / "ingest_state_pulsefz.json"
 

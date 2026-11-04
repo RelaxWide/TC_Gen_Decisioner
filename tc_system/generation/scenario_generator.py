@@ -1,13 +1,19 @@
+import json
+
+from shared.spec_evidence import format_evidence
+from tc_system.verification import validate_plan_contract, CAPABILITIES
 from shared.llm_client import generate_llm_response
 from shared.rag_client import generate_rag_response
 
 SCENARIO_SCHEMA = {
     "description": "string — what this test case exercises and why it is worth testing",
     "preconditions": "array of strings — device/namespace state required before the command runs",
-    "fail_criteria": "array of strings — observable conditions that mean this test failed",
     "steps_plan": (
         'array of objects {"opcode_name": <a real command name from available_commands>, '
-        '"role": <what this step checks>, "phase": "setup" | "action" | "verify"}. '
+        '"role": <what this step checks>, "phase": "setup" | "action" | "verify", '
+        '"expected_status": "SUCCESS" or the exact expected NVMe error token, '
+        '"field_constraints": [{"field": "cdw10", "mask": "0x000007FF", "value": "0x0000037D"}], '
+        '"payload_hex": null or a short hex byte pattern (e.g. "A55A") repeated to fill a write buffer}. '
         'Exactly one step must have phase="action" and its opcode_name must equal the target '
         'command given above (opcode=... command_set=...). setup steps must come before the '
         'action step, verify steps must come after it. If the clause needs several preconditions '
@@ -17,6 +23,22 @@ SCENARIO_SCHEMA = {
     ),
     "chain_summary": ("string — 1-2 sentence summary of what the whole step sequence verifies. "
                        "If steps_plan has only the action step, this can repeat description."),
+    "requirements": (
+        'array of {"description": Korean string, "evidence_id": supplied evidence ID, '
+        '"quote": exact verbatim spec text (at least 20 characters), "checks": [check objects]}. '
+        'Each requirement needs executable checks. A check has "kind" and zero-based "step". '
+        'Allowed kinds: completion (compare with step.expected_status); '
+        'result_bits (CQE DW0: mask, value, operator eq/ne/le/ge); '
+        'data_length (bytes); data_field (little-endian offset, width 1..8, mask, value, operator); '
+        'data_equal (other_step); data_matches_write (other_step, compare with that write payload). '
+        'Masks and values are integers or 0x hex strings. No Python, expressions or regex checks.'
+    ),
+    "precondition_checks": 'array of {"description": exact preconditions entry, "checks": [check objects]}; '
+                           'every precondition needs checks on steps BEFORE action',
+    "required_capabilities": 'array of required executor capability names from the supplied list',
+    "unverified_conditions": 'array of strings; any essential condition that this executor cannot establish '
+                             'or observe. Nonempty means the test will be skipped, never claimed covered.',
+
 }
 
 SCENARIO_SYSTEM_PROMPT = (
@@ -28,7 +50,7 @@ SCENARIO_SYSTEM_PROMPT = (
     "reading it back, or set a feature before checking it was applied) and verify steps for "
     "commands that confirm the target command's effect afterward. Only ever choose commands that "
     "appear in available_commands, by their exact name — never invent one.\n\n"
-    "Write description, every fail_criteria entry, chain_summary, and every steps_plan[].role in "
+    "Write description, requirement descriptions, chain_summary, and every steps_plan[].role in "
     "Korean (한국어). steps_plan[].opcode_name and steps_plan[].phase must stay exactly as given "
     "(a real English command name, and one of setup/action/verify) — do not translate those.\n\n"
     "DEVICE_FACTS: if the prompt includes a device_facts block, it lists commands/ranges measured "
@@ -36,6 +58,26 @@ SCENARIO_SYSTEM_PROMPT = (
     "supports; avoid proposing one its OACS/ONCS/SANICAP bits report as absent unless it is the "
     "action step itself (the action step is fixed by the clause under test even if this drive "
     "turns out not to implement it)."
+    "\n\nEXECUTABLE CONTRACT: test one concrete cited requirement at a time. Do not list multiple "
+    "variants in prose while issuing only one command. Every claimed observation must have a check. "
+    "Fix the request selectors/addresses that define the test in field_constraints; these survive retries. "
+    "For Get Features constrain CDW10[10:0] (FID and SEL); Identify CNS and Get Log Page LID "
+    "use CDW10[7:0]; Directive DTYPE/DOPER use CDW11[15:0]. NVM Read/Write/Compare must "
+    "fix SLBA (CDW10,11) and NLB (CDW12[15:0]). Firmware Commit fixes CA/FS in CDW10[5:0]. "
+    "Declare expected_status for EVERY step, including intentionally expected errors in negative tests. "
+    "preconditions are claims to MEASURE before action, not assumptions inferred from device_facts. "
+    "DEVICE LIMITS: sequential nvme-cli passthru only; no concurrent outstanding command/CID control, "
+    "event injection, resets, timing measurements or dynamic runtime parameters. Abort/AER tests are "
+    "not executable here. Write payloads are zero bytes unless payload_hex is explicitly provided; "
+    "never claim a structured management payload was sent unless you encode it. Data comparisons "
+    "use captured hex bytes, not the model's explanation. data_equal/data_matches_write compare the "
+    "same data only: for NVM Read/Write/Compare the compared step's SLBA/NLB (field_constraints) must "
+    "lie inside the other step's range, and data_matches_write needs a non-zero payload_hex (zeros "
+    "look the same as unwritten LBAs). Unsupported capabilities or insufficient "
+    "evidence must be reported in unverified_conditions. Never simplify away the original requirement "
+    "just to make a command return success. Previously verified requirement quotes are provided to "
+    "help select a different requirement; testing one does not cover an entire clause."
+
 )
 
 
@@ -52,8 +94,7 @@ def _validate_steps_plan(plan, opcode_entry: dict, available_opcodes: list[dict]
         raise ValueError("steps_plan must be a non-empty array")
     # Checked up front: a bare string entry (e.g. ["Identify", {...}]) used to
     # reach `step.get` below as AttributeError, which nothing upstream caught —
-    # one malformed reply took the whole --count batch down instead of falling
-    # back to the single-step plan.
+    # one malformed reply must not take the whole --count batch down.
     if not all(isinstance(s, dict) for s in plan):
         raise ValueError("every steps_plan entry must be an object")
     by_name = {o["name"]: o for o in available_opcodes}
@@ -104,14 +145,19 @@ def generate_scenario(section: dict, opcode_entry: dict, available_opcodes: list
     UNSUPPORTED the expensive way (an LLM call plus an SSH round trip) for every target."""
     rag = generate_rag_response(
         f"{section['title']} ({opcode_entry['name']}) expected behavior and error handling",
-        top_k=3, doc_filter=[section["spec_doc"]],
+        top_k=3, doc_filter=[section["spec_doc"]], section=section, command_name=opcode_entry["name"],
+        layout_ref=opcode_entry.get("section_ref"), purpose="scenario",
     )
+    if not rag["chunks"]:
+        raise ValueError(f"exact spec evidence unavailable for {section['section_id']}")
     available_names = sorted({o["name"] for o in available_opcodes})
     prompt = (
         f"spec_doc={section['spec_doc']} section={section['section_id']} title={section['title']} "
         f"opcode={opcode_entry['raw_opcode']} command_set={opcode_entry['command_set']}\n"
         f"available_commands={', '.join(available_names)}\n"
-        f"spec_context=\n" + "\n".join(c["text"] for c in rag["chunks"])
+        f"executor_capabilities={sorted(CAPABILITIES)}\n"
+        f"previously_verified_requirements={json.dumps(section.get('previous_requirements', []), ensure_ascii=False)}\n"
+        f"spec_context=\n" + format_evidence(rag["chunks"])
     )
     if device_facts:
         prompt += f"\n\ndevice_facts=\n{device_facts}"
@@ -120,27 +166,28 @@ def generate_scenario(section: dict, opcode_entry: dict, available_opcodes: list
             f"\n\nA previous attempt's plan did not work out: {feedback}\n"
             "Propose a plan that does not depend on that outcome."
         )
-    llm = generate_llm_response(prompt, system=SCENARIO_SYSTEM_PROMPT,
-                                 response_schema=SCENARIO_SCHEMA, caller="scenario_generator")
-    structured = llm["structured"]
-
-    try:
-        steps_plan = _validate_steps_plan(structured.get("steps_plan"), opcode_entry, available_opcodes)
-    except (ValueError, TypeError, KeyError):
-        # Multi-step is purely additive and optional, with an always-safe
-        # single-step fallback — unlike author_args's direction/nsid retries,
-        # which guard against something that would otherwise reach real
-        # hardware, a bad steps_plan never left this host. Spending another
-        # LLM round-trip to rescue a nice-to-have isn't worth it, so this
-        # degrades immediately instead of retrying.
-        steps_plan = [{"opcode_name": opcode_entry["name"], "role": "primary clause behavior", "phase": "action"}]
+    for attempt in range(2):
+        llm = generate_llm_response(prompt, system=SCENARIO_SYSTEM_PROMPT,
+                                   response_schema=SCENARIO_SCHEMA, caller="scenario_generator")
+        structured = llm["structured"]
+        try:
+            steps_plan = _validate_steps_plan(structured.get("steps_plan"), opcode_entry, available_opcodes)
+            validate_plan_contract(structured, rag["chunks"], section["section_id"], available_opcodes)
+            break
+        except (ValueError, TypeError, KeyError) as exc:
+            if attempt:
+                raise ValueError(f"scenario contract invalid: {exc}") from exc
+            prompt += f"\n\nYour plan is not executable: {exc}. Correct the contract without changing its target."
 
     return {
         "description": str(structured["description"]),
-        "preconditions": _as_list(structured["preconditions"]),
-        "fail_criteria": _as_list(structured["fail_criteria"]),
+        "preconditions": structured["preconditions"],
+        "fail_criteria": [r["description"] for r in structured["requirements"]],
         "steps_plan": steps_plan,
         "chain_summary": str(structured.get("chain_summary") or structured["description"]),
+        "requirements": structured["requirements"],
+        "precondition_checks": structured.get("precondition_checks", []),
+        "spec_evidence": rag["chunks"],
         "rag_response_id": rag["response_id"],
         "llm_response_id": llm["response_id"],
     }

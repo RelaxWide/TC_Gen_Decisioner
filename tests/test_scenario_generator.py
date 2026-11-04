@@ -3,6 +3,7 @@
 No network: `generate_scenario` is exercised through a stubbed LLM so the
 steps_plan validation/fallback logic is covered without calling out.
 """
+from copy import deepcopy
 import unittest
 from unittest import mock
 
@@ -24,33 +25,55 @@ AVAILABLE_OPCODES = [
 
 GOOD_STRUCTURED = {
     "description": "Verify Read returns the deallocated status for an unwritten LBA.",
-    "preconditions": ["Namespace supports deallocated LBA error reporting"],
+    "preconditions": [],
     "fail_criteria": ["Read does not return the deallocated status"],
     "steps_plan": [{"opcode_name": "Read", "role": "primary clause behavior", "phase": "action"}],
     "chain_summary": "Read an unwritten LBA and check the deallocated status.",
 }
 
 
+EVIDENCE = {"evidence_id": "spec-fixture", "section_id": SECTION["section_id"],
+            "role": "target", "text": "The Read command shall return the requested data to the host."}
+
+
+def prepared(structured):
+    structured = deepcopy(structured)
+    plan = structured["steps_plan"]
+    for step in plan:
+        if not isinstance(step, dict):
+            continue
+        step.setdefault("expected_status", "SUCCESS")
+        step.setdefault("field_constraints", [{"field": f"cdw{i}", "mask": "0xFFFFFFFF", "value": 0}
+                                               for i in (10, 11, 12)])
+    action = next((i for i, p in enumerate(plan) if isinstance(p, dict) and p.get("phase") == "action"), 0)
+    structured.setdefault("requirements", [{"description": "Read completion", "evidence_id": "spec-fixture",
+                                              "quote": EVIDENCE["text"],
+                                              "checks": [{"kind": "completion", "step": action}]}])
+    structured.setdefault("precondition_checks", [])
+    structured.setdefault("required_capabilities", ["sequential", "completion_status"])
+    structured.setdefault("unverified_conditions", [])
+    return structured
+
+
 def _run(structured, available_opcodes=AVAILABLE_OPCODES, feedback=None, opcode=OPCODE):
     with mock.patch.object(scenario_generator, "generate_rag_response",
-                            return_value={"chunks": [{"text": "spec text"}], "response_id": "r"}), \
+                            return_value={"chunks": [EVIDENCE], "response_id": "r"}), \
          mock.patch.object(scenario_generator, "generate_llm_response",
-                            return_value={"structured": structured, "response_id": "l"}):
+                            return_value={"structured": prepared(structured), "response_id": "l"}):
         return generate_scenario(SECTION, opcode, available_opcodes, feedback=feedback)
 
 
 class TestStepsPlanValidation(unittest.TestCase):
-    def test_non_object_entry_falls_back_instead_of_crashing(self):
+    def test_non_object_entry_is_rejected(self):
         # A bare string entry used to raise AttributeError, which nothing
         # upstream caught — one malformed reply ended the whole batch.
-        out = _run(dict(GOOD_STRUCTURED, steps_plan=[
-            "Write", {"opcode_name": "Read", "role": "primary", "phase": "action"}]))
-        self.assertEqual([s["phase"] for s in out["steps_plan"]], ["action"])
-        self.assertEqual(out["steps_plan"][0]["opcode_name"], "Read")
+        with self.assertRaises(ValueError):
+            _run(dict(GOOD_STRUCTURED, steps_plan=[
+                "Write", {"opcode_name": "Read", "role": "primary", "phase": "action"}]))
 
     def test_single_action_step_passes_through(self):
         out = _run(dict(GOOD_STRUCTURED))
-        self.assertEqual(out["steps_plan"], GOOD_STRUCTURED["steps_plan"])
+        self.assertEqual(out["steps_plan"], prepared(GOOD_STRUCTURED)["steps_plan"])
         self.assertEqual(out["chain_summary"], GOOD_STRUCTURED["chain_summary"])
 
     def test_setup_before_action_and_verify_after_is_accepted(self):
@@ -60,7 +83,7 @@ class TestStepsPlanValidation(unittest.TestCase):
             {"opcode_name": "Compare", "role": "confirm the data matches", "phase": "verify"},
         ]
         out = _run(dict(GOOD_STRUCTURED, steps_plan=plan))
-        self.assertEqual(out["steps_plan"], plan)
+        self.assertEqual(out["steps_plan"], prepared(dict(GOOD_STRUCTURED, steps_plan=plan))["steps_plan"])
 
     def test_multiple_setup_steps_are_allowed(self):
         # PM-state-transition-style scenarios need more than one precondition
@@ -71,42 +94,41 @@ class TestStepsPlanValidation(unittest.TestCase):
             {"opcode_name": "Read", "role": "primary clause behavior", "phase": "action"},
         ]
         out = _run(dict(GOOD_STRUCTURED, steps_plan=plan))
-        self.assertEqual(out["steps_plan"], plan)
+        self.assertEqual(out["steps_plan"], prepared(dict(GOOD_STRUCTURED, steps_plan=plan))["steps_plan"])
 
-    def test_missing_action_step_falls_back_to_single_step(self):
+    def test_missing_action_step_is_rejected(self):
         plan = [{"opcode_name": "Write", "role": "oops", "phase": "setup"}]
-        out = _run(dict(GOOD_STRUCTURED, steps_plan=plan))
-        self.assertEqual(out["steps_plan"],
-                          [{"opcode_name": "Read", "role": "primary clause behavior", "phase": "action"}])
+        with self.assertRaises(ValueError):
+            _run(dict(GOOD_STRUCTURED, steps_plan=plan))
 
-    def test_action_step_naming_a_different_command_falls_back(self):
+    def test_action_step_naming_a_different_command_is_rejected(self):
         plan = [{"opcode_name": "Write", "role": "wrong target", "phase": "action"}]
-        out = _run(dict(GOOD_STRUCTURED, steps_plan=plan))
-        self.assertEqual(out["steps_plan"][0]["opcode_name"], "Read")
+        with self.assertRaises(ValueError):
+            _run(dict(GOOD_STRUCTURED, steps_plan=plan))
 
-    def test_invented_command_name_falls_back(self):
+    def test_invented_command_name_is_rejected(self):
         plan = [
             {"opcode_name": "Totally Made Up Command", "role": "setup", "phase": "setup"},
             {"opcode_name": "Read", "role": "primary clause behavior", "phase": "action"},
         ]
-        out = _run(dict(GOOD_STRUCTURED, steps_plan=plan))
-        self.assertEqual(len(out["steps_plan"]), 1)
+        with self.assertRaises(ValueError):
+            _run(dict(GOOD_STRUCTURED, steps_plan=plan))
 
-    def test_setup_after_action_falls_back(self):
+    def test_setup_after_action_is_rejected(self):
         plan = [
             {"opcode_name": "Read", "role": "primary clause behavior", "phase": "action"},
             {"opcode_name": "Write", "role": "misordered", "phase": "setup"},
         ]
-        out = _run(dict(GOOD_STRUCTURED, steps_plan=plan))
-        self.assertEqual(len(out["steps_plan"]), 1)
+        with self.assertRaises(ValueError):
+            _run(dict(GOOD_STRUCTURED, steps_plan=plan))
 
-    def test_verify_before_action_falls_back(self):
+    def test_verify_before_action_is_rejected(self):
         plan = [
             {"opcode_name": "Compare", "role": "misordered", "phase": "verify"},
             {"opcode_name": "Read", "role": "primary clause behavior", "phase": "action"},
         ]
-        out = _run(dict(GOOD_STRUCTURED, steps_plan=plan))
-        self.assertEqual(len(out["steps_plan"]), 1)
+        with self.assertRaises(ValueError):
+            _run(dict(GOOD_STRUCTURED, steps_plan=plan))
 
     def test_a_destructive_setup_step_riskier_than_the_action_is_accepted(self):
         # The canonical case: Write (risk_class 2, destructive) setting up
@@ -120,15 +142,15 @@ class TestStepsPlanValidation(unittest.TestCase):
             {"opcode_name": "Read", "role": "primary clause behavior", "phase": "action"},
         ]
         out = _run(dict(GOOD_STRUCTURED, steps_plan=plan))
-        self.assertEqual(out["steps_plan"], plan)
+        self.assertEqual(out["steps_plan"], prepared(dict(GOOD_STRUCTURED, steps_plan=plan))["steps_plan"])
 
-    def test_two_action_steps_falls_back(self):
+    def test_two_action_steps_is_rejected(self):
         plan = [
             {"opcode_name": "Read", "role": "primary clause behavior", "phase": "action"},
             {"opcode_name": "Write", "role": "also action?", "phase": "action"},
         ]
-        out = _run(dict(GOOD_STRUCTURED, steps_plan=plan))
-        self.assertEqual(len(out["steps_plan"]), 1)
+        with self.assertRaises(ValueError):
+            _run(dict(GOOD_STRUCTURED, steps_plan=plan))
 
     def test_admin_and_nvm_commands_can_mix_in_one_plan(self):
         plan = [
@@ -136,7 +158,7 @@ class TestStepsPlanValidation(unittest.TestCase):
             {"opcode_name": "Read", "role": "primary clause behavior", "phase": "action"},
         ]
         out = _run(dict(GOOD_STRUCTURED, steps_plan=plan))
-        self.assertEqual(out["steps_plan"], plan)
+        self.assertEqual(out["steps_plan"], prepared(dict(GOOD_STRUCTURED, steps_plan=plan))["steps_plan"])
 
 
 class TestReplanFeedback(unittest.TestCase):
@@ -145,10 +167,10 @@ class TestReplanFeedback(unittest.TestCase):
 
         def _capture(prompt, **kwargs):
             captured["prompt"] = prompt
-            return {"structured": dict(GOOD_STRUCTURED), "response_id": "l"}
+            return {"structured": prepared(GOOD_STRUCTURED), "response_id": "l"}
 
         with mock.patch.object(scenario_generator, "generate_rag_response",
-                                return_value={"chunks": [{"text": "spec"}], "response_id": "r"}), \
+                                return_value={"chunks": [EVIDENCE], "response_id": "r"}), \
              mock.patch.object(scenario_generator, "generate_llm_response", _capture):
             generate_scenario(SECTION, OPCODE, AVAILABLE_OPCODES,
                                feedback="step 0 (Write) was rejected: NVMe status: INVALID_FIELD")
@@ -160,10 +182,10 @@ class TestReplanFeedback(unittest.TestCase):
 
         def _capture(prompt, **kwargs):
             captured["prompt"] = prompt
-            return {"structured": dict(GOOD_STRUCTURED), "response_id": "l"}
+            return {"structured": prepared(GOOD_STRUCTURED), "response_id": "l"}
 
         with mock.patch.object(scenario_generator, "generate_rag_response",
-                                return_value={"chunks": [{"text": "spec"}], "response_id": "r"}), \
+                                return_value={"chunks": [EVIDENCE], "response_id": "r"}), \
              mock.patch.object(scenario_generator, "generate_llm_response", _capture):
             generate_scenario(SECTION, OPCODE, AVAILABLE_OPCODES)
         self.assertNotIn("did not work out", captured["prompt"])
@@ -175,10 +197,10 @@ class TestDeviceFacts(unittest.TestCase):
 
         def _capture(prompt, **kwargs):
             captured["prompt"] = prompt
-            return {"structured": dict(GOOD_STRUCTURED), "response_id": "l"}
+            return {"structured": prepared(GOOD_STRUCTURED), "response_id": "l"}
 
         with mock.patch.object(scenario_generator, "generate_rag_response",
-                                return_value={"chunks": [{"text": "spec"}], "response_id": "r"}), \
+                                return_value={"chunks": [EVIDENCE], "response_id": "r"}), \
              mock.patch.object(scenario_generator, "generate_llm_response", _capture):
             generate_scenario(SECTION, OPCODE, AVAILABLE_OPCODES,
                                device_facts="지원하는 optional admin 커맨드(OACS): Format NVM")
@@ -190,10 +212,10 @@ class TestDeviceFacts(unittest.TestCase):
 
         def _capture(prompt, **kwargs):
             captured["prompt"] = prompt
-            return {"structured": dict(GOOD_STRUCTURED), "response_id": "l"}
+            return {"structured": prepared(GOOD_STRUCTURED), "response_id": "l"}
 
         with mock.patch.object(scenario_generator, "generate_rag_response",
-                                return_value={"chunks": [{"text": "spec"}], "response_id": "r"}), \
+                                return_value={"chunks": [EVIDENCE], "response_id": "r"}), \
              mock.patch.object(scenario_generator, "generate_llm_response", _capture):
             generate_scenario(SECTION, OPCODE, AVAILABLE_OPCODES)
         self.assertNotIn("device_facts", captured["prompt"])

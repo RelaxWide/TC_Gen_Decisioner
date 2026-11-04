@@ -87,7 +87,7 @@ def _unsupported(i):
 def _plain_fail(i):
     # Nonzero exit, no INVALID_* text — a real firmware misbehavior, not a
     # rejected argument or an unsupported opcode, so this reaches judging.
-    return {"step_index": i, "exit_code": 1, "stdout": "unexpected failure, no further detail"}
+    return {"step_index": i, "exit_code": 1, "stdout": "NVMe status: INTERNAL: internal controller error"}
 
 
 class _FakeIndex:
@@ -147,6 +147,7 @@ class PipelineTestCase(unittest.TestCase):
             mock.patch.object(config, "active_coverage_index_path", lambda: index_path),
             mock.patch.object(config, "TC_STORE_PATH", tmp_path / "tc_store.json"),
             mock.patch.object(config, "COVERAGE_STATE_PATH", tmp_path / "coverage_state.json"),
+            mock.patch.object(config, "TARGET_SKIPS_PATH", tmp_path / "target_skips.json"),
             mock.patch.object(config, "FAILURE_CONTEXTS_DIR", tmp_path / "failure_contexts"),
             mock.patch.object(config, "VERDICTS_DIR", tmp_path / "verdicts"),
             mock.patch.object(config, "get_ssh_target", lambda: {
@@ -172,8 +173,8 @@ class PipelineTestCase(unittest.TestCase):
         return pipeline.run_pipeline(count=1, executor=executor, allow_destructive=True)
 
 
-class TestTcExecJudgmentsResetEachRun(PipelineTestCase):
-    def test_old_verdicts_and_failure_contexts_are_wiped_and_stale_tc_refs_cleared(self):
+class TestTcExecJudgmentsRetainedAcrossRuns(PipelineTestCase):
+    def test_old_verdicts_and_failure_contexts_are_retained_with_their_tc_references(self):
         # data/verdicts/tc_exec.json otherwise only ever grows across every
         # invocation that was ever run. tc_store.json's status/steps stay —
         # only the judgment trail and any now-dangling reference to it reset.
@@ -195,13 +196,13 @@ class TestTcExecJudgmentsResetEachRun(PipelineTestCase):
         with mock.patch.object(pipeline, "generate_scenario", side_effect=_single_step_scenario):
             pipeline.run_pipeline(count=1, executor=executor, allow_destructive=True)
 
-        self.assertFalse((old_fc_dir / "fc-old-1.json").exists())
+        self.assertTrue((old_fc_dir / "fc-old-1.json").exists())
         verdicts = json.loads((Path(config.VERDICTS_DIR) / "tc_exec.json").read_text(encoding="utf-8"))
-        self.assertEqual([v for v in verdicts if v.get("verdict_id") == "verdict-old"], [])
+        self.assertEqual(len([v for v in verdicts if v.get("verdict_id") == "verdict-old"]), 1)
 
         old_tc = next(tc for tc in tc_store.load_all() if tc["tc_id"] == "tc-old")
-        self.assertNotIn("verdict_id", old_tc)
-        self.assertNotIn("failure_context_id", old_tc)
+        self.assertEqual(old_tc["verdict_id"], "verdict-old")
+        self.assertEqual(old_tc["failure_context_id"], "fc-old-1")
         self.assertEqual(old_tc["status"], "FAIL")  # coverage-relevant fields untouched
 
 
@@ -383,6 +384,22 @@ class TestScenarioGenerationFailureIsNotFatal(PipelineTestCase):
         self.assertEqual(calls["n"], 2)  # both targets were attempted
         self.assertEqual(result["skipped"], 1)
         self.assertEqual(len(executor.calls), 1)  # the skipped target never reached execution
+
+    def test_a_generation_skip_is_remembered_so_the_next_run_moves_on(self):
+        # A skip leaves no TC record. Unrecorded, an empty store re-picked the
+        # same first target on every `--count 1` run and failed it forever.
+        seen = []
+
+        def _always_fails(section, opcode_entry, available_opcodes, feedback=None, device_facts=None):
+            seen.append(section["section_id"])
+            raise LLMCallError("bad reply")
+
+        with mock.patch.object(pipeline, "generate_scenario", side_effect=_always_fails):
+            pipeline.run_pipeline(count=1, executor=_FakeExecutor([]), allow_destructive=True)
+            pipeline.run_pipeline(count=1, executor=_FakeExecutor([]), allow_destructive=True)
+        self.assertEqual(len(set(seen)), 2, seen)
+        log = json.loads(config.TARGET_SKIPS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual([e["kind"] for e in log], ["generation_failed", "generation_failed"])
 
 
 class TestDeviceFactsReachGeneration(PipelineTestCase):
@@ -604,7 +621,7 @@ class TestReplanLlmFailureFallsBackToOriginal(PipelineTestCase):
         # unimplemented setup step — the per-step view keeps both.
         self.assertEqual(result["unsupported"], 0)
         stored = json.loads(Path(config.TC_STORE_PATH).read_text(encoding="utf-8"))
-        self.assertEqual(stored[0]["status"], "PASS")
+        self.assertEqual(stored[0]["status"], "UNVERIFIED")
         self.assertEqual(stored[0]["step_statuses"], ["UNSUPPORTED", "PASS"])
 
 
@@ -623,7 +640,8 @@ class TestJudgeFailureIsNotFatal(PipelineTestCase):
         tc = stored[0]
         self.assertEqual(tc["status"], "FAIL")
         self.assertIsNone(tc.get("verdict_id"))
-        self.assertIsNone(tc.get("failure_context_id"))
+        self.assertTrue(tc.get("failure_context_id"))
+        self.assertTrue((config.FAILURE_CONTEXTS_DIR / "tc_exec" / (tc["failure_context_id"] + ".json")).exists())
 
 
 class _TimingOutExecutor(_FakeExecutor):
@@ -761,8 +779,8 @@ FIELD_VALUE_INDEX_JSON = {
 }
 
 
-class TestFieldValueTargetIsUnsupportedNotError(PipelineTestCase):
-    def test_a_verified_rejection_counts_as_unsupported_not_our_bug(self):
+class TestFieldValueRejectionDoesNotProveUnsupported(PipelineTestCase):
+    def test_a_verified_selector_does_not_prove_all_arguments_valid(self):
         # End-to-end: a target whose section requires a specific Log Page
         # Identifier, correctly placed in CDW10 (field_value_verified=True),
         # gets rejected by the (stub) controller — this must land as
@@ -781,18 +799,19 @@ class TestFieldValueTargetIsUnsupportedNotError(PipelineTestCase):
                     "direction": "none", "nsid": 0, "shared_facts": {}, "field_breakdown": "LID=01h",
                     "field_value_verified": True}
 
-        executor = _FakeExecutor([[{"step_index": 0, "exit_code": 22, "stdout":
-                                     "NVMe status: INVALID_LOG_PAGE: The log page indicated is invalid(0x109)"}]])
+        refused = [{"step_index": 0, "exit_code": 22, "stdout":
+                    "NVMe status: INVALID_NS: invalid namespace(0xb)"}]
+        executor = _FakeExecutor([refused, refused])
         with mock.patch.object(config, "active_coverage_index_path", lambda: index_path), \
              mock.patch.object(pipeline, "generate_scenario", side_effect=_single_step_for), \
              mock.patch.object(tc_writer, "author_args", side_effect=_verified_author_args):
             result = pipeline.run_pipeline(count=1, executor=executor, allow_destructive=True)
 
-        self.assertEqual(result["unsupported"], 1)
-        self.assertEqual(result["our_bugs"], 0)
+        self.assertEqual(result["unsupported"], 0)
+        self.assertEqual(result["our_bugs"], 1)
         self.assertEqual(result["skipped"], 0)
         stored = json.loads(Path(config.TC_STORE_PATH).read_text(encoding="utf-8"))
-        self.assertEqual(stored[0]["status"], "UNSUPPORTED")
+        self.assertEqual(stored[0]["status"], "ERROR")
 
 
 if __name__ == "__main__":

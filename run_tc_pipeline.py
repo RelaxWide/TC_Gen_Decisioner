@@ -7,7 +7,8 @@ from shared.run_log import capture_to_file
 from tc_system.execution.ssh_runner import DestructiveStepBlocked, passthru_cmd
 from tc_system.pipeline import run_pipeline
 
-_STATUS_LABEL = {"PASS": "PASS", "FAIL": "FAIL", "ERROR": "우리버그", "UNSUPPORTED": "미지원"}
+_STATUS_LABEL = {"PASS": "PASS", "FAIL": "FAIL", "ERROR": "실행/인자 오류", "UNSUPPORTED": "미지원 응답",
+                 "UNVERIFIED": "미검증"}
 _PHASE_LABEL = {"setup": "사전조건", "action": "본동작", "verify": "확인"}
 _tc_start_times = {}
 
@@ -126,13 +127,21 @@ def _print_result(index, total, tc):
         _dual_label("     ", "⚠ 재시도", detail)
 
     execution = tc.get("execution") or {}
+    verification = tc.get("verification") or {}
+    print(f"     스펙 검증: {verification.get('status', 'UNVERIFIED')}")
+    for req in verification.get("requirements", []):
+        _dual_label("     ", req["status"], req["description"])
+        for check in req.get("results", []):
+            _dual_label("       ", check["result"], check["detail"])
+    for issue in verification.get("issues", []):
+        _dual_label("     ", "미검증 사유", issue)
     reason = execution.get("args_rejected") or execution.get("host_tool_crash")
     _dual_label("     ", "사유", reason, width=110)
     if status == "UNSUPPORTED":
         # evaluate_criteria runs the generic rules regardless of status, so
         # "exit code != 0" always fires here too — that's expected for an
         # unimplemented command and not a real violation, so it's not shown.
-        print("     (옵션 커맨드 미구현 — 드라이브에 대한 유효한 결과)")
+        print("     (미지원 응답 관측 — 필수/선택 기능의 스펙 적합성을 뜻하지 않음)")
     elif status == "FAIL":
         violated = [c for c in execution.get("criteria_results", []) if c["result"] == "violated"]
         for c in violated:
@@ -226,10 +235,13 @@ def _run(args) -> int:
           f"failed={result['failed']} our_bugs={result.get('our_bugs', 0)} unsupported={result.get('unsupported', 0)} "
           f"skipped={result.get('skipped', 0)}")
     cov = result["coverage"]
-    print(f"coverage: 테스트가능 {cov.get('reachable_pct', 0)}% ({cov.get('reachable_covered', 0)}/{cov.get('reachable_total', 0)})"
+    print(f"요구사항 검증: {cov.get('requirements_evaluated', 0)}/{cov.get('requirements_total', 0)} 생성 요구사항"
+          f" (PASS={cov.get('requirements_passed', 0)}, FAIL={cov.get('requirements_failed', 0)}, "
+          f"미검증={cov.get('requirements_unverified', 0)}) — 전체 스펙 검증률 아님")
+    print(f"명령 실행 이력: 연결된 조항 {cov.get('reachable_pct', 0)}% ({cov.get('reachable_covered', 0)}/{cov.get('reachable_total', 0)})"
           f" / 전체스펙 {cov['section_pct']}% ({cov['section_covered']}/{cov['section_total']}), "
           f"opcode {cov['opcode_pct']}% ({cov['opcode_covered']}/{cov['opcode_total']})")
-    print(f"  PASS로 커버 {cov.get('section_passing', 0)} / FAIL로만 커버 {cov.get('section_failing', 0)}"
+    print(f"  명령 완료 이력 {cov.get('section_passing', 0)} / 명령 실패 이력 {cov.get('section_failing', 0)}"
           f" / 미지원 {cov.get('section_unsupported', 0)} / 집계제외 {cov.get('excluded_tc_count', 0)}")
     return 0
 

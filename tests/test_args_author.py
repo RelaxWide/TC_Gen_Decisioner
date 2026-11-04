@@ -133,7 +133,8 @@ class TestAuthorArgs(unittest.TestCase):
         # CDW0) legitimately move no buffer at all — that zero-length choice
         # was measured accepted (PASS) on real hardware and must stay legal
         # even though opcode 0x06's bits nominally allow a "read" transfer.
-        out = _run(dict(GOOD, direction="none", data_len=0))
+        out = _run(dict(GOOD, direction="none", data_len=0),
+                   opcode={"name": "Get Features", "raw_opcode": "0x0A", "command_set": "ADMIN"})
         self.assertEqual(out["direction"], "none")
 
     def test_bidirectional_opcode_bits_allow_either_direction(self):
@@ -321,12 +322,13 @@ class TestAuthorArgs(unittest.TestCase):
         with mock.patch.object(args_author, "generate_rag_response",
                                 return_value={"chunks": [{"text": "spec"}], "response_id": "r"}), \
              mock.patch.object(args_author, "generate_llm_response",
-                                return_value={"structured": dict(GOOD, cdw10="0x00000000"),
+                                return_value={"structured": dict(GOOD, cdw10="0x00000000", cdw13="0x02000000"),
                                               "response_id": "l"}):
             out = author_args(SECTION, get_lba_status, ACTIVE_NSID,
                                required_field_values=[{"field_name": "Action Type", "hex_value": "0x02"}])
         self.assertEqual(out["cdw10"], "0x00000000")
-        self.assertFalse(out["field_value_verified"])
+        self.assertEqual(out["cdw13"], "0x02000000")
+        self.assertTrue(out["field_value_verified"])
 
     def test_no_required_field_values_is_not_verified(self):
         out = _run(dict(GOOD))

@@ -57,6 +57,12 @@ def _parse_effects_log(raw: str) -> list[str]:
     return _EFFECTS_RE.findall(raw or "")
 
 
+def in_use_lba_bytes(raw: dict[str, str] | None) -> int | None:
+    """LBA data size of the namespace's in-use format, or None if unknown."""
+    match = _LBA_IN_USE_RE.search((raw or {}).get("id_ns", "") or "")
+    return int(match.group(1)) if match else None
+
+
 def summarize_device_capabilities(raw: dict[str, str]) -> str:
     """`raw` is the dict `ssh_runner.probe_device_capabilities` returns
     (`{"id_ctrl": <text>, "id_ns": <text>, "effects_log": <text>}`, any of

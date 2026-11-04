@@ -1,7 +1,9 @@
 import unittest
 
 import config
-from tc_system.coverage.coverage_state import compute_coverage, pick_next_targets
+from tc_system.verification import UNEXECUTABLE_COMMANDS
+from tc_system.coverage.coverage_state import (UNRESOLVED_ATTEMPT_LIMIT, compute_coverage,
+                                              pick_next_targets)
 from tc_system.coverage.spec_coverage_index import SpecCoverageIndexFile
 
 
@@ -50,14 +52,14 @@ class TestCoverageIndex(unittest.TestCase):
 
     def test_excluded_sections_are_offered_again_as_targets(self):
         sections = self.testable
-        targets = pick_next_targets(self.index, [self._tc(0, "ERROR")], count=len(sections))
+        targets = pick_next_targets(self.index, [self._tc(0, "ERROR")], count=10000)
         self.assertIn(sections[0]["section_id"], [s["section_id"] for s, _ in targets])
 
-    def test_pick_next_targets_skips_covered_sections(self):
+    def test_exposure_does_not_permanently_exclude_a_spec_section(self):
         sections = self.testable
-        targets = pick_next_targets(self.index, [self._tc(0, "PASS")], count=len(sections))
+        targets = pick_next_targets(self.index, [self._tc(0, "PASS")], count=10000)
         target_ids = [s["section_id"] for s, _ in targets]
-        self.assertNotIn(sections[0]["section_id"], target_ids)
+        self.assertIn(sections[0]["section_id"], target_ids)
 
     def test_legacy_record_without_the_field_is_excluded(self):
         # Records predating `uses_placeholder_args` must not silently count —
@@ -119,10 +121,10 @@ class TestCoverageIndex(unittest.TestCase):
 
     def test_an_errored_step_section_is_still_offered_as_a_target(self):
         tc = self._multi_tc(0, 1, "PASS", "ERROR")
-        targets = pick_next_targets(self.index, [tc], count=len(self.testable))
+        targets = pick_next_targets(self.index, [tc], count=10000)
         target_ids = [s["section_id"] for s, _ in targets]
         self.assertIn(self.testable[1]["section_id"], target_ids)
-        self.assertNotIn(self.testable[0]["section_id"], target_ids)
+        self.assertIn(self.testable[0]["section_id"], target_ids)
 
     def test_each_step_gets_its_own_outcome_not_the_siblings(self):
         # Previously the whole TC would read UNSUPPORTED and mislabel the
@@ -175,6 +177,55 @@ class TestOpcodeAndSectionLookup(unittest.TestCase):
 
     def test_get_section_returns_none_for_a_nonexistent_id(self):
         self.assertIsNone(self.index.get_section("nvm:999.999.999"))
+
+
+class TestTargetRotation(unittest.TestCase):
+    def setUp(self):
+        self.index = SpecCoverageIndexFile(config.active_coverage_index_path())
+        # Clauses whose every opcode is executable here (Abort/AER are never offered).
+        self.testable = [s for s in self.index.list_sections() if self.index.opcodes_for_section(s)
+                         and all(o["name"] not in UNEXECUTABLE_COMMANDS
+                                 for o in self.index.opcodes_for_section(s))]
+
+    def _tc(self, section, status, n=0):
+        opcode = self.index.opcodes_for_section(section)[0]
+        return {"tc_id": f"tc-{section['section_id']}-{n}", "status": status, "uses_placeholder_args": False,
+                "steps": [{"phase": "action"}], "step_section_ids": [section["section_id"]],
+                "step_opcodes": [opcode["opcode"]], "source_section_ids": [section["section_id"]],
+                "source_opcodes": [opcode["opcode"]]}
+
+    def _order(self, records):
+        return [s["section_id"] for s, _ in pick_next_targets(self.index, records, count=10000)]
+
+    def test_unsupported_target_goes_behind_every_unanswered_one(self):
+        first = self.testable[0]
+        once_errored = self.testable[1]
+        order = self._order([self._tc(first, "UNSUPPORTED"), self._tc(once_errored, "ERROR")])
+        self.assertIn(first["section_id"], order)  # still offered, never excluded
+        self.assertLess(order.index(once_errored["section_id"]), order.index(first["section_id"]))
+        never_tried = [s["section_id"] for s in self.testable[2:]]
+        self.assertTrue(all(order.index(sid) < order.index(first["section_id"]) for sid in never_tried))
+
+    def test_repeated_errors_stop_outranking_answered_targets_after_the_limit(self):
+        stuck, answered = self.testable[0], self.testable[1]
+        records = [self._tc(stuck, "ERROR", n) for n in range(UNRESOLVED_ATTEMPT_LIMIT)]
+        records.append(self._tc(answered, "UNSUPPORTED"))
+        order = self._order(records)
+        self.assertLess(order.index(answered["section_id"]), order.index(stuck["section_id"]))
+
+    def test_one_opcode_per_clause_per_batch(self):
+        order = self._order([])
+        self.assertEqual(len(order), len(set(order)))
+
+    def test_skipped_targets_count_as_attempts(self):
+        first = self._order([])[0]
+        opcode = next(o for s, o in pick_next_targets(self.index, [], count=1))
+        skips = [{"section_id": first, "opcode": opcode["opcode"]}]
+        self.assertNotEqual(pick_next_targets(self.index, [], 1, skip_records=skips)[0][0]["section_id"], first)
+
+    def test_commands_this_executor_cannot_run_are_never_offered(self):
+        picked = pick_next_targets(self.index, [], count=10000)
+        self.assertFalse([o["name"] for _, o in picked if o["name"] in UNEXECUTABLE_COMMANDS])
 
 
 if __name__ == "__main__":

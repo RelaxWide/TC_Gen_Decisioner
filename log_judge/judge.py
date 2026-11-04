@@ -9,6 +9,32 @@ from shared.file_store import load_json
 from shared.ids import stable_id
 from shared.llm_client import generate_llm_response
 from shared.rag_client import generate_rag_response
+from shared.spec_evidence import JUDGE_EVIDENCE_CHARS, limit_evidence
+
+_STEP_FIELDS = ("name", "phase", "role", "mode", "opcode", "nsid", "cdw10", "cdw11", "cdw12",
+                "cdw13", "cdw14", "cdw15", "data_len", "direction", "expected_status",
+                "field_constraints", "args_source")
+
+
+def _compact_definition(definition):
+    """What the judge needs to reason about the test, without the spec evidence
+    (sent once, as spec_context) or the per-step copies of the scenario."""
+    if not definition:
+        return definition
+    contract = definition.get("contract") or {}
+    verification = definition.get("verification") or {}
+    scenario = definition.get("scenario") or {}
+    return {
+        "scenario": {k: scenario.get(k) for k in ("description", "preconditions", "chain_summary")},
+        "steps": [{k: s.get(k) for k in _STEP_FIELDS if k in s} for s in definition.get("steps") or []],
+        "requirements": [{k: r.get(k) for k in ("description", "quote", "evidence_id", "checks")}
+                         for r in contract.get("requirements") or []],
+        "precondition_checks": contract.get("precondition_checks") or [],
+        "verification": {"status": verification.get("status"), "issues": verification.get("issues"),
+                         "requirements": [{"description": r.get("description"), "status": r.get("status"),
+                                           "results": r.get("results")}
+                                          for r in verification.get("requirements") or []]},
+    }
 
 JUDGE_RESPONSE_SCHEMA = {
     "classification": 'exactly one of "firmware_defect", "test_env_issue", "needs_engineer_review"',
@@ -25,6 +51,12 @@ JUDGE_SYSTEM_PROMPT = (
     "firmware defect in the drive, an issue with the test environment/harness, or whether "
     "an engineer must investigate further. Base the verdict only on the given evidence; "
     "if the evidence is thin or ambiguous, say so and choose needs_engineer_review.\n\n"
+    "For TC_EXEC, inspect test_definition first: the actual encoded fields, expected status, "
+    "cited requirements, measured checks and prerequisites. An expected error is not a defect. "
+    "A command completing successfully does not prove the scenario was executed. An unverified "
+    "precondition, missing data or a host timeout does not by itself prove either a firmware or "
+    "environment fault. Do not invent a comparison that the harness did not perform. Coverage "
+    "IDs with a/n suffixes are internal identifiers; only steps[].opcode is the wire opcode.\n\n"
     "Write rationale and every guidance entry in Korean (한국어). classification itself "
     "must stay exactly one of the three literal English enum values given in the schema "
     "— do not translate it."
@@ -77,13 +109,16 @@ def _extract_command_name(fc: dict) -> str | None:
 def _build_prompt(fc: dict) -> tuple[str, str | None, str | None]:
     opcode = _extract_opcode(fc)
     name = _extract_command_name(fc)
+    signals = {k: v for k, v in fc["signals"].items() if k not in ("test_definition", "step_results")}
+    definition = fc["signals"].get("test_definition")
     lines = [
         f"source_type={fc['source_type']} run_id={fc['run_id']} timestamp={fc['timestamp']}",
         # Budgets are generous on purpose: the stored excerpts are already
         # signal-prioritised and capped, so a tight slice here was dropping the
         # discriminating kernel lines (one context carries 155 resets and 45
         # timeouts; 2 KB showed only the first handful of resets).
-        f"signals={json.dumps(fc['signals'], ensure_ascii=False)[:4000]}",
+        f"test_definition={json.dumps(_compact_definition(definition), ensure_ascii=False)}",
+        f"signals={json.dumps(signals, ensure_ascii=False)}",
         f"primary_log_excerpt=\n{fc['primary_log_excerpt'][:8000]}",
         f"dmesg_excerpt=\n{(fc.get('dmesg_excerpt') or '')[:12000]}",
     ]
@@ -142,13 +177,18 @@ def judge_failure_context(fc: dict, use_rag_grounding: bool = True) -> dict:
 
     if use_rag_grounding and (opcode or name):
         query = " ".join(t for t in (name, f"opcode {opcode}" if opcode else None) if t)
-        rag = generate_rag_response(f"NVMe {query} expected behavior and error handling", top_k=3)
+        evidence = ((fc["signals"].get("test_definition") or {}).get("contract") or {}).get("evidence")
+        rag = ({"chunks": evidence, "response_id": stable_id("rag-judgment", *(e["evidence_id"] for e in evidence))}
+               if evidence else generate_rag_response(f"NVMe {query} expected behavior and error handling", top_k=3))
         fc["spec_grounding"] = {
             "queried": True,
             "rag_response_id": rag["response_id"],
-            "matched_section_ids": [c["section_id"] for c in rag["chunks"] if c.get("section_id")],
+            "matched_section_ids": list(dict.fromkeys(s for c in rag["chunks"]
+                                                       for s in (c.get("section_ids") or [c.get("section_id")]) if s)),
+            "matched_chunk_ids": [c.get("chunk_id") for c in rag["chunks"] if c.get("chunk_id")],
         }
-        prompt += "\n\nspec_context=\n" + "\n".join(c["text"] for c in rag["chunks"])
+        prompt += "\n\nspec_context=\n" + "\n".join(
+            c["text"] for c in limit_evidence(rag["chunks"], JUDGE_EVIDENCE_CHARS))
 
     llm = generate_llm_response(prompt, system=JUDGE_SYSTEM_PROMPT,
                                  response_schema=JUDGE_RESPONSE_SCHEMA, caller="judge")

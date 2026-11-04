@@ -12,7 +12,7 @@ def build_report_model() -> dict:
     tc_records = load_json(config.TC_STORE_PATH, default=[])
 
     coverage = load_json(config.COVERAGE_STATE_PATH, default=None)
-    if coverage is None and config.active_coverage_index_path().exists():
+    if config.active_coverage_index_path().exists():
         index = SpecCoverageIndexFile(config.active_coverage_index_path())
         coverage = compute_coverage(index, tc_records)
 

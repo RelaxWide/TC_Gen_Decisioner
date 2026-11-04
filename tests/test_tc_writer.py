@@ -125,7 +125,7 @@ class TestBuildTcMultiStep(unittest.TestCase):
         self.calls = []
 
         def _fake_author_args(section, opcode_entry, active_nsid, prior_steps=None, rejected=None,
-                               device_facts=None, required_field_values=None):
+                               device_facts=None, required_field_values=None, test_intent=None):
             self.calls.append({"opcode_entry": opcode_entry, "prior_steps": prior_steps})
             facts = {"lba": "0x5", "nlb": "0"} if opcode_entry["name"] == "Write" else {}
             return _authored(opcode_entry, shared_facts=facts)
@@ -199,7 +199,7 @@ class TestReauthorSteps(unittest.TestCase):
         calls = []
 
         def _capture(section, opcode_entry, active_nsid, prior_steps=None, rejected=None, device_facts=None,
-                     required_field_values=None):
+                     required_field_values=None, test_intent=None):
             calls.append({"opcode_entry": opcode_entry, "prior_steps": prior_steps, "rejected": rejected})
             facts = {"lba": "0x9", "nlb": "0"} if opcode_entry["name"] == "Write" else {}
             return _authored(opcode_entry, shared_facts=facts)
@@ -225,7 +225,7 @@ class TestReauthorSteps(unittest.TestCase):
         captured = {}
 
         def _capture(section, opcode_entry, active_nsid, prior_steps=None, rejected=None, device_facts=None,
-                     required_field_values=None):
+                     required_field_values=None, test_intent=None):
             captured["prior_steps"] = prior_steps
             return _authored(opcode_entry)
 

@@ -1,15 +1,11 @@
 from datetime import datetime, timezone
+from collections import Counter
 
-# A TC counts toward coverage once it actually reached the device and produced an
-# answer about it:
-#   PASS        — the command behaved as the clause describes.
-#   FAIL        — it ran and misbehaved; the path was still exercised.
-#   UNSUPPORTED — the controller reported INVALID_OPCODE. Most NVMe commands are
-#                 optional, so "this drive does not implement it" is a real
-#                 finding about the drive, not a gap in testing.
-# ERROR is excluded: either the harness never landed the command (SSH failure)
-# or our own arguments were malformed (INVALID_FIELD, host tool crash), so
-# nothing was learned about the spec and the section is re-offered.
+from tc_system.verification import UNEXECUTABLE_COMMANDS, verify_tc
+from tc_system.execution.expectation_checker import check_step_expectations, check_execution
+
+# Historical command exposure only. Requirement verification is separately
+# computed from cited executable checks; visiting an opcode never completes a clause.
 COVERING_STATUSES = ("PASS", "FAIL", "UNSUPPORTED")
 
 
@@ -32,9 +28,42 @@ def _covering_entries(tc: dict) -> list[tuple[str, str, str]]:
     section_ids = tc.get("step_section_ids") or tc.get("source_section_ids", [])
     opcodes = tc.get("step_opcodes") or tc.get("source_opcodes", [])
     statuses = tc.get("step_statuses")
+    if tc.get("steps") and (tc.get("execution") or {}).get("step_results"):
+        statuses = check_step_expectations(tc, tc["execution"])
     if not statuses or len(statuses) != len(section_ids):
         statuses = [tc.get("status")] * len(section_ids)
     return list(zip(section_ids, opcodes, statuses))
+
+
+def requirement_coverage(tc_records):
+    rows = {}
+    for tc in tc_records:
+        if tc.get("uses_placeholder_args", True):
+            continue
+        execution = tc.get("execution") or {}
+        verification = verify_tc(tc, execution)
+        command_status = check_execution(tc, execution) if tc.get("steps") else "ERROR"
+        for req in verification["requirements"]:
+            rid = req["requirement_id"]
+            row = rows.setdefault(rid, {"requirement_id": rid, "section_id": req["section_id"],
+                                        "description": req["description"], "quote": req["quote"],
+                                        "evidence_id": req["evidence_id"], "observations": []})
+            status = req["status"]
+            if command_status in {"ERROR", "UNSUPPORTED"} or (command_status == "FAIL" and status == "PASS"):
+                status = "UNVERIFIED"
+            row["observations"].append({"tc_id": tc["tc_id"], "status": status})
+    for row in rows.values():
+        statuses = {o["status"] for o in row["observations"]} - {"UNVERIFIED"}
+        row["status"] = "MIXED" if len(statuses) > 1 else next(iter(statuses), "UNVERIFIED")
+    values = list(rows.values())
+    counts = Counter(r["status"] for r in values)
+    evaluated = sum(counts[s] for s in ("PASS", "FAIL", "MIXED"))
+    return values, {"requirements_total": len(values), "requirements_evaluated": evaluated,
+                    "requirements_passed": counts["PASS"], "requirements_failed": counts["FAIL"],
+                    "requirements_mixed": counts["MIXED"], "requirements_unverified": counts["UNVERIFIED"],
+                    "requirements_evaluated_pct": round(100 * evaluated / len(values), 1) if values else 0.0,
+                    "sections_with_verified_cases": len({r["section_id"] for r in values
+                                                          if r["status"] != "UNVERIFIED"})}
 
 
 def compute_coverage(index, tc_records: list[dict]) -> dict:
@@ -109,12 +138,16 @@ def compute_coverage(index, tc_records: list[dict]) -> dict:
         if s["section_id"] in section_covering:
             doc["covered"] += 1
 
+    requirements, verified_summary = requirement_coverage(tc_records)
     return {
+        "schema_version": 2,
+        "requirement_coverage": requirements,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "section_coverage": section_coverage,
         "opcode_coverage": opcode_coverage,
         "excluded_tc_ids": excluded_tc_ids,
         "summary": {
+            **verified_summary,
             "section_total": len(sections),
             "section_covered": section_covered_count,
             "section_pct": round(100 * section_covered_count / len(sections), 1) if sections else 0.0,
@@ -157,25 +190,82 @@ def _target_rank(section: dict, opcode: dict) -> tuple:
     return (risk, authoritative, section["section_id"])
 
 
-def pick_next_targets(index, tc_records: list[dict], count: int) -> list[tuple[dict, dict]]:
-    """Return up to `count` (section, opcode) pairs not yet covered by any TC.
+def pick_next_targets(index, tc_records: list[dict], count: int,
+                      skip_records: list[dict] | None = None) -> list[tuple[dict, dict]]:
+    """Rotate through clause/opcode pairs, prioritizing unverified, less tried ones.
 
-    Sections whose only TCs ERRORed (or carried placeholder args) are offered
-    again — those runs never established anything about the section. For a
-    multi-step TC, a section is "covered" only via the specific step that was
-    actually about it, not by the TC's overall (possibly worse) scalar status.
+    One tested requirement does not finish a clause. Neither a legacy PASS nor
+    an unsupported setup step permanently removes a target. Completed requirement
+    quotes are supplied to the next scenario so it can choose another behavior.
     """
-    covered_sections = {
-        sid for tc in tc_records
-        for sid, _, status in _covering_entries(tc)
-        if status in COVERING_STATUSES
-    }
-    candidates = []
-    for section in index.list_sections():
-        if section["section_id"] in covered_sections:
+    requirements, _ = requirement_coverage(tc_records)
+    verified = Counter(r["section_id"] for r in requirements if r["status"] != "UNVERIFIED")
+    attempts, pair_attempts, unsupported_pairs = Counter(), Counter(), set()
+    for tc in tc_records:
+        pair = _action_pair(tc)
+        if pair:
+            attempts[pair[0]] += 1
+            pair_attempts[pair] += 1
+            if _action_unsupported(tc):
+                unsupported_pairs.add(pair)
+        else:
+            for sid in tc.get("source_section_ids", []):
+                attempts[sid] += 1
+    # A target skipped before reaching the device leaves no TC record. Without
+    # counting it, an empty store re-picked the same first target every run
+    # (measured: `--count 1` failed on the same generation forever).
+    for skip in skip_records or []:
+        attempts[skip["section_id"]] += 1
+        pair_attempts[(skip["section_id"], skip["opcode"])] += 1
+
+    def key(pair):
+        sid, opcode = pair[0]["section_id"], pair[1]["opcode"]
+        # "Has an answer": a verified requirement, the drive's own INVALID_OPCODE
+        # for this command, or enough tries that more of the same is unlikely to
+        # help. Such targets are still offered (one requirement never finishes a
+        # clause), just after every target that has none — otherwise the ~half
+        # of commands this drive does not implement would be re-generated and
+        # re-sent ahead of every verified clause, every run.
+        settled = (verified[sid] > 0 or (sid, opcode) in unsupported_pairs
+                   or attempts[sid] >= UNRESOLVED_ATTEMPT_LIMIT)
+        return (settled, attempts[sid], pair_attempts[(sid, opcode)], _target_rank(*pair))
+
+    candidates = sorted(((section, opcode) for section in index.list_sections()
+                         for opcode in index.opcodes_for_section(section)
+                         if opcode.get("name") not in UNEXECUTABLE_COMMANDS), key=key)
+    picked, seen_sections = [], set()
+    for section, opcode in candidates:
+        # One opcode per clause per batch; the others rotate in on later runs
+        # through pair_attempts.
+        if section["section_id"] in seen_sections:
             continue
-        for opcode in index.opcodes_for_section(section):
-            candidates.append((section, opcode))
+        seen_sections.add(section["section_id"])
+        picked.append((section, opcode))
+        if len(picked) == count:
             break
-    candidates.sort(key=lambda pair: _target_rank(*pair))
-    return candidates[:count]
+    return picked
+
+
+# Attempts without a verified requirement or an INVALID_OPCODE after which a
+# clause stops outranking clauses that already have an answer.
+UNRESOLVED_ATTEMPT_LIMIT = 3
+
+
+def _action_pair(tc: dict) -> tuple[str, str] | None:
+    """(section_id, opcode) of the command under test, from the per-step arrays."""
+    steps = tc.get("steps") or []
+    sections, opcodes = tc.get("step_section_ids") or [], tc.get("step_opcodes") or []
+    idx = next((i for i, s in enumerate(steps) if s.get("phase") == "action"), None)
+    if idx is not None and idx < len(sections) and idx < len(opcodes):
+        return sections[idx], opcodes[idx]
+    target = (tc.get("verification_contract") or {}).get("target_section_id")
+    if target and tc.get("source_opcodes"):
+        return target, tc["source_opcodes"][0]
+    return None
+
+
+def _action_unsupported(tc: dict) -> bool:
+    execution = tc.get("execution") or {}
+    if tc.get("steps") and execution.get("step_results"):
+        return check_execution(tc, execution) == "UNSUPPORTED"
+    return tc.get("status") == "UNSUPPORTED"

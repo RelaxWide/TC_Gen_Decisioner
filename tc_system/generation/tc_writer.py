@@ -17,6 +17,7 @@ how many setup/verify steps surround it.
 import re
 
 from tc_system.generation.args_author import ArgsAuthoringError, author_args
+from tc_system.verification import VERSION, payload_for_step, validate_fixed_fields
 
 PLACEHOLDER_ARGS = "placeholder"
 AUTHORED_ARGS = "authored"
@@ -38,7 +39,7 @@ def namespace_id_from_device_path(nvme_ns: str) -> int:
 def _command_step(section: dict, opcode_entry: dict, nvme_ctrl: str, nvme_ns: str, active_nsid: int,
                    phase: str | None = None, role: str | None = None,
                    prior_steps: list[dict] | None = None, rejected: dict | None = None,
-                   device_facts: str | None = None) -> dict:
+                   device_facts: str | None = None, test_intent: dict | None = None) -> dict:
     is_admin = opcode_entry["command_set"] == "ADMIN"
     step = {
         # Carried purely for display (run_tc_pipeline.py names each step by
@@ -58,6 +59,7 @@ def _command_step(section: dict, opcode_entry: dict, nvme_ctrl: str, nvme_ns: st
         "cdw10": "0x00000000",
         "cdw11": "0x00000000",
         "cdw12": "0x00000000",
+        "cdw13": "0x00000000", "cdw14": "0x00000000", "cdw15": "0x00000000",
         "data_len": 0,
         "direction": "none",
         "destructive": opcode_entry.get("destructive", False),
@@ -72,11 +74,16 @@ def _command_step(section: dict, opcode_entry: dict, nvme_ctrl: str, nvme_ns: st
         "args_source": PLACEHOLDER_ARGS,
         "shared_facts": {},
         "field_value_verified": False,
+        "test_intent": test_intent or {},
+        "field_constraints": (test_intent or {}).get("field_constraints", []),
+        "expected_status": (test_intent or {}).get("expected_status", "SUCCESS"),
+        "payload_hex": (test_intent or {}).get("payload_hex"),
+        "lba_bytes": (test_intent or {}).get("lba_bytes"),
     }
     try:
         authored = author_args(section, opcode_entry, active_nsid, prior_steps=prior_steps,
                                 rejected=rejected, device_facts=device_facts,
-                                required_field_values=section.get("field_values"))
+                                required_field_values=section.get("field_values"), test_intent=test_intent)
     except ArgsAuthoringError as exc:
         step["args_error"] = str(exc)
         return step
@@ -84,6 +91,7 @@ def _command_step(section: dict, opcode_entry: dict, nvme_ctrl: str, nvme_ns: st
         "cdw10": authored["cdw10"],
         "cdw11": authored["cdw11"],
         "cdw12": authored["cdw12"],
+        **{f"cdw{i}": authored.get(f"cdw{i}", "0x00000000") for i in range(13, 16)},
         "nsid": authored["nsid"],
         "data_len": authored["data_len"],
         "direction": authored["direction"],
@@ -98,14 +106,19 @@ def _command_step(section: dict, opcode_entry: dict, nvme_ctrl: str, nvme_ns: st
         # this to tell "this drive doesn't implement this specific value"
         # (a real finding) apart from "we authored a malformed argument".
         "field_value_verified": authored.get("field_value_verified", False),
+        "args_llm_response_id": authored.get("llm_response_id"),
     })
+    validate_fixed_fields(step, step["field_constraints"])
+    payload_for_step(step)  # Reject a promised payload that does not fit the buffer.
     return step
 
 
 def _prior_steps_up_to(resolved_steps: list[dict], steps: list[dict], upto: int) -> list[dict]:
     return [
         {"step": j, "phase": resolved_steps[j]["phase"], "opcode_name": resolved_steps[j]["opcode_entry"]["name"],
-         "facts": steps[j].get("shared_facts", {})}
+         "facts": steps[j].get("shared_facts", {}),
+         "encoded_fields": {k: steps[j].get(k) for k in ("nsid", "cdw10", "cdw11", "cdw12",
+                                                         "cdw13", "cdw14", "cdw15", "data_len", "direction")}}
         for j in range(upto)
     ]
 
@@ -128,15 +141,16 @@ def reauthor_steps(tc: dict, resolved_steps: list[dict], rejected: dict, active_
         rejection = {"step": first, "reason": rejected["reason"]} if j == i else None
         rebuilt = _command_step(rs["section"], rs["opcode_entry"], first["device"], first["device"], active_nsid,
                                  phase=rs["phase"], role=rs.get("role"),
-                                 prior_steps=prior_steps, rejected=rejection, device_facts=device_facts)
+                                 prior_steps=prior_steps, rejected=rejection, device_facts=device_facts,
+                                 test_intent=first.get("test_intent"))
         steps[j] = rebuilt
-        prior_steps.append({"step": j, "phase": rs["phase"], "opcode_name": rs["opcode_entry"]["name"],
-                             "facts": rebuilt.get("shared_facts", {})})
+        prior_steps = _prior_steps_up_to(resolved_steps, steps, j + 1)
     return steps
 
 
 def build_tc(tc_id: str, resolved_steps: list[dict], scenario: dict,
-             nvme_ctrl: str, nvme_ns: str, active_nsid: int, device_facts: str | None = None) -> dict:
+             nvme_ctrl: str, nvme_ns: str, active_nsid: int, device_facts: str | None = None,
+             lba_bytes: int | None = None) -> dict:
     from tc_system.models import make_tc_record
 
     action = next(rs for rs in resolved_steps if rs["phase"] == "action")
@@ -146,9 +160,18 @@ def build_tc(tc_id: str, resolved_steps: list[dict], scenario: dict,
     steps: list[dict] = []
     for rs in resolved_steps:
         prior_steps = _prior_steps_up_to(resolved_steps, steps, len(steps))
+        intent = {"scenario": scenario["description"], "preconditions": scenario["preconditions"],
+                  "requirements": scenario.get("requirements", []),
+                  "phase": rs["phase"], "role": rs.get("role"),
+                  "field_constraints": rs.get("field_constraints", []),
+                  "expected_status": rs.get("expected_status", "SUCCESS"),
+                  "payload_hex": rs.get("payload_hex"),
+                  # Rides in test_intent so a reauthor (which reuses the stored
+                  # intent) checks the same buffer size as the first attempt.
+                  "lba_bytes": lba_bytes}
         steps.append(_command_step(rs["section"], rs["opcode_entry"], nvme_ctrl, nvme_ns, active_nsid,
                                     phase=rs["phase"], role=rs.get("role"), prior_steps=prior_steps,
-                                    device_facts=device_facts))
+                                    device_facts=device_facts, test_intent=intent))
 
     if len(resolved_steps) == 1:
         expectation_description = (
@@ -187,4 +210,13 @@ def build_tc(tc_id: str, resolved_steps: list[dict], scenario: dict,
     tc["step_section_ids"] = [rs["section"]["section_id"] for rs in resolved_steps]
     tc["step_opcodes"] = [rs["opcode_entry"]["opcode"] for rs in resolved_steps]
     tc["chain_summary"] = chain_summary
+    tc["verification_contract"] = {
+        "version": VERSION, "target_section_id": action["section"]["section_id"],
+        "requirements": scenario.get("requirements", []),
+        "precondition_checks": scenario.get("precondition_checks", []),
+        "evidence": scenario.get("spec_evidence", []),
+    }
+    if scenario.get("requirements"):
+        tc["expectation"]["description"] = " / ".join(r["description"] for r in scenario["requirements"])
+        tc["expectation"]["fail_criteria"] = []  # The contract is the single source of checks.
     return tc

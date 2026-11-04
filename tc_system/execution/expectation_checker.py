@@ -12,7 +12,10 @@ leaves stdout empty, so without that merge these rules can never fire.
 """
 import re
 
-TIMEOUT_MARKERS = ("timeout", "timed out", "TimeoutExpired")
+from tc_system.verification import (HOST_ERROR_RE, KERNEL_ABORT_RE, completion_status, matches_expected,
+                                    expected_status, payload_for_step, verify_tc)
+
+TIMEOUT_MARKERS = ("timed out", "TimeoutExpired", "command timeout", "I/O timeout")
 ERROR_STATUS_MARKERS = ("NVMe status:", "nvme status:")
 
 # A crash of nvme-cli itself on the host, not a device fault. Seen for real:
@@ -26,23 +29,46 @@ HOST_CRASH_MARKERS = ("malloc(", "corrupted", "Segmentation fault", "double free
 
 
 def _nonzero_exit(tc_record: dict, execution_result: dict) -> tuple[bool, str]:
-    offenders = [r for r in execution_result["step_results"] if r["exit_code"] != 0]
+    steps = tc_record.get("steps", [])
+    offenders = [r for r in execution_result.get("step_results", []) if r["exit_code"] != 0
+                 and not (r["step_index"] < len(steps) and matches_expected(steps[r["step_index"]], r))]
     if offenders:
         codes = ", ".join(f"step{r['step_index']}={r['exit_code']}" for r in offenders)
         return True, f"nvme-cli exit code != 0 ({codes})"
     return False, "all steps exited 0"
 
 
+def kernel_aborted(execution_result: dict) -> int | None:
+    """Index of the first step the kernel cancelled (see KERNEL_ABORT_RE) -
+    the same finding as an SSH timeout, caught one layer lower."""
+    for r in execution_result.get("step_results", []):
+        if r.get("started", True) and KERNEL_ABORT_RE.search(str(r.get("stdout", ""))):
+            return r["step_index"]
+    return None
+
+
+def device_hung(execution_result: dict) -> bool:
+    """SSH batch timeout or kernel-side cancellation: never retried, always
+    followed by a health check, and always FAIL."""
+    return bool(execution_result.get("timed_out")) or kernel_aborted(execution_result) is not None
+
+
 def _timed_out(tc_record: dict, execution_result: dict) -> tuple[bool, str]:
     if execution_result.get("timed_out"):
         return True, "command batch exceeded its SSH timeout"
-    blob = " ".join(str(r.get("stdout", "")) for r in execution_result["step_results"])
+    aborted = kernel_aborted(execution_result)
+    if aborted is not None:
+        return True, f"step{aborted}: the kernel cancelled the command (EINTR/EIO after its nvme timeout or a reset)"
+    blob = " ".join(str(r.get("stdout", "")) for r in execution_result.get("step_results", []))
     hit = next((m for m in TIMEOUT_MARKERS if m.lower() in blob.lower()), None)
     return (True, f"timeout reported in command output ({hit})") if hit else (False, "no timeout reported")
 
 
 def _controller_error_status(tc_record: dict, execution_result: dict) -> tuple[bool, str]:
-    for r in execution_result["step_results"]:
+    for r in execution_result.get("step_results", []):
+        steps = tc_record.get("steps", [])
+        if r["step_index"] < len(steps) and matches_expected(steps[r["step_index"]], r):
+            continue
         out = str(r.get("stdout", ""))
         if any(m in out for m in ERROR_STATUS_MARKERS) and "SUCCESS" not in out.upper():
             # Just the one line carrying the status text, not out.strip()[:200]
@@ -65,7 +91,7 @@ def _vacuous_success(tc_record: dict, execution_result: dict) -> tuple[bool, str
     a false confirmation, which is worse than a failure.
     """
     steps = tc_record.get("steps") or []
-    by_index = {r["step_index"]: r for r in execution_result["step_results"]}
+    by_index = {r["step_index"]: r for r in execution_result.get("step_results", [])}
     for i, step in enumerate(steps):
         result = by_index.get(i)
         if result is None or result.get("exit_code") != 0:
@@ -76,40 +102,41 @@ def _vacuous_success(tc_record: dict, execution_result: dict) -> tuple[bool, str
     return False, "no vacuous success detected"
 
 
-def _firmware_commit_activated_unvalidated_image(tc_record: dict, execution_result: dict) -> tuple[bool, str]:
-    """Firmware Image Download has no real signed image to send — the batch
-    sends a zero-filled dummy buffer instead (see `ssh_runner.execute_tc_steps`'s
-    stdin handling), deliberately, so this exercises whether the controller
-    actually validates an image before letting Firmware Commit (opcode 0x10)
-    activate it. CDW10 bits 2:0 are the Commit Action (CA): 0 just stages the
-    image into the slot without activating it (harmless regardless of
-    content); 1/2/3/6/7 activate it, immediately or at the next reset. A
-    controller that validates images should reject an activating commit
-    against a dummy image with a non-zero exit code — the exact status text
-    isn't load-bearing here, only whether it let an invalid image through.
-    Accepting one is the serious finding this TC exists to catch, not an
-    argument-authoring mistake on our side, so it must not get swallowed by
-    the generic INVALID_* "our bug" classification the way a real mistake
-    would be.
-    """
-    steps = tc_record.get("steps") or []
-    by_index = {r["step_index"]: r for r in execution_result["step_results"]}
+def _firmware_violation_indices(tc_record, execution_result):
+    steps = tc_record.get("steps", [])
+    results = {r["step_index"]: r for r in execution_result.get("step_results", [])}
+    dummy_downloaded = False
+    violations = set()
     for i, step in enumerate(steps):
-        if str(step.get("opcode", "")).lower() != "0x10":
+        if step.get("mode", "admin-passthru") != "admin-passthru":
             continue
-        try:
-            commit_action = int(step["cdw10"], 16) & 0b111
-        except (TypeError, ValueError, KeyError):
-            continue
-        if commit_action == 0:
-            continue
-        result = by_index.get(i)
-        if result is not None and result.get("exit_code") == 0:
-            return True, (f"step{i}: Firmware Commit with an activating Commit Action "
-                           f"(CA={commit_action}) succeeded against a dummy, unvalidated firmware "
-                           "image — the controller should reject an invalid image before "
-                           "activating it")
-    return False, "no activating Firmware Commit succeeded against a dummy image"
+        opcode = str(step.get("opcode", "")).lower()
+        result = results.get(i)
+        if opcode == "0x11":
+            # Provenance matters: CA=2 can activate a valid existing slot.
+            try:
+                payload = payload_for_step(step)
+                dummy_downloaded = bool(payload and not any(payload) and
+                                        completion_status(result) == "SUCCESS")
+            except (ValueError, KeyError):
+                dummy_downloaded = False
+        if opcode == "0x10" and dummy_downloaded:
+            try:
+                ca = (int(step["cdw10"], 16) >> 3) & 7
+            except (ValueError, TypeError, KeyError):
+                continue
+            if ca in {1, 3} and completion_status(result) == "SUCCESS":
+                violations.add(i)
+            # The download/commit relationship must not be reused indefinitely.
+            dummy_downloaded = False
+    return violations
+
+
+def _firmware_commit_activated_unvalidated_image(tc_record, execution_result):
+    indices = _firmware_violation_indices(tc_record, execution_result)
+    if indices:
+        return True, f"steps {sorted(indices)} activated after a successful zero-filled dummy download (CA bits 5:3)"
+    return False, "no proven dummy-download activation observed"
 
 
 def unsupported_opcode(execution_result: dict) -> str | None:
@@ -121,7 +148,7 @@ def unsupported_opcode(execution_result: dict) -> str | None:
     toward coverage and must not be retried — no argument fix can make an
     unimplemented command succeed.
     """
-    for r in execution_result["step_results"]:
+    for r in execution_result.get("step_results", []):
         out = str(r.get("stdout", ""))
         if "INVALID_OPCODE" in out:
             return out.strip().splitlines()[0]
@@ -160,10 +187,10 @@ def rejected_arguments(execution_result: dict, tc_record: dict | None = None) ->
     whether a local one-step reauthor is safe (nothing after it depends on
     it) or whether the whole chain needs replanning.
     """
-    verified_indices = {i for i, s in enumerate((tc_record or {}).get("steps") or [])
-                         if s.get("field_value_verified")}
-    for r in execution_result["step_results"]:
-        if r["step_index"] in verified_indices:
+    steps = (tc_record or {}).get("steps", [])
+    for r in execution_result.get("step_results", []):
+        if r["step_index"] < len(steps) and (matches_expected(steps[r["step_index"]], r)
+                                             or expected_status(steps[r["step_index"]]) != "SUCCESS"):
             continue
         out = str(r.get("stdout", ""))
         for match in _INVALID_STATUS_RE.finditer(out):
@@ -172,31 +199,9 @@ def rejected_arguments(execution_result: dict, tc_record: dict | None = None) ->
     return None
 
 
-def field_value_unsupported(tc_record: dict, execution_result: dict) -> tuple[int, str] | None:
-    """Returns (step_index, controller's rejection text) when a step whose
-    required field value was deterministically verified (CDW10 confirmed to
-    carry the exact Log Page/Feature Identifier/CNS/etc. the clause names —
-    see `args_author._verify_field_values`) was still rejected by the
-    controller with any non-INVALID_OPCODE `INVALID_*` status.
-
-    Unlike `rejected_arguments`'s bucket, this is a real finding about the
-    drive — the value was confirmed correctly placed before this reached the
-    wire, so the rejection means this specific value isn't implemented, the
-    same kind of legitimate answer `unsupported_opcode` already produces for
-    a whole unimplemented command, just at finer grain.
-    """
-    steps = tc_record.get("steps") or []
-    by_index = {r["step_index"]: r for r in execution_result["step_results"]}
-    for i, step in enumerate(steps):
-        if not step.get("field_value_verified"):
-            continue
-        result = by_index.get(i)
-        if result is None:
-            continue
-        out = str(result.get("stdout", ""))
-        for match in _INVALID_STATUS_RE.finditer(out):
-            if match.group(0) != "INVALID_OPCODE":
-                return i, out.strip().splitlines()[0]
+def field_value_unsupported(tc_record: dict, execution_result: dict):
+    # A correct selector is not proof that NSID/length/other fields/state are
+    # valid. Keep the public helper for old callers; never infer support here.
     return None
 
 
@@ -207,7 +212,7 @@ def host_tool_crash(execution_result: dict) -> str | None:
     run must not be judged, must not count toward coverage, and should be
     retried once the arguments are fixed.
     """
-    for r in execution_result["step_results"]:
+    for r in execution_result.get("step_results", []):
         out = str(r.get("stdout", ""))
         marker = next((m for m in HOST_CRASH_MARKERS if m in out), None)
         if r.get("exit_code") in HOST_CRASH_EXIT_CODES or marker:
@@ -235,6 +240,11 @@ def evaluate_criteria(tc_record: dict, execution_result: dict) -> list[dict]:
         results.append({"criterion": name, "kind": "builtin",
                          "result": "violated" if violated else "satisfied", "detail": detail})
 
+    verification = verify_tc(tc_record, execution_result)
+    for req in verification["requirements"]:
+        for check in req["results"]:
+            results.append({"criterion": req["description"], "kind": "spec",
+                            "requirement_id": req["requirement_id"], **check})
     declared = (tc_record.get("expectation") or {}).get("fail_criteria", [])
     for criterion in declared:
         if criterion in BUILTIN_RULES:
@@ -245,118 +255,90 @@ def evaluate_criteria(tc_record: dict, execution_result: dict) -> list[dict]:
 
 
 def check_step_expectations(tc_record: dict, execution_result: dict) -> list[str]:
-    """One PASS/FAIL/UNSUPPORTED/ERROR per step, independent of its siblings.
-
-    `tc_record["status"]` (from `check_expectation`) stays the single
-    verdict used for routing (judge invocation, the placeholder-args skip,
-    etc.) — this is a separate, additive per-step view
-    so coverage can credit a chain's early PASS step even when a later step
-    in the same TC errors out, instead of the whole chain being thrown out
-    together. Mirrors `check_expectation`'s priority order (UNSUPPORTED >
-    ERROR > FAIL > PASS) but scoped to one step's own result.
-    """
-    steps = tc_record.get("steps") or []
-    by_index = {r["step_index"]: r for r in execution_result["step_results"]}
+    """Transport/command outcomes, not a claim that a spec requirement passed."""
+    steps = tc_record.get("steps", [])
+    results = {r["step_index"]: r for r in execution_result.get("step_results", [])}
+    firmware = _firmware_violation_indices(tc_record, execution_result)
     statuses = []
     for i, step in enumerate(steps):
-        result = by_index.get(i)
-        if result is None or not result.get("started", True):
-            # Never executed — e.g. an earlier step in the same shared-timeout
-            # batch hung, so this one's delimiter was never even echoed. ERROR,
-            # not FAIL: FAIL counts toward coverage, and a step that never
-            # reached the device established nothing about its clause. (The
-            # step that actually hung *did* start, so it still lands on FAIL
-            # via the `exit_code is None` branch below.)
-            statuses.append("ERROR")
-            continue
-        out = str(result.get("stdout", ""))
-        exit_code = result.get("exit_code")
-        if "INVALID_OPCODE" in out:
-            statuses.append("UNSUPPORTED")
-            continue
-        crash_marker = next((m for m in HOST_CRASH_MARKERS if m in out), None)
-        if exit_code in HOST_CRASH_EXIT_CODES or crash_marker:
-            statuses.append("ERROR")
-            continue
-        if any(m.group(0) != "INVALID_OPCODE" for m in _INVALID_STATUS_RE.finditer(out)):
-            # A verified step's rejection means this specific Log Page/
-            # Feature Identifier/CNS/etc. value isn't implemented — a real
-            # finding, not an authoring mistake — since CDW10 was already
-            # deterministically confirmed to carry the exact value the
-            # clause names before this ever reached the wire.
-            statuses.append("UNSUPPORTED" if step.get("field_value_verified") else "ERROR")
-            continue
-        if exit_code is None:
-            statuses.append("FAIL" if execution_result.get("timed_out") else "ERROR")
-            continue
-        timed_out_here = any(m.lower() in out.lower() for m in TIMEOUT_MARKERS)
-        controller_error = any(m in out for m in ERROR_STATUS_MARKERS) and "SUCCESS" not in out.upper()
-        vacuous = step.get("direction", "none") != "none" and not step.get("data_len")
-        violated = exit_code != 0 or timed_out_here or controller_error or vacuous
-        statuses.append("FAIL" if violated else "PASS")
+        r = results.get(i)
+        if not r or not r.get("started", True):
+            status = "ERROR"
+        else:
+            out, code = str(r.get("stdout", "")), r.get("exit_code")
+            actual = completion_status(r)
+            if HOST_ERROR_RE.search(out) or code in HOST_CRASH_EXIT_CODES or any(m in out for m in HOST_CRASH_MARKERS):
+                status = "ERROR"
+            elif KERNEL_ABORT_RE.search(out):
+                status = "FAIL"  # The device did not complete it; see KERNEL_ABORT_RE.
+            elif code is None:
+                status = "FAIL" if execution_result.get("timed_out") else "ERROR"
+            elif i in firmware:
+                status = "FAIL"
+            elif matches_expected(step, r):
+                status = "FAIL" if step.get("direction", "none") != "none" and not step.get("data_len") else "PASS"
+            elif actual == "INVALID_OPCODE":
+                status = "UNSUPPORTED"
+            elif actual and expected_status(step) != "SUCCESS":
+                # A negative test observed the wrong completion. Accepting the
+                # invalid request is a device finding; a *different* rejection
+                # (INVALID_NS instead of INVALID_FIELD) is as likely to be one of
+                # our other fields as the device, so it is re-queued, not judged.
+                status = "ERROR" if actual.startswith("INVALID_") else "FAIL"
+            elif _INVALID_STATUS_RE.search(out):
+                status = "ERROR"
+            elif actual or any(m.lower() in out.lower() for m in TIMEOUT_MARKERS):
+                status = "FAIL"
+            elif code == 0:
+                status = "PASS"  # Process completed; contract still requires a captured completion.
+            else:
+                status = "ERROR"  # A process exit alone is not device behavior.
+        statuses.append(status)
     return statuses
 
 
-def _action_step_indices(tc_record: dict, n_results: int) -> set[int]:
-    """Indices of the chain's action step(s), read from each step's `phase`.
-    A record with no phase tags (legacy, or a fake in tests) treats every
-    step as the action — which reproduces the old any-step behavior."""
-    steps = tc_record.get("steps") or []
-    indices = {i for i, s in enumerate(steps) if s.get("phase") == "action"}
-    return indices or set(range(max(n_results, len(steps))))
+def check_execution(tc_record: dict, execution_result: dict) -> str:
+    """Aggregate command outcomes. Failed dependencies cannot be ignored.
 
-
-def _unsupported_step_indices(tc_record: dict, execution_result: dict) -> set[int]:
-    """Steps the drive answered "not implemented" for: INVALID_OPCODE, or any
-    non-INVALID_OPCODE `INVALID_*` on a step whose required field value was
-    deterministically verified (see `field_value_unsupported`)."""
-    steps = tc_record.get("steps") or []
-    indices = set()
-    for r in execution_result["step_results"]:
-        i, out = r["step_index"], str(r.get("stdout", ""))
-        if "INVALID_OPCODE" in out:
-            indices.add(i)
-        elif (i < len(steps) and steps[i].get("field_value_verified")
-              and any(m.group(0) != "INVALID_OPCODE" for m in _INVALID_STATUS_RE.finditer(out))):
-            indices.add(i)
-    return indices
+    Steps the contract executor deliberately did not send (`blocked_reason`:
+    an earlier step or precondition check already failed) are left out of the
+    aggregate - their per-step ERROR only keeps them out of coverage. Counting
+    them let a verify step that never ran turn the action's real FAIL into an
+    ERROR, which is excluded from coverage and re-queued as our own mistake.
+    """
+    statuses = check_step_expectations(tc_record, execution_result)
+    if not statuses:
+        return "ERROR"
+    if device_hung(execution_result):
+        return "FAIL"
+    blocked = {r["step_index"] for r in execution_result.get("step_results", []) if r.get("blocked_reason")}
+    considered = {i: s for i, s in enumerate(statuses) if i not in blocked}
+    action_indices = {i for i, step in enumerate(tc_record.get("steps", [])) if step.get("phase") == "action"}
+    if not action_indices:
+        action_indices = set(range(len(statuses)))
+    first_action = min(action_indices)
+    if any(considered.get(i) == "UNSUPPORTED" for i in action_indices):
+        return "UNSUPPORTED"
+    # The action's own FAIL decides the TC unless a setup step ERRORed (its
+    # precondition was never established, so the FAIL may be ours).
+    setup_error = any(considered.get(i) == "ERROR" for i in range(first_action))
+    if not setup_error and any(considered.get(i) == "FAIL" for i in action_indices):
+        return "FAIL"
+    values = set(considered.values())
+    if "UNSUPPORTED" in values:
+        return "UNVERIFIED"  # Missing setup/verify capability, not an unsupported action.
+    if "ERROR" in values:
+        return "ERROR"
+    if "FAIL" in values:
+        return "FAIL"
+    if blocked:
+        return "UNVERIFIED"  # Stopped by an unmet precondition check, nothing failed.
+    return "PASS"
 
 
 def check_expectation(tc_record: dict, execution_result: dict) -> str:
-    if not execution_result["step_results"]:
-        return "ERROR"
-    if execution_result.get("timed_out"):
-        # A wedged device is the headline finding this tool exists to produce, so
-        # it is a FAIL — checked first, so nothing else about the chain (a setup
-        # step that happened to be UNSUPPORTED, a rejected field elsewhere) can
-        # relabel the hang and keep it away from judging. Only non-timeout
-        # causes of a missing EXIT_CODE marker (SSH dropped, output truncated)
-        # are ERROR — those say nothing about the device.
-        return "FAIL"
-
-    unsupported = _unsupported_step_indices(tc_record, execution_result)
-    if unsupported & _action_step_indices(tc_record, len(execution_result["step_results"])):
-        # A real answer about the drive: the command under test — or, for a
-        # step whose required value was deterministically verified before it
-        # was sent, this specific value of an otherwise-implemented command —
-        # is not implemented.
-        return "UNSUPPORTED"
-    if unsupported:
-        # Only a setup/verify step is unimplemented. That says nothing about
-        # the clause under test, so it must not decide the TC's status in
-        # either direction: not UNSUPPORTED (that used to mask a real FAIL of
-        # the action step and skip judging it), and not FAIL either (its own
-        # non-zero exit is not a firmware misbehavior). The per-step view
-        # (`check_step_expectations`) still records it as UNSUPPORTED.
-        execution_result = dict(execution_result, step_results=[
-            r for r in execution_result["step_results"] if r["step_index"] not in unsupported])
-
-    if host_tool_crash(execution_result) or rejected_arguments(execution_result, tc_record):
-        # Our bug, not the drive's — ERROR keeps it out of coverage and re-queues it.
-        return "ERROR"
-
-    criteria = evaluate_criteria(tc_record, execution_result)
-    violated = any(c["result"] == "violated" for c in criteria)
-    if any(r["exit_code"] is None for r in execution_result["step_results"]):
-        return "ERROR"
-    return "FAIL" if violated else "PASS"
+    status = check_execution(tc_record, execution_result)
+    if status != "PASS":
+        return status
+    # Successful command delivery is necessary, never sufficient, for PASS.
+    return verify_tc(tc_record, execution_result)["status"]

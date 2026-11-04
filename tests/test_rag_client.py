@@ -30,7 +30,7 @@ class TestRagClient(unittest.TestCase):
     def test_generate_rag_response_is_not_dummy(self):
         r = generate_rag_response("Identify command", top_k=2)
         self.assertFalse(r["is_dummy"])
-        self.assertTrue(all(c["section_id"] for c in r["chunks"]))
+        self.assertTrue(all(c["chunk_id"] for c in r["chunks"]))
 
 
 if __name__ == "__main__":

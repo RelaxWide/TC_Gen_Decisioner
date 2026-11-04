@@ -22,11 +22,11 @@ def _exec(step_results, **kw):
 class TestExpectationChecker(unittest.TestCase):
     def test_clean_run_passes(self):
         result = _exec([{"step_index": 0, "exit_code": 0, "stdout": "ok"}])
-        self.assertEqual(check_expectation(TC, result), "PASS")
+        self.assertEqual(check_expectation(TC, result), "UNVERIFIED")
 
     def test_nonzero_exit_fails_and_names_the_step(self):
         result = _exec([{"step_index": 0, "exit_code": 22, "stdout": ""}])
-        self.assertEqual(check_expectation(TC, result), "FAIL")
+        self.assertEqual(check_expectation(TC, result), "ERROR")
         violated = [c for c in evaluate_criteria(TC, result) if c["result"] == "violated"]
         self.assertIn("step0=22", violated[0]["detail"])
 
@@ -60,7 +60,7 @@ class TestExpectationChecker(unittest.TestCase):
     def test_real_nvme_cli_success_text_is_not_flagged(self):
         result = _exec([{"step_index": 0, "exit_code": 0,
                           "stdout": "Admin Command Get Features is Success and result: 0x03030304"}])
-        self.assertEqual(check_expectation(TC, result), "PASS")
+        self.assertEqual(check_expectation(TC, result), "UNVERIFIED")
 
     def test_vacuous_success_is_a_fail_not_a_pass(self):
         # Measured: io-passthru 0x02 with cdw10=0 and no --data-len exits 0 while
@@ -76,7 +76,7 @@ class TestExpectationChecker(unittest.TestCase):
     def test_real_data_transfer_is_not_flagged_vacuous(self):
         tc = {**TC, "steps": [{"opcode": "0x06", "direction": "read", "data_len": 4096}]}
         result = _exec([{"step_index": 0, "exit_code": 0, "stdout": "SAMSUNG MZAMF1T0HMKB-00BL2"}])
-        self.assertEqual(check_expectation(tc, result), "PASS")
+        self.assertEqual(check_expectation(tc, result), "UNVERIFIED")
 
     def test_device_hang_is_a_fail_finding_not_an_error(self):
         # A wedged device is the headline finding; ERROR would get it silently
@@ -110,14 +110,14 @@ class TestFieldValueUnsupported(unittest.TestCase):
                             "field_value_verified": field_value_verified}],
                 "expectation": {"description": "d", "fail_criteria": []}}
 
-    def test_a_verified_steps_rejection_is_unsupported_not_error(self):
+    def test_selector_verification_does_not_prove_support_or_other_fields(self):
         tc = self._tc(field_value_verified=True)
         result = _exec([{"step_index": 0, "exit_code": 22, "stdout":
                           "NVMe status: INVALID_LOG_PAGE: The log page indicated is invalid(0x109)"}])
-        self.assertEqual(check_expectation(tc, result), "UNSUPPORTED")
-        self.assertIsNotNone(field_value_unsupported(tc, result))
-        self.assertIsNone(rejected_arguments(result, tc))
-        self.assertEqual(check_step_expectations(tc, result), ["UNSUPPORTED"])
+        self.assertEqual(check_expectation(tc, result), "ERROR")
+        self.assertIsNone(field_value_unsupported(tc, result))
+        self.assertIsNotNone(rejected_arguments(result, tc))
+        self.assertEqual(check_step_expectations(tc, result), ["ERROR"])
 
     def test_the_same_stdout_on_an_unverified_step_is_still_error(self):
         tc = self._tc(field_value_verified=False)
@@ -140,7 +140,7 @@ class TestFieldValueUnsupported(unittest.TestCase):
             {"step_index": 0, "exit_code": 22, "stdout": "NVMe status: INVALID_LOG_PAGE: invalid(0x109)"},
             {"step_index": 1, "exit_code": 22, "stdout": "NVMe status: INVALID_FIELD: reserved value(0x2)"},
         ])
-        self.assertEqual(check_step_expectations(tc, result), ["UNSUPPORTED", "ERROR"])
+        self.assertEqual(check_step_expectations(tc, result), ["ERROR", "ERROR"])
 
     def test_no_verified_steps_means_no_field_value_finding(self):
         tc = self._tc(field_value_verified=False)
@@ -165,17 +165,19 @@ class TestFirmwareCommitDummyImage(unittest.TestCase):
         return {"tc_id": "tc-1", "steps": [{"opcode": "0x10", "cdw10": cdw10, "direction": "none", "data_len": 0}],
                 "expectation": {"description": "d", "fail_criteria": []}}
 
-    def test_an_activating_commit_action_that_succeeds_is_violated(self):
-        tc = self._tc("0x00000002")  # CA=2: activate at next reset
-        result = _exec([{"step_index": 0, "exit_code": 0, "stdout": "Success"}])
-        violated = [c for c in evaluate_criteria(tc, result) if c["result"] == "violated"]
-        names = [c["criterion"] for c in violated]
+    def test_an_activating_commit_after_a_proven_dummy_download_is_violated(self):
+        # NVMe Base Firmware Commit table: CA[5:3]=1, FS[2:0]=1.
+        tc = self._tc("0x00000009")
+        tc["steps"].insert(0, {"opcode": "0x11", "direction": "write", "data_len": 4})
+        result = _exec([{"step_index": i, "exit_code": 0, "stdout": "Admin Command 0x10 is Success and result: 0x0"} for i in range(2)])
+        names = [c["criterion"] for c in evaluate_criteria(tc, result) if c["result"] == "violated"]
         self.assertIn("firmware commit activated an unvalidated dummy image", names)
+        self.assertEqual(check_step_expectations(tc, result), ["PASS", "FAIL"])
 
     def test_commit_action_zero_succeeding_is_not_violated(self):
         # CA=0 only stages the image into the slot — it is never activated,
         # so a real controller accepting arbitrary bytes there isn't a defect.
-        tc = self._tc("0x00000000")
+        tc = self._tc("0x00000001")
         result = _exec([{"step_index": 0, "exit_code": 0, "stdout": "Success"}])
         violated = [c["criterion"] for c in evaluate_criteria(tc, result) if c["result"] == "violated"]
         self.assertNotIn("firmware commit activated an unvalidated dummy image", violated)
@@ -184,7 +186,7 @@ class TestFirmwareCommitDummyImage(unittest.TestCase):
         # The expected, desired outcome: the controller validated the dummy
         # image and refused to activate it. The exact rejection text isn't
         # load-bearing here — only that it wasn't accepted (exit_code != 0).
-        tc = self._tc("0x00000003")  # CA=3: activate immediately
+        tc = self._tc("0x00000019")  # CA=3, FS=1: activate immediately
         result = _exec([{"step_index": 0, "exit_code": 7, "stdout": "NVMe status: FW_INVALID_IMAGE"}])
         violated = [c["criterion"] for c in evaluate_criteria(tc, result) if c["result"] == "violated"]
         self.assertNotIn("firmware commit activated an unvalidated dummy image", violated)
@@ -266,7 +268,7 @@ class TestOurBugsVsRealFindings(unittest.TestCase):
     def test_clean_success_is_unaffected(self):
         result = _exec([{"step_index": 0, "exit_code": 0,
                           "stdout": "Admin Command Identify is Success and result: 0x00000000"}])
-        self.assertEqual(check_expectation(TC, result), "PASS")
+        self.assertEqual(check_expectation(TC, result), "UNVERIFIED")
         self.assertIsNone(unsupported_opcode(result))
         self.assertIsNone(rejected_arguments(result))
         self.assertIsNone(host_tool_crash(result))
@@ -356,7 +358,7 @@ class TestScalarStatusFollowsTheActionStep(unittest.TestCase):
     def test_unsupported_setup_does_not_mask_an_action_fail(self):
         result = _exec([
             {"step_index": 0, "exit_code": 1, "stdout": self.UNSUPPORTED_OUT},
-            {"step_index": 1, "exit_code": 1, "stdout": "unexpected failure, no further detail"},
+            {"step_index": 1, "exit_code": 1, "stdout": "NVMe status: INTERNAL: internal controller error"},
         ])
         self.assertEqual(check_expectation(self._tc("setup", "action"), result), "FAIL")
 
@@ -368,7 +370,7 @@ class TestScalarStatusFollowsTheActionStep(unittest.TestCase):
             {"step_index": 1, "exit_code": 0, "stdout": "Admin Command Identify is Success"},
         ])
         tc = self._tc("setup", "action")
-        self.assertEqual(check_expectation(tc, result), "PASS")
+        self.assertEqual(check_expectation(tc, result), "UNVERIFIED")
         self.assertEqual(check_step_expectations(tc, result), ["UNSUPPORTED", "PASS"])
 
     def test_unsupported_action_is_still_unsupported(self):
@@ -395,7 +397,8 @@ class TestCheckStepExpectationsContinued(unittest.TestCase):
 
     def test_single_step_tc_matches_the_whole_tc_scalar(self):
         result = _exec([{"step_index": 0, "exit_code": 0, "stdout": "ok"}])
-        self.assertEqual(check_step_expectations(TC, result), [check_expectation(TC, result)])
+        self.assertEqual(check_step_expectations(TC, result), ["PASS"])
+        self.assertEqual(check_expectation(TC, result), "UNVERIFIED")
 
 
 if __name__ == "__main__":

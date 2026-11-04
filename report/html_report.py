@@ -1,7 +1,9 @@
 from pathlib import Path
+import json
 
 import config
 from report import components as c
+from tc_system.verification import verify_tc
 
 SOURCE_LABELS = {"qst": "QST", "pulsefz": "PULSEFZ", "tc_exec": "TC 자동생성 실행 결과"}
 
@@ -12,15 +14,15 @@ def _coverage_section(coverage: dict | None) -> str:
     s = coverage["summary"]
     tiles = (
         # Reachable first: it is the number that can actually reach 100%.
-        c.stat_tile("테스트 가능 조항 커버리지", f"{s.get('reachable_pct', 0)}%",
+        c.stat_tile("명령 실행 이력이 있는 조항", f"{s.get('reachable_pct', 0)}%",
                      f"{s.get('reachable_covered', 0)}/{s.get('reachable_total', 0)} 조항 (opcode 연결됨)")
-        + c.stat_tile("전체 스펙 대비", f"{s['section_pct']}%",
+        + c.stat_tile("전체 조항 중 실행 이력", f"{s['section_pct']}%",
                        f"{s['section_covered']}/{s['section_total']} 조항 — 산문/구조 조항 포함")
         + c.stat_tile("Opcode coverage", f"{s['opcode_pct']}%", f"{s['opcode_covered']}/{s['opcode_total']} opcodes")
-        + c.stat_tile("PASS로 커버", str(s.get("section_passing", 0)), "정상 동작 확인됨")
-        + c.stat_tile("FAIL로만 커버", str(s.get("section_failing", 0)), "실행됐지만 오동작")
+        + c.stat_tile("명령 완료", str(s.get("section_passing", 0)), "스펙 준수 검증과 별도")
+        + c.stat_tile("명령 실패 관측", str(s.get("section_failing", 0)), "원인 분류와 별도")
         + c.stat_tile("PASS/FAIL 혼재", str(s.get("section_mixed", 0)), "재현성 확인 필요")
-        + c.stat_tile("미지원 확인", str(s.get("section_unsupported", 0)), "드라이브가 미구현")
+        + c.stat_tile("미지원 응답 관측", str(s.get("section_unsupported", 0)), "필수/선택 기능의 적합성은 별도 검증")
     )
     bars = "".join(c.progress_bar(d["pct"], d["spec_doc"]) for d in s["per_spec_doc"])
     notes = ""
@@ -30,8 +32,62 @@ def _coverage_section(coverage: dict | None) -> str:
             "인자가 placeholder였거나, 실행이 우리 쪽 사유(INVALID_FIELD·호스트 크래시·SSH 실패)로 "
             "끝나 Spec에 대해 입증한 바가 없는 항목입니다.</div>"
         )
-    return (f'<div class="stat-row">{tiles}</div>'
+    verified = (
+        c.stat_tile("검증식을 평가한 요구사항", str(s.get("requirements_evaluated", 0)),
+                    f"생성된 요구사항 {s.get('requirements_total', 0)}개 중 — 전체 스펙 분모 아님")
+        + c.stat_tile("요구사항 PASS", str(s.get("requirements_passed", 0)))
+        + c.stat_tile("요구사항 FAIL / 혼재", f"{s.get('requirements_failed', 0)} / {s.get('requirements_mixed', 0)}")
+        + c.stat_tile("미검증 요구사항", str(s.get("requirements_unverified", 0)))
+    )
+    explanation = '<p class="note">한 요구사항의 검증은 조항 전체의 검증 완료를 뜻하지 않습니다. '
+    explanation += '기존 기록은 보존되며, 스펙 근거·검증식이 없으면 미검증으로 표시합니다.</p>'
+    return (f'<div class="stat-row">{verified}</div>{explanation}<h3>명령 실행·지원 조사 이력</h3>'
+            f'<div class="stat-row">{tiles}</div>'
             f'<div class="card" style="margin-top:16px">{bars}</div>{notes}')
+
+
+def _json(value):
+    return '<pre>' + c.esc(json.dumps(value, ensure_ascii=False, indent=2)) + '</pre>'
+
+
+def _tc_evidence(tc):
+    verification = verify_tc(tc, tc.get("execution") or {})
+    contract = tc.get("verification_contract") or {}
+    evidence = {e.get("evidence_id"): e for e in contract.get("evidence", [])}
+    rows = []
+    for req in verification["requirements"]:
+        block = evidence.get(req.get("evidence_id"), {})
+        rows.append([
+            c.esc(block.get("section_id", "")) + '<blockquote>' + c.esc(req.get("quote", "")) + '</blockquote>',
+            c.esc(req["description"]), c.esc(req["status"]),
+            _json(req["results"]),
+        ])
+    body = '<p><strong>시나리오</strong>: ' + c.esc((tc.get("scenario") or {}).get("description", "")) + '</p>'
+    body += '<p><strong>스펙 검증</strong>: ' + c.esc(verification["status"]) + '</p>'
+    body += _json(verification["issues"])
+    if rows:
+        body += c.table(["스펙 근거", "검증할 요구사항", "결과", "검증식 · 실제 관측 · 기대값"], rows)
+    else:
+        body += '<p>실행 가능한 검증식과 인용 근거가 없는 기록입니다. 기존 PASS는 스펙 검증 완료로 집계하지 않습니다.</p>'
+    step_rows = []
+    results = {r["step_index"]: r for r in (tc.get("execution") or {}).get("step_results", [])}
+    for i, step in enumerate(tc.get("steps", [])):
+        encoded = {k: step.get(k) for k in ("mode", "opcode", "nsid", "cdw10", "cdw11", "cdw12",
+                                          "cdw13", "cdw14", "cdw15", "direction", "data_len")}
+        encoded["payload"] = "명시적 hex payload" if step.get("payload_hex") else "write 시 zero-filled"
+        step_rows.append([c.esc(f"{i}: {step.get('name', '')} ({step.get('phase', '')})"),
+                          c.esc(step.get("role", "")), _json(step.get("field_constraints", [])),
+                          _json(encoded), c.esc(step.get("expected_status", "SUCCESS")),
+                          _json(results.get(i, {"missing": True}))])
+    body += c.table(["단계", "계획한 목적", "고정 필드", "실제 명령 인자", "기대 상태", "실제 응답"], step_rows)
+    body += '<h4>사전조건 평가</h4>' + _json(verification["preconditions"])
+    body += '<h4>기존 산문 기준 / 평가 이력</h4>' + _json((tc.get("execution") or {}).get("criteria_results", []))
+    if tc.get("attempts"):
+        body += c.details_block("재시도 전후 명령과 원본 증거", _json(tc["attempts"]))
+    body += c.details_block("스펙 근거 원문과 생성 호출 ID", _json({
+        "evidence": contract.get("evidence", []), "generated_from": tc.get("generated_from"),
+        "args_llm_response_ids": [s.get("args_llm_response_id") for s in tc.get("steps", [])]}))
+    return c.details_block(c.esc(f"스펙 검증: {verification['status']} — 근거·명령·결과 보기"), body)
 
 
 def _tc_table(tc_records: list[dict]) -> str:
@@ -49,6 +105,7 @@ def _tc_table(tc_records: list[dict]) -> str:
             # ERROR here means our own bug (malformed fields or a crashed host
             # tool), so it is excluded from coverage and retried.
             "ERROR": '<span class="badge" style="background:var(--status-warning);color:#0b0b0b">&#9679; 우리버그</span>',
+            "UNVERIFIED": '<span class="badge">미검증</span>',
         }.get(tc["status"], c.esc(tc["status"]))
         flags = []
         if tc.get("destructive"):
@@ -63,8 +120,9 @@ def _tc_table(tc_records: list[dict]) -> str:
             c.esc(tc["tc_id"]), c.esc(tc["name"]), status_badge, " ".join(flags),
             c.esc(", ".join(tc["source_section_ids"])), c.esc(", ".join(tc["source_opcodes"])),
             c.esc(tc.get("updated_at", "")),
+            _tc_evidence(tc),
         ])
-    return c.table(["TC ID", "Name", "Status", "Flags", "Section(s)", "Opcode(s)", "Updated"], rows)
+    return c.table(["TC ID", "Name", "저장된 결과", "Flags", "Section(s)", "Opcode(s)", "Updated", "검증 근거"], rows)
 
 
 def _verdict_rows(source: str, verdicts: list[dict], fc_by_id: dict) -> list[list[str]]:

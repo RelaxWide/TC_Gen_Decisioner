@@ -175,7 +175,7 @@ class TestCommandLogging(unittest.TestCase):
         with mock.patch.object(ssh_runner, "_plink", side_effect=_capture):
             execute_tc_steps([self.STEP, self.WRITE_STEP])
         batch_call = next(kw for kw in calls if "timeout" in kw)
-        self.assertEqual(batch_call.get("stdin"), "\x00" * 512)
+        self.assertEqual(batch_call.get("stdin"), b"\x00" * 512)
 
     def test_a_batch_with_no_write_steps_still_gets_an_explicit_empty_stdin(self):
         # An explicit "" (not the default None) still closes stdin
@@ -190,7 +190,7 @@ class TestCommandLogging(unittest.TestCase):
         with mock.patch.object(ssh_runner, "_plink", side_effect=_capture):
             execute_tc_steps([self.STEP])
         batch_call = next(kw for kw in calls if "timeout" in kw)
-        self.assertEqual(batch_call.get("stdin"), "")
+        self.assertEqual(batch_call.get("stdin"), b"")
 
     def test_multiple_write_steps_each_get_their_own_slice_of_the_shared_stdin(self):
         second_write = dict(self.WRITE_STEP, data_len=4)
@@ -203,7 +203,7 @@ class TestCommandLogging(unittest.TestCase):
         with mock.patch.object(ssh_runner, "_plink", side_effect=_capture):
             execute_tc_steps([self.WRITE_STEP, self.STEP, second_write])
         batch_call = next(kw for kw in calls if "timeout" in kw)
-        self.assertEqual(batch_call.get("stdin"), "\x00" * 512 + "\x00" * 4)
+        self.assertEqual(batch_call.get("stdin"), b"\x00" * 512 + b"\x00" * 4)
 
 
 class TestProbeDeviceCapabilities(unittest.TestCase):

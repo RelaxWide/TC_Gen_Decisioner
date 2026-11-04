@@ -45,6 +45,9 @@ def _validate_step(step: dict) -> None:
     for field in ("opcode", "cdw10", "cdw11", "cdw12"):
         if not _HEX_RE.match(step.get(field, "")):
             raise ValueError(f"invalid step {field}: {step.get(field)!r}")
+    for field in ("cdw13", "cdw14", "cdw15"):
+        if not _HEX_RE.fullmatch(step.get(field, "0x0")):
+            raise ValueError(f"invalid step {field}")
     # nsid is required, not defaulted: `passthru_cmd` interpolates step["nsid"]
     # directly, so a `.get(..., 0)` here let a step with no nsid pass validation
     # and then die with KeyError while building the command.
@@ -58,6 +61,14 @@ def _validate_step(step: dict) -> None:
             raise ValueError(f"invalid step {field}: {value!r}")
     if step.get("direction", "none") not in ("none", "read", "write"):
         raise ValueError(f"invalid step direction: {step.get('direction')!r}")
+    from tc_system.verification import payload_for_step, validate_fixed_fields
+    payload_for_step(step)
+    validate_fixed_fields(step, step.get("field_constraints", []))
+    if step.get("args_source") == "authored":
+        from tc_system.command_fields import validate_transfer
+        validate_transfer(step, {"command_set": "ADMIN" if step["mode"] == "admin-passthru" else "NVM",
+                                 "raw_opcode": step["opcode"], "name": step.get("name", step["opcode"])},
+                          lba_bytes=step.get("lba_bytes"))
 
 
 def passthru_cmd(step: dict) -> str:
@@ -65,6 +76,9 @@ def passthru_cmd(step: dict) -> str:
     cmd = (f"sudo nvme {step['mode']} {step['device']} --opcode={step['opcode']} "
            f"--namespace-id={step['nsid']} --cdw10={step['cdw10']} --cdw11={step['cdw11']} "
            f"--cdw12={step['cdw12']}")
+    for i in range(13, 16):
+        if f"cdw{i}" in step:
+            cmd += f" --cdw{i}={step[f'cdw{i}']}"
     direction = step.get("direction", "none")
     if direction != "none" and step.get("data_len"):
         cmd += f" --data-len={step['data_len']} --{direction}"
@@ -91,10 +105,14 @@ def _plink(target: dict, command: str, stdin: str | None = None, timeout: int = 
         with os.fdopen(fd, "w") as f:
             f.write(target["password"])
         try:
-            return subprocess.run(
+            proc = subprocess.run(
                 ["plink", "-ssh", "-batch", "-pwfile", pwfile_path, f"{target['user']}@{target['host']}", command],
-                input=stdin, capture_output=True, text=True, timeout=timeout,
+                input=stdin, capture_output=True, text=not isinstance(stdin, bytes), timeout=timeout,
             )
+            if isinstance(proc.stdout, bytes):
+                proc.stdout = proc.stdout.decode("utf-8", "replace")
+                proc.stderr = proc.stderr.decode("utf-8", "replace")
+            return proc
         except subprocess.TimeoutExpired as exc:
             # A wedged device is the main thing this tool hunts for, so a timeout
             # must become a recorded finding, not a traceback that aborts the run.
@@ -221,7 +239,29 @@ def device_responsive(nvme_ctrl: str, timeout: int = 15) -> tuple[bool, str]:
     return True, ""
 
 
-def execute_tc_steps(steps: list[dict], allow_destructive: bool = False) -> dict:
+def capture_dmesg(tc_id=None, attempt_id=None) -> str:
+    """One `dmesg -T` dump, logged like a batch stage. The step-by-step
+    contract executor calls this once after its last step instead of once per
+    step (each SSH round trip is a separate plink connection)."""
+    target = config.get_ssh_target()
+    log_record = {"timestamp": datetime.now(timezone.utc).isoformat(), "n_steps": 0, "stages": [],
+                  "tc_id": tc_id, "attempt_id": attempt_id}
+    try:
+        dump_proc, stage = _timed_plink(target, "sudo -S dmesg -T", "dmesg_dump",
+                                         stdin=target["password"] + "\n")
+        log_record["stages"].append(stage)
+        return dump_proc.stdout
+    finally:
+        _append_ssh_log(log_record)
+
+
+def execute_tc_steps(steps: list[dict], allow_destructive: bool = False,
+                     tc_id=None, attempt_id=None, step_index: int | None = None,
+                     clear_dmesg: bool = True, dump_dmesg: bool = True) -> dict:
+    """`step_index` is logged for a single step sent on its own (contract
+    executor). With `clear_dmesg=False` the dmesg scope is the caller's
+    (`clear_ok`/`dmesg_captured_scoped` are None); with `dump_dmesg=False`
+    `dmesg_text` is empty and the caller dumps once itself."""
     # Last gate before the wire. Both flags must be checked: the two commands
     # that can leave the drive unbootable — Firmware Commit 0x10 and Firmware
     # Image Download 0x11 — carry firmware_state=True but destructive=False,
@@ -238,16 +278,19 @@ def execute_tc_steps(steps: list[dict], allow_destructive: bool = False) -> dict
                 + " — omit --no-destructive to permit these"
             )
 
+    step_commands = [passthru_cmd(step) for step in steps]  # Validate before any remote call.
     target = config.get_ssh_target()
-    log_record = {"timestamp": datetime.now(timezone.utc).isoformat(), "n_steps": len(steps), "stages": []}
+    log_record = {"timestamp": datetime.now(timezone.utc).isoformat(), "n_steps": len(steps), "stages": [],
+                  "tc_id": tc_id, "attempt_id": attempt_id, "step_index": step_index}
 
     try:
-        clear_proc, stage = _timed_plink(target, "sudo -S dmesg -c > /dev/null", "dmesg_clear",
-                                          stdin=target["password"] + "\n")
-        log_record["stages"].append(stage)
-        clear_ok = clear_proc.returncode == 0
+        clear_ok = None
+        if clear_dmesg:
+            clear_proc, stage = _timed_plink(target, "sudo -S dmesg -c > /dev/null", "dmesg_clear",
+                                              stdin=target["password"] + "\n")
+            log_record["stages"].append(stage)
+            clear_ok = clear_proc.returncode == 0
 
-        step_commands = [passthru_cmd(step) for step in steps]
         log_record["step_commands"] = step_commands
 
         lines = []
@@ -270,21 +313,25 @@ def execute_tc_steps(steps: list[dict], allow_destructive: bool = False) -> dict
         # other step took. One shared stdin stream feeds the whole batch
         # script in order, so each write step consumes exactly its own
         # data_len bytes; non-write steps read nothing.
-        write_payload = "".join(
-            "\x00" * step["data_len"] for step in steps
+        from tc_system.verification import payload_for_step
+        write_payload = b"".join(
+            payload_for_step(step) for step in steps
             if step.get("direction") == "write" and step.get("data_len")
         )
         batch_proc, stage = _timed_plink(target, "\n".join(lines), "batch", stdin=write_payload,
                                           timeout=SECONDS_PER_STEP * len(steps))
         log_record["stages"].append(stage)
 
-        dump_proc, stage = _timed_plink(target, "sudo -S dmesg -T", "dmesg_dump",
-                                         stdin=target["password"] + "\n")
-        log_record["stages"].append(stage)
+        dmesg_text = ""
+        if dump_dmesg:
+            dump_proc, stage = _timed_plink(target, "sudo -S dmesg -T", "dmesg_dump",
+                                             stdin=target["password"] + "\n")
+            log_record["stages"].append(stage)
+            dmesg_text = dump_proc.stdout
 
         return {
             "step_results": _parse_batch_output(batch_proc.stdout, len(steps)),
-            "dmesg_text": dump_proc.stdout,
+            "dmesg_text": dmesg_text,
             "batch_stderr": batch_proc.stderr,
             "clear_ok": clear_ok,
             # When the pre-batch `dmesg -c` fails (it needs the sudo password, which
