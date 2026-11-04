@@ -619,3 +619,58 @@ class TestReportDoesNotCallALegacyPassVerified(unittest.TestCase):
         tc, execution = fixture()
         tc.update(status="PASS", execution=execution)
         self.assertEqual(describe_outcome(tc, verify_tc(tc, execution))["verdict"], "스펙 요구사항 검증 통과")
+
+
+
+class TestExpectedStatusUsesNvmeCliTokens(unittest.TestCase):
+    """Measured: a Directive Receive scenario expected the drive to reject the
+    unsupported command, wrote the spec's name for it, and was reported as
+    "미지원 응답" instead of the PASS it had designed for."""
+    OUT = "NVMe status: INVALID_OPCODE: The associated command opcode field is not valid(0x1)"
+
+    def _tc(self, expected):
+        step = {"name": "Directive Receive", "phase": "action", "opcode": "0x1a", "direction": "read",
+                "data_len": 4096, "expected_status": expected}
+        tc = {"tc_id": "t", "steps": [step], "scenario": {"preconditions": []},
+              "verification_contract": {"version": 2, "precondition_checks": [],
+                  "evidence": [{"evidence_id": "source", "text": QUOTE}],
+                  "requirements": [{"requirement_id": "r", "section_id": "base:5.2.7", "evidence_id": "source",
+                                    "quote": QUOTE, "description": "unsupported -> Invalid Command Opcode",
+                                    "checks": [{"kind": "completion", "step": 0}]}]}}
+        return tc, {"step_results": [{"step_index": 0, "exit_code": 22, "stdout": self.OUT, "started": True}]}
+
+    def test_spec_names_are_mapped_to_nvme_cli_tokens(self):
+        from tc_system.verification import canonical_status
+        for name, token in (("INVALID_COMMAND_OPCODE", "INVALID_OPCODE"), ("Invalid Command Opcode", "INVALID_OPCODE"),
+                            ("Invalid Field in Command", "INVALID_FIELD"), ("INVALID_NAMESPACE_OR_FORMAT", "INVALID_NS"),
+                            ("SUCCESS", "SUCCESS"), ("INVALID_OPCODE", "INVALID_OPCODE")):
+            with self.subTest(name=name):
+                self.assertEqual(canonical_status(name), token)
+
+    def test_an_expected_rejection_written_with_the_spec_name_is_the_intended_pass(self):
+        for expected in ("INVALID_OPCODE", "INVALID_COMMAND_OPCODE", "Invalid Command Opcode"):
+            with self.subTest(expected=expected):
+                tc, execution = self._tc(expected)
+                self.assertEqual(check_step_expectations(tc, execution), ["PASS"])
+                self.assertEqual(check_expectation(tc, execution), "PASS")
+
+    def test_without_that_expectation_it_is_still_unsupported(self):
+        tc, execution = self._tc("SUCCESS")
+        self.assertEqual(check_expectation(tc, execution), "UNSUPPORTED")
+
+    def test_the_plan_stores_the_token(self):
+        plan = {"steps_plan": [{"opcode_name": "Directive Receive", "phase": "action",
+                                "expected_status": "Invalid Command Opcode",
+                                "field_constraints": [{"field": "cdw11", "mask": "0xffff", "value": "0x0101"}]}],
+                "requirements": [{"evidence_id": "source", "quote": QUOTE, "description": "d",
+                                  "checks": [{"kind": "completion", "step": 0}]}],
+                "preconditions": [], "precondition_checks": []}
+        ops = [{"name": "Directive Receive", "raw_opcode": "0x1a", "command_set": "ADMIN"}]
+        validate_plan_contract(plan, [{"evidence_id": "source", "text": QUOTE}], "base:5.2.7", ops)
+        self.assertEqual(plan["steps_plan"][0]["expected_status"], "INVALID_OPCODE")
+
+    def test_an_unexpected_unsupported_says_what_was_expected(self):
+        from tc_system.execution.expectation_checker import describe_outcome
+        tc, _ = self._tc("INVALID_FIELD")
+        tc["status"] = "UNSUPPORTED"
+        self.assertIn("기대 INVALID_FIELD", describe_outcome(tc)["cause"])

@@ -415,7 +415,12 @@ def describe_outcome(tc: dict, verification: dict | None = None) -> dict:
         return {"verdict": "장비 결함 후보 — 스펙과 다른 동작이나 행이 관측됨", "cause": cause,
                 "next": "LLM 판정(verdict)과 원시 응답을 엔지니어가 확인"}
     if status == "UNSUPPORTED":
-        return {"verdict": "드라이브가 이 커맨드를 구현하지 않음(INVALID_OPCODE)", "cause": None,
+        expected = [f"스텝 {i} {s.get('name')}: 기대 {expected_status(s)}"
+                    for i, s in enumerate(tc.get("steps") or [])
+                    if s.get("phase") == "action" and expected_status(s) != "SUCCESS"]
+        return {"verdict": "드라이브가 이 커맨드를 구현하지 않음(INVALID_OPCODE)",
+                "cause": ("; ".join(expected) + " — 시나리오가 다른 완료 상태를 기대했으므로 의도한 검증은 아님")
+                         if expected else None,
                 "next": "선택(O) 기능이면 정상. 필수(M)라면 결함 후보이니 스펙의 M/O 표를 확인"}
     if status == "UNVERIFIED":
         issues = verification.get("issues") or []

@@ -11,7 +11,8 @@ SCENARIO_SCHEMA = {
     "steps_plan": (
         'array of objects {"opcode_name": <a real command name from available_commands>, '
         '"role": <what this step checks>, "phase": "setup" | "action" | "verify", '
-        '"expected_status": "SUCCESS" or the exact expected NVMe error token, '
+        '"expected_status": "SUCCESS" or the expected error as nvme-cli prints it '
+        '(e.g. INVALID_OPCODE for Invalid Command Opcode, INVALID_FIELD, INVALID_NS, INVALID_LOG_PAGE), '
         '"field_constraints": [{"field": "cdw10", "mask": "0x000007FF", "value": "0x0000037D"}], '
         '"payload_hex": null or a short hex byte pattern (e.g. "A55A") repeated to fill a write buffer}. '
         'Exactly one step must have phase="action" and its opcode_name must equal the target '

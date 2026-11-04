@@ -106,8 +106,39 @@ def completion_status(result):
     return None
 
 
+# nvme-cli prints its own short tokens ("NVMe status: INVALID_OPCODE: ...",
+# confirmed in stored real output), while the spec - and so the model - names
+# the same status "Invalid Command Opcode". A scenario that correctly expected
+# the drive to reject an unsupported command but wrote INVALID_COMMAND_OPCODE
+# never matched, and its intended result was reported as "미지원 응답".
+STATUS_ALIASES = {
+    "SUCCESSFUL_COMPLETION": "SUCCESS",
+    "INVALID_COMMAND_OPCODE": "INVALID_OPCODE",
+    "INVALID_FIELD_IN_COMMAND": "INVALID_FIELD",
+    "INVALID_NAMESPACE_OR_FORMAT": "INVALID_NS", "INVALID_NAMESPACE": "INVALID_NS",
+    "COMMAND_ID_CONFLICT": "CMDID_CONFLICT",
+    "DATA_TRANSFER_ERROR": "DATA_XFER_ERROR",
+    "COMMANDS_ABORTED_DUE_TO_POWER_LOSS_NOTIFICATION": "POWER_LOSS",
+    "INTERNAL_ERROR": "INTERNAL",
+    "COMMAND_ABORT_REQUESTED": "ABORT_REQ",
+    "COMMAND_SEQUENCE_ERROR": "CMD_SEQ_ERROR",
+    "LBA_OUT_OF_RANGE": "LBA_RANGE",
+    "CAPACITY_EXCEEDED": "CAP_EXCEEDED",
+    "NAMESPACE_NOT_READY": "NS_NOT_READY",
+    "INVALID_LOG_PAGE_IDENTIFIER": "INVALID_LOG_PAGE",
+    "INVALID_FIRMWARE_SLOT": "FIRMWARE_SLOT",
+    "INVALID_FIRMWARE_IMAGE": "FIRMWARE_IMAGE",
+    "FEATURE_IDENTIFIER_NOT_SAVEABLE": "FEATURE_NOT_SAVEABLE",
+    "FEATURE_NOT_NAMESPACE_SPECIFIC": "FEATURE_NOT_PER_NS",
+}
+def canonical_status(name):
+    """A spec-style status name -> the token nvme-cli prints."""
+    token = re.sub(r"[^A-Z0-9]+", "_", str(name or "").upper()).strip("_")
+    return STATUS_ALIASES.get(token, token)
+
+
 def expected_status(step):
-    return step.get("expected_status", "SUCCESS")
+    return canonical_status(step.get("expected_status") or "SUCCESS")
 
 
 def matches_expected(step, result):
@@ -268,8 +299,9 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
         if step["opcode_name"] in UNEXECUTABLE_COMMANDS:
             raise ValueError("Abort/AER requires asynchronous command/event control, unavailable in this executor")
         status = step.get("expected_status")
-        if not isinstance(status, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]+", status):
+        if not isinstance(status, str) or not status.strip():
             raise ValueError("every step must explicitly declare its expected completion status")
+        step["expected_status"] = canonical_status(status)  # stored in nvme-cli's spelling
         if step.get("payload_hex") is not None:
             try:
                 payload_bytes(step["payload_hex"])

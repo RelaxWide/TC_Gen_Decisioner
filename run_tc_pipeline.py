@@ -5,6 +5,7 @@ import time
 
 from shared.run_log import capture_to_file
 from tc_system.execution.expectation_checker import describe_outcome
+from tc_system.verification import expected_status
 from tc_system.execution.ssh_runner import DestructiveStepBlocked, passthru_cmd
 from tc_system.pipeline import run_pipeline
 
@@ -94,6 +95,7 @@ def _print_start(index, total, tc):
         except ValueError as exc:
             cmd = f"(명령 생성 불가 — {exc})"
         print(f"        $ {cmd}")
+        print(f"        기대 완료 상태: {expected_status(step)}")
 
     _dual_label("  ", "Expectation", expectation.get("description"))
     fail_criteria = expectation.get("fail_criteria") or []
