@@ -1,0 +1,17 @@
+secrets.local.json
+data/
+logs/
+report/output/*.html
+__pycache__/
+*.pyc
+.venv/
+
+# Credentials — copy the .example templates and fill them in locally
+rag/srag_llm_guide.py
+
+# Raw test logs (live on the test PC; one file exceeds GitHub's 100MB limit)
+QST/
+PULSEFZ/
+
+# Generated reports embed raw log excerpts; regenerate with run_report.py
+report/output/archive/

@@ -1,0 +1,262 @@
+{
+  "schema_version": 1,
+  "sections": [
+    {
+      "section_id": "nvme-base-1.4:5.15",
+      "spec_doc": "NVM-Express-Base-Specification",
+      "title": "Identify command",
+      "related_opcodes": [
+        "0x06a"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-base-1.4:5.14",
+      "spec_doc": "NVM-Express-Base-Specification",
+      "title": "Get Log Page command",
+      "related_opcodes": [
+        "0x02a"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-base-1.4:5.21",
+      "spec_doc": "NVM-Express-Base-Specification",
+      "title": "Set Features command",
+      "related_opcodes": [
+        "0x09a"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-base-1.4:5.16",
+      "spec_doc": "NVM-Express-Base-Specification",
+      "title": "Get Features command",
+      "related_opcodes": [
+        "0x0Aa"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-base-1.4:5.2",
+      "spec_doc": "NVM-Express-Base-Specification",
+      "title": "Abort command",
+      "related_opcodes": [
+        "0x08a"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-base-1.4:5.10",
+      "spec_doc": "NVM-Express-Base-Specification",
+      "title": "Firmware Image Download command",
+      "related_opcodes": [
+        "0x11a"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-base-1.4:5.9",
+      "spec_doc": "NVM-Express-Base-Specification",
+      "title": "Firmware Commit command",
+      "related_opcodes": [
+        "0x10a"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-base-1.4:5.23",
+      "spec_doc": "NVM-Express-Base-Specification",
+      "title": "Format NVM command",
+      "related_opcodes": [
+        "0x80a"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-base-1.4:5.27",
+      "spec_doc": "NVM-Express-Base-Specification",
+      "title": "Device Self-test command",
+      "related_opcodes": [
+        "0x14a"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-nvm-1.0:3.2",
+      "spec_doc": "NVM-Express-NVM-Command-Set-Specification",
+      "title": "Flush command",
+      "related_opcodes": [
+        "0x00n"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-nvm-1.0:3.6",
+      "spec_doc": "NVM-Express-NVM-Command-Set-Specification",
+      "title": "Write command",
+      "related_opcodes": [
+        "0x01n"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-nvm-1.0:3.5",
+      "spec_doc": "NVM-Express-NVM-Command-Set-Specification",
+      "title": "Read command",
+      "related_opcodes": [
+        "0x02n"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-nvm-1.0:3.3",
+      "spec_doc": "NVM-Express-NVM-Command-Set-Specification",
+      "title": "Dataset Management command",
+      "related_opcodes": [
+        "0x09n"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-nvm-1.0:3.9",
+      "spec_doc": "NVM-Express-NVM-Command-Set-Specification",
+      "title": "Verify command",
+      "related_opcodes": [
+        "0x0Cn"
+      ],
+      "source": "manual_seed"
+    },
+    {
+      "section_id": "nvme-nvm-1.0:3.1",
+      "spec_doc": "NVM-Express-NVM-Command-Set-Specification",
+      "title": "Compare command",
+      "related_opcodes": [
+        "0x05n"
+      ],
+      "source": "manual_seed"
+    }
+  ],
+  "opcodes": [
+    {
+      "opcode": "0x06a",
+      "raw_opcode": "0x06",
+      "name": "Identify",
+      "command_set": "ADMIN",
+      "direction": "read",
+      "destructive": false
+    },
+    {
+      "opcode": "0x02a",
+      "raw_opcode": "0x02",
+      "name": "Get Log Page",
+      "command_set": "ADMIN",
+      "direction": "read",
+      "destructive": false
+    },
+    {
+      "opcode": "0x09a",
+      "raw_opcode": "0x09",
+      "name": "Set Features",
+      "command_set": "ADMIN",
+      "direction": "write",
+      "destructive": false
+    },
+    {
+      "opcode": "0x0Aa",
+      "raw_opcode": "0x0A",
+      "name": "Get Features",
+      "command_set": "ADMIN",
+      "direction": "read",
+      "destructive": false
+    },
+    {
+      "opcode": "0x08a",
+      "raw_opcode": "0x08",
+      "name": "Abort",
+      "command_set": "ADMIN",
+      "direction": "none",
+      "destructive": false
+    },
+    {
+      "opcode": "0x11a",
+      "raw_opcode": "0x11",
+      "name": "Firmware Image Download",
+      "command_set": "ADMIN",
+      "direction": "write",
+      "destructive": true
+    },
+    {
+      "opcode": "0x10a",
+      "raw_opcode": "0x10",
+      "name": "Firmware Commit",
+      "command_set": "ADMIN",
+      "direction": "none",
+      "destructive": true
+    },
+    {
+      "opcode": "0x80a",
+      "raw_opcode": "0x80",
+      "name": "Format NVM",
+      "command_set": "ADMIN",
+      "direction": "none",
+      "destructive": true
+    },
+    {
+      "opcode": "0x14a",
+      "raw_opcode": "0x14",
+      "name": "Device Self-test",
+      "command_set": "ADMIN",
+      "direction": "none",
+      "destructive": false
+    },
+    {
+      "opcode": "0x00n",
+      "raw_opcode": "0x00",
+      "name": "Flush",
+      "command_set": "NVM",
+      "direction": "none",
+      "destructive": false
+    },
+    {
+      "opcode": "0x01n",
+      "raw_opcode": "0x01",
+      "name": "Write",
+      "command_set": "NVM",
+      "direction": "write",
+      "destructive": true
+    },
+    {
+      "opcode": "0x02n",
+      "raw_opcode": "0x02",
+      "name": "Read",
+      "command_set": "NVM",
+      "direction": "read",
+      "destructive": false
+    },
+    {
+      "opcode": "0x09n",
+      "raw_opcode": "0x09",
+      "name": "Dataset Management",
+      "command_set": "NVM",
+      "direction": "write",
+      "destructive": true
+    },
+    {
+      "opcode": "0x0Cn",
+      "raw_opcode": "0x0C",
+      "name": "Verify",
+      "command_set": "NVM",
+      "direction": "none",
+      "destructive": false
+    },
+    {
+      "opcode": "0x05n",
+      "raw_opcode": "0x05",
+      "name": "Compare",
+      "command_set": "NVM",
+      "direction": "write",
+      "destructive": false
+    }
+  ]
+}
