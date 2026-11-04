@@ -206,9 +206,14 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
     steps = structured["steps_plan"]
     if set(structured.get("required_capabilities", [])) - CAPABILITIES:
         raise ValueError("scenario requires capabilities this executor does not implement")
-    if structured.get("unverified_conditions"):
-        raise ValueError("scenario has prerequisites/observations that cannot be verified: "
-                         + str(structured["unverified_conditions"]))
+    # Notes on what this TC deliberately leaves untested are recorded, not
+    # rejected (measured: the model listed honest scope limits such as "other
+    # LIDs are not covered by this single-action TC", and every target was
+    # skipped). What the requirement depends on must be a precondition with a
+    # check before the action - that rule, below, is the one that blocks.
+    notes = structured.get("out_of_scope", structured.get("unverified_conditions", []))
+    if not isinstance(notes, list) or not all(isinstance(n, str) for n in notes):
+        raise ValueError("out_of_scope must be an array of strings")
     action = next(i for i, s in enumerate(steps) if s["phase"] == "action")
     by_name = {o["name"]: o for o in available_opcodes}
     for step in steps:

@@ -51,7 +51,7 @@ def prepared(structured):
                                               "checks": [{"kind": "completion", "step": action}]}])
     structured.setdefault("precondition_checks", [])
     structured.setdefault("required_capabilities", ["sequential", "completion_status"])
-    structured.setdefault("unverified_conditions", [])
+    structured.setdefault("out_of_scope", [])
     return structured
 
 
@@ -75,6 +75,19 @@ class TestStepsPlanValidation(unittest.TestCase):
         out = _run(dict(GOOD_STRUCTURED))
         self.assertEqual(out["steps_plan"], prepared(GOOD_STRUCTURED)["steps_plan"])
         self.assertEqual(out["chain_summary"], GOOD_STRUCTURED["chain_summary"])
+
+    def test_scope_notes_are_recorded_not_a_reason_to_skip(self):
+        # Measured: honest notes such as "other LIDs are not covered by this
+        # single-action TC" used to reject every scenario (all targets skipped).
+        notes = ["지원하지 않는 LID에 대한 동작은 이 TC에서 검증하지 않음"]
+        for key in ("out_of_scope", "unverified_conditions"):  # the older key too
+            with self.subTest(key=key):
+                out = _run(dict(GOOD_STRUCTURED, **{key: notes}))
+                self.assertEqual(out["out_of_scope"], notes)
+
+    def test_scope_notes_must_be_strings(self):
+        with self.assertRaisesRegex(ValueError, "out_of_scope"):
+            _run(dict(GOOD_STRUCTURED, out_of_scope="not a list"))
 
     def test_setup_before_action_and_verify_after_is_accepted(self):
         plan = [

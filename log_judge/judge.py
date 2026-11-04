@@ -25,7 +25,7 @@ def _compact_definition(definition):
     verification = definition.get("verification") or {}
     scenario = definition.get("scenario") or {}
     return {
-        "scenario": {k: scenario.get(k) for k in ("description", "preconditions", "chain_summary")},
+        "scenario": {k: scenario.get(k) for k in ("description", "preconditions", "out_of_scope", "chain_summary")},
         "steps": [{k: s.get(k) for k in _STEP_FIELDS if k in s} for s in definition.get("steps") or []],
         "requirements": [{k: r.get(k) for k in ("description", "quote", "evidence_id", "checks")}
                          for r in contract.get("requirements") or []],

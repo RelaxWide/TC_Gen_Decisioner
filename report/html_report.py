@@ -63,6 +63,10 @@ def _tc_evidence(tc):
             _json(req["results"]),
         ])
     body = '<p><strong>시나리오</strong>: ' + c.esc((tc.get("scenario") or {}).get("description", "")) + '</p>'
+    notes = (tc.get("scenario") or {}).get("out_of_scope", [])
+    if notes:
+        body += '<p><strong>이 TC가 검증하지 않는 범위</strong></p><ul>' + "".join(
+            f"<li>{c.esc(n)}</li>" for n in notes) + '</ul>'
     body += '<p><strong>스펙 검증</strong>: ' + c.esc(verification["status"]) + '</p>'
     body += _json(verification["issues"])
     if rows:

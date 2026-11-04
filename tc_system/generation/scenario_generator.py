@@ -36,8 +36,9 @@ SCENARIO_SCHEMA = {
     "precondition_checks": 'array of {"description": exact preconditions entry, "checks": [check objects]}; '
                            'every precondition needs checks on steps BEFORE action',
     "required_capabilities": 'array of required executor capability names from the supplied list',
-    "unverified_conditions": 'array of strings; any essential condition that this executor cannot establish '
-                             'or observe. Nonempty means the test will be skipped, never claimed covered.',
+    "out_of_scope": 'array of Korean strings; related behaviors this TC deliberately does NOT verify '
+                    '(other LIDs/values, deeper data comparison, ...). Informational only: recorded in the '
+                    'report, never blocks the test. Not for the requirement\'s own preconditions.',
 
 }
 
@@ -50,7 +51,7 @@ SCENARIO_SYSTEM_PROMPT = (
     "reading it back, or set a feature before checking it was applied) and verify steps for "
     "commands that confirm the target command's effect afterward. Only ever choose commands that "
     "appear in available_commands, by their exact name — never invent one.\n\n"
-    "Write description, requirement descriptions, chain_summary, and every steps_plan[].role in "
+    "Write description, requirement descriptions, chain_summary, every out_of_scope entry and every steps_plan[].role in "
     "Korean (한국어). steps_plan[].opcode_name and steps_plan[].phase must stay exactly as given "
     "(a real English command name, and one of setup/action/verify) — do not translate those.\n\n"
     "DEVICE_FACTS: if the prompt includes a device_facts block, it lists commands/ranges measured "
@@ -73,8 +74,11 @@ SCENARIO_SYSTEM_PROMPT = (
     "use captured hex bytes, not the model's explanation. data_equal/data_matches_write compare the "
     "same data only: for NVM Read/Write/Compare the compared step's SLBA/NLB (field_constraints) must "
     "lie inside the other step's range, and data_matches_write needs a non-zero payload_hex (zeros "
-    "look the same as unwritten LBAs). Unsupported capabilities or insufficient "
-    "evidence must be reported in unverified_conditions. Never simplify away the original requirement "
+    "look the same as unwritten LBAs). If the cited requirement itself cannot be "
+    "stimulated or observed with this executor, pick another requirement from the evidence that can be. "
+    "List related behaviors this TC leaves untested in out_of_scope (a note, never a reason to skip). "
+    "A condition the requirement depends on belongs in preconditions with a check before the action, "
+    "not in out_of_scope. Never simplify away the original requirement "
     "just to make a command return success. Previously verified requirement quotes are provided to "
     "help select a different requirement; testing one does not cover an entire clause."
 
@@ -87,6 +91,11 @@ def _as_list(value) -> list[str]:
     if isinstance(value, str):
         return [value] if value.strip() else []
     return [str(v) for v in value]
+
+
+def _scope_notes(structured):
+    """out_of_scope, also accepting the older unverified_conditions key."""
+    return [str(n) for n in (structured.get("out_of_scope") or structured.get("unverified_conditions") or [])]
 
 
 def _validate_steps_plan(plan, opcode_entry: dict, available_opcodes: list[dict]) -> list[dict]:
@@ -187,6 +196,7 @@ def generate_scenario(section: dict, opcode_entry: dict, available_opcodes: list
         "chain_summary": str(structured.get("chain_summary") or structured["description"]),
         "requirements": structured["requirements"],
         "precondition_checks": structured.get("precondition_checks", []),
+        "out_of_scope": _scope_notes(structured),
         "spec_evidence": rag["chunks"],
         "rag_response_id": rag["response_id"],
         "llm_response_id": llm["response_id"],

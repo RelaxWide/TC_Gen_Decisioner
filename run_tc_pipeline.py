@@ -135,6 +135,8 @@ def _print_result(index, total, tc):
             _dual_label("       ", check["result"], check["detail"])
     for issue in verification.get("issues", []):
         _dual_label("     ", "미검증 사유", issue)
+    for note in (tc.get("scenario") or {}).get("out_of_scope", []):
+        _dual_label("     ", "검증 범위 밖", note)
     reason = execution.get("args_rejected") or execution.get("host_tool_crash")
     _dual_label("     ", "사유", reason, width=110)
     if status == "UNSUPPORTED":

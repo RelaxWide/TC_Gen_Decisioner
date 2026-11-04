@@ -195,7 +195,8 @@ def build_tc(tc_id: str, resolved_steps: list[dict], scenario: dict,
         source_opcodes=list(dict.fromkeys(rs["opcode_entry"]["opcode"] for rs in resolved_steps)),
         generated_from={"rag_response_id": scenario["rag_response_id"],
                          "llm_response_id": scenario["llm_response_id"]},
-        scenario={"description": scenario["description"], "preconditions": scenario["preconditions"]},
+        scenario={"description": scenario["description"], "preconditions": scenario["preconditions"],
+                  "out_of_scope": scenario.get("out_of_scope", [])},
         expectation={
             "description": expectation_description,
             "fail_criteria": scenario["fail_criteria"] + ["nvme-cli exit code != 0", "command timeout exceeded"],
@@ -214,6 +215,7 @@ def build_tc(tc_id: str, resolved_steps: list[dict], scenario: dict,
         "version": VERSION, "target_section_id": action["section"]["section_id"],
         "requirements": scenario.get("requirements", []),
         "precondition_checks": scenario.get("precondition_checks", []),
+        "out_of_scope": scenario.get("out_of_scope", []),
         "evidence": scenario.get("spec_evidence", []),
     }
     if scenario.get("requirements"):

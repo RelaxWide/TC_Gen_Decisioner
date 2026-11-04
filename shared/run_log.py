@@ -15,7 +15,7 @@ class _Tee:
     others — the file stream, opened as UTF-8, is the one that has to be
     reliable, even if the console display degrades.
 
-    Also prefixes every line with a `[HH:MM:SS]` timestamp, on both the
+    Also prefixes every line with a `[YYYY-MM-DD HH:MM:SS.mmm]` timestamp, on both the
     console and the file — without it, a line like "-> 실행 중..." gives no
     way to tell, while staring at it, whether the wait is normal or an actual
     multi-minute SSH hang; correlating against `ssh_commands.jsonl`'s own
@@ -47,7 +47,10 @@ class _Tee:
         return "".join(out), data.endswith("\n")
 
     def _stamp_now(self):
-        return datetime.now().strftime("[%H:%M:%S] ")
+        # Date + milliseconds: a multi-day run (or two runs on different days
+        # side by side) is unreadable with the time alone, and the per-step
+        # SSH calls finish within the same second.
+        return datetime.now().strftime("[%Y-%m-%d %H:%M:%S.%f")[:-3] + "] "
 
     def write(self, data):
         data, self._at_line_start = self._stamped(data, self._at_line_start, self._stamp_now())

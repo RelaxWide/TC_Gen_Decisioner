@@ -13,7 +13,7 @@ from unittest import mock
 import config
 from shared.run_log import capture_to_file
 
-_STAMP_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\] ")
+_STAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] ")
 
 
 def _unstamped_lines(text):
@@ -50,7 +50,7 @@ class TestCaptureToFile(unittest.TestCase):
         lines = path.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(lines), 2)
         for line in lines:
-            self.assertRegex(line, r"^\[\d{2}:\d{2}:\d{2}\] ")
+            self.assertRegex(line, _STAMP_RE)
         self.assertIn("first line", lines[0])
         self.assertIn("second line", lines[1])
 
@@ -62,7 +62,7 @@ class TestCaptureToFile(unittest.TestCase):
             print("\n[1/10] header")
         lines = path.read_text(encoding="utf-8").splitlines()
         self.assertEqual(lines[0], "")
-        self.assertRegex(lines[1], r"^\[\d{2}:\d{2}:\d{2}\] \[1/10\] header$")
+        self.assertRegex(lines[1], _STAMP_RE.pattern + r"\[1/10\] header$")
 
     def test_printed_text_still_reaches_the_real_console(self):
         real_stdout = mock.Mock()
