@@ -814,5 +814,121 @@ class TestFieldValueRejectionDoesNotProveUnsupported(PipelineTestCase):
         self.assertEqual(stored[0]["status"], "ERROR")
 
 
+
+class TestRetryIsLogged(PipelineTestCase):
+    """Measured: Get Features FID 84h ended "실행/인자 오류" with no trace of
+    what the retry changed or what came back. (The fixture's step 0 is Write,
+    a destructive step, so rejections are put on step 0: a rejection after it
+    is deliberately not retried.)"""
+
+    def _stored(self):
+        return json.loads(Path(config.TC_STORE_PATH).read_text(encoding="utf-8"))[0]
+
+    def _authored_by_attempt(self, *a, **k):
+        # First authoring -> 0x84; the reauthor after a rejection -> 0x184.
+        return dict(_authored(a[1]), cdw10="0x00000184" if k.get("rejected") else "0x00000084")
+
+    def test_a_retry_rejected_again_shows_what_changed_and_what_came_back(self):
+        executor = _FakeExecutor([[_rejected(0), _ok(1)], [_rejected(0), _ok(1)]])
+        with mock.patch.object(tc_writer, "author_args", side_effect=self._authored_by_attempt):
+            self._run(executor)
+        entry = self._stored()["retry_log"][0]
+        self.assertEqual(entry["kind"], "args_rejected")
+        self.assertEqual(entry["step_index"], 0)
+        self.assertIn("INVALID_FIELD", entry["trigger"])
+        self.assertIn("스텝 0 cdw10 0x00000084 -> 0x00000184", entry["changes"])
+        self.assertEqual(entry["detail"], "재시도도 거부됨")
+        self.assertIn("INVALID_FIELD", entry["result"])
+
+    def test_a_retry_that_could_not_be_authored_says_why_nothing_was_resent(self):
+        from tc_system.generation.args_author import ArgsAuthoringError
+
+        def author(*a, **k):
+            if k.get("rejected"):
+                raise ArgsAuthoringError("FID must stay 84h but SEL conflicts")
+            return _authored(a[1])
+
+        executor = _FakeExecutor([[_rejected(0), _ok(1)]])
+        with mock.patch.object(tc_writer, "author_args", side_effect=author):
+            self._run(executor)
+        entry = self._stored()["retry_log"][0]
+        self.assertIn("placeholder", entry["detail"])
+        self.assertIn("SEL conflicts", entry["detail"])
+        self.assertEqual(len(executor.calls), 1)
+
+    def test_a_rejection_after_a_destructive_step_records_why_it_was_not_retried(self):
+        executor = _FakeExecutor([[_ok(0), _rejected(1)]])
+        self._run(executor)
+        entry = self._stored()["retry_log"][0]
+        self.assertEqual((entry["kind"], entry["step_index"]), ("none", 1))
+        self.assertIn("파괴적", entry["detail"])
+        self.assertEqual(len(executor.calls), 1)
+
+    def test_an_error_that_is_not_a_rejection_records_that_no_retry_was_made(self):
+        executor = _FakeExecutor([[{"step_index": 0, "exit_code": 2,
+                                     "stdout": "/dev/nvme0n1: No such file or directory"}, _ok(1)]])
+        self._run(executor)
+        entry = self._stored()["retry_log"][0]
+        self.assertEqual(entry["kind"], "none")
+        self.assertIn("재시도 대상 아님", entry["detail"])
+
+    def test_the_terminal_prints_the_retry_history(self):
+        import contextlib
+        import io
+        import run_tc_pipeline
+        executor = _FakeExecutor([[_rejected(0), _ok(1)], [_rejected(0), _ok(1)]])
+        with mock.patch.object(tc_writer, "author_args", side_effect=self._authored_by_attempt):
+            self._run(executor)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run_tc_pipeline._print_result(1, 1, self._stored())
+        text = out.getvalue()
+        self.assertIn("인자 거부 → 재시도", text)
+        self.assertIn("바뀐 값: 스텝 0 cdw10 0x00000084 -> 0x00000184", text)
+        self.assertIn("재시도 결과:", text)
+
+
+
+class TestPlaceholderRetryKeepsTheFailedList(PipelineTestCase):
+    def test_a_later_failing_tc_is_still_counted_and_the_batch_keeps_going(self):
+        # The placeholder-retry branch once assigned the placeholder step to
+        # `failed`, replacing the failed-TC list: the summary counted the step
+        # dict's keys and the next FAIL crashed on dict.append.
+        from tc_system.generation.args_author import ArgsAuthoringError
+
+        def author(*a, **k):
+            if k.get("rejected"):
+                raise ArgsAuthoringError("cannot keep FID and fix SEL")
+            return _authored(a[1])
+
+        executor = _FakeExecutor([[_rejected(0), _ok(1)], [_ok(0), _plain_fail(1)]])
+        with mock.patch.object(tc_writer, "author_args", side_effect=author):
+            result = pipeline.run_pipeline(count=2, executor=executor, allow_destructive=True)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["executed"], 2)
+
+
+class TestCountMustBePositive(PipelineTestCase):
+    def test_zero_or_negative_count_runs_nothing(self):
+        for count in (0, -1):
+            with self.subTest(count=count), self.assertRaises(ValueError):
+                pipeline.run_pipeline(count=count, executor=_FakeExecutor([]), allow_destructive=True)
+
+    def test_target_selection_returns_nothing_for_a_non_positive_count(self):
+        from tc_system.coverage.spec_coverage_index import SpecCoverageIndexFile
+        index = SpecCoverageIndexFile(config.active_coverage_index_path())
+        for count in (0, -1):
+            with self.subTest(count=count):
+                self.assertEqual(pipeline.pick_next_targets(index, [], count), [])
+
+    def test_the_cli_rejects_it_before_anything_runs(self):
+        import argparse
+        import run_tc_pipeline
+        for text in ("0", "-1"):
+            with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
+                run_tc_pipeline._positive_int(text)
+        self.assertEqual(run_tc_pipeline._positive_int("3"), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

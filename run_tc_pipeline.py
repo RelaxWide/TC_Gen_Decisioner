@@ -14,6 +14,13 @@ _PHASE_LABEL = {"setup": "사전조건", "action": "본동작", "verify": "확�
 _tc_start_times = {}
 
 
+def _positive_int(text):
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {value}")
+    return value
+
+
 def _one_line(text, width=100):
     text = " ".join(str(text or "").split())
     return textwrap.shorten(text, width=width, placeholder=" ...")
@@ -112,20 +119,25 @@ def _print_result(index, total, tc):
             step_label = _STATUS_LABEL.get(step_statuses[i], step_statuses[i])
             print(f"    [{i}] {step.get('name') or '?'}  {step_label}  cdw10={step['cdw10']} data_len={step['data_len']}")
 
-    retried = tc.get("retried")
-    if retried:
-        # Without this, the command block above (printed by _print_start
-        # before any retry) can silently disagree with the cdw10/data_len
-        # values just printed above — e.g. a rejected Set Features authored
-        # with cdw10=0x16 up there, re-authored to 0x01 down here — with
-        # nothing on screen explaining why. Measured: this read as a bug
-        # on first glance until the SSH/LLM call logs were cross-checked.
-        kind_label = {"args_rejected": "인자 거부", "replanned": "미지원 → 재계획"}.get(
-            retried["kind"], retried["kind"])
-        detail = (f"스텝 {retried['step_index']}({retried.get('step_name') or '?'})이 "
-                  f"{kind_label}로 재시도됨 — 위 \"실행할 명령\"은 재시도 전 값이고, 방금 찍힌 cdw 값이 "
-                  f"실제로 전송된 최종 값입니다. 사유: {retried['reason']}")
-        _dual_label("     ", "⚠ 재시도", detail)
+    # Every retry decision: what triggered it, which argument values changed,
+    # and what came back - or why nothing was resent. Without this the
+    # command block above (printed before any retry) silently disagreed with
+    # the final values, and a retry that was rejected again, or never sent,
+    # left no trace at all (measured: Get Features FID 84h -> 실행/인자 오류
+    # with no way to tell what the retry did).
+    heads = {"args_rejected": "인자 거부 → 재시도", "replanned": "미지원 스텝 → 재계획",
+             "none": "재시도 안 함"}
+    for entry in tc.get("retry_log") or []:
+        where = f"스텝 {entry['step_index']} {entry.get('step_name') or '?'}"
+        if entry.get("trigger"):
+            where += f" — 계기: {entry['trigger']}"
+        _dual_label("     ", f"⚠ {heads.get(entry['kind'], entry['kind'])}", where, width=110)
+        for change in entry.get("changes", []):
+            _dual_label("       ", "바뀐 값", change, width=110)
+        _dual_label("       ", "처리", entry.get("detail"), width=110)
+        _dual_label("       ", "재시도 결과", entry.get("result"), width=110)
+    if tc.get("retried"):
+        print("       (위 \"실행할 명령\"은 재시도 전 값이고, 결과 줄의 cdw 값이 실제로 보낸 최종 값)")
 
     execution = tc.get("execution") or {}
     verification = tc.get("verification") or {}
@@ -174,7 +186,8 @@ def _print_skip(index, total, section, opcode_entry, reason):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--count", type=int, default=5, help="how many new TCs to generate+execute this run")
+    parser.add_argument("--count", type=_positive_int, default=5,
+                        help="how many new TCs to generate+execute this run (1 or more)")
     parser.add_argument("--allow-placeholder-args", action="store_true",
                          help="execute a TC even though its command arguments fell back to placeholders "
                               "(plumbing experiments only; resulting TCs are excluded from the coverage "

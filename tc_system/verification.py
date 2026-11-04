@@ -40,13 +40,31 @@ MIN_QUOTE_CHARS = 20   # letters/digits in the whole quote
 MIN_SEGMENT_CHARS = 8  # letters/digits in each "..."-separated piece
 
 
+# One spelling per operator: the evidence has both "≥" and OCR'd LaTeX
+# "$ \geq $", and a model may write ">=". Operators carry meaning and are kept.
+_LATEX_OPERATORS = [(re.compile(r"\\geq?(?![a-z])"), ">="), (re.compile(r"\\leq?(?![a-z])"), "<="),
+                    (re.compile(r"\\neq(?![a-z])"), "!="), (re.compile(r"\\times(?![a-z])"), "*")]
+_OPERATOR_CHARS = str.maketrans({"≥": ">=", "⩾": ">=", "≤": "<=", "⩽": "<=", "≠": "!=", "×": "*", "÷": "/",
+                                 "−": "-", "–": "-", "—": "-", "‐": "-", "‑": "-", "‒": "-"})
+
+
 def _quote_key(text):
-    """Letters and digits only, case-folded. The evidence carries table pipes,
-    OCR'd LaTeX ("LBA $ _{s} $"), curly quotes and en dashes; a model copying
-    the sentence writes "LBAs", "'" and "-". Same words in the same order is
-    what provenance needs - a translation or paraphrase still fails."""
-    text = unicodedata.normalize("NFKC", plain_text(text)).casefold()
-    return re.sub(r"[^0-9a-z]", "", text)
+    """Letters, digits and operators, case-folded.
+
+    The evidence carries table pipes, OCR'd LaTeX ("LBA $ _{s} $"), curly
+    quotes and en dashes; a model copying the sentence writes "LBAs", "'" and
+    "-". Those differences are dropped. Comparison/arithmetic operators and
+    decimal points are kept: "≥ NAWUN" quoted as "≤ NAWUN" is the opposite
+    requirement, not a formatting difference. Hyphens inside words
+    ("zero-filled") are dropped; a minus next to a number or space is kept.
+    """
+    text = unicodedata.normalize("NFKC", plain_text(text))
+    for pattern, replacement in _LATEX_OPERATORS:
+        text = pattern.sub(replacement, text)
+    text = text.translate(_OPERATOR_CHARS).casefold()
+    text = re.sub(r"(?<=[a-z])-(?=[a-z])", "", text)
+    text = re.sub(r"(?<=\d)\.(?=\d)", "#", text)  # 1.5 stays distinct from 15
+    return re.sub(r"[^0-9a-z<>=!+\-*/%^#]", "", text)
 
 
 def quote_in(quote, text):
@@ -304,16 +322,35 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
                     "and give that block's evidence_id")
             req["evidence_id"] = block["evidence_id"]
         if not isinstance(req.get("description"), str) or not req["description"].strip():
-            raise ValueError("requirement needs a description")
+            raise ValueError(f"requirements[{n}] needs a description")
         checks = req.get("checks")
         if not isinstance(checks, list) or not checks:
-            raise ValueError("requirement has no executable checks")
+            raise ValueError(f"requirements[{n}] has no executable checks")
         for check in checks:
             validate_check(check, len(steps))
-        if not any(integer(c["step"]) >= action for c in checks):
-            raise ValueError("a target requirement cannot be verified by setup observations alone")
         req["requirement_id"] = stable_id("req", section_id, block["evidence_id"], quote)
         req["section_id"] = section_id
+    # A "requirement" whose checks all observe steps before the action is a
+    # precondition (e.g. "Identify reports the log page as supported"): it is
+    # measured before the command under test and gates it. Moved there instead
+    # of rejecting the whole scenario (measured: base:5.2.12 skipped over one
+    # such entry). The scenario still needs at least one check on the action.
+    setup_only = [r for r in requirements if not any(integer(c["step"]) >= action for c in r["checks"])]
+    if len(setup_only) == len(requirements):
+        action_name = steps[action]["opcode_name"]
+        raise ValueError(
+            f"every requirement only checks steps before the action. The action is steps_plan[{action}] "
+            f"({action_name}) and step indexes are 0-based: give at least one requirement a check with "
+            f"\"step\": {action} or later; observations of earlier steps belong in precondition_checks")
+    if setup_only:
+        conditions = structured.setdefault("precondition_checks", [])
+        if not isinstance(structured.get("preconditions"), list) or not isinstance(conditions, list):
+            raise ValueError("preconditions and precondition_checks must be arrays")
+        structured["requirements"] = [r for r in requirements if r not in setup_only]
+        for req in setup_only:
+            structured["preconditions"].append(req["description"])
+            conditions.append({"description": req["description"], "checks": req["checks"],
+                               "moved_from_requirement": True})
     covered_conditions = structured.get("precondition_checks", [])
     if not isinstance(covered_conditions, list):
         raise ValueError("precondition_checks must be an array")

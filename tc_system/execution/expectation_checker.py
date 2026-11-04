@@ -344,7 +344,7 @@ def check_expectation(tc_record: dict, execution_result: dict) -> str:
     return verify_tc(tc_record, execution_result)["status"]
 
 
-def _status_line(out: str) -> str:
+def status_line(out: str) -> str:
     """The one output line that says what happened (full text, not cut)."""
     lines = [l.strip() for l in out.splitlines() if l.strip()]
     for line in lines:
@@ -373,27 +373,40 @@ def error_cause(tc_record: dict, execution_result: dict) -> dict | None:
         if not r or not r.get("started", True):
             kind, detail = "환경", "SSH 배치가 중간에 끊겨 이 스텝은 장비에 전송되지 않음"
         elif code in HOST_CRASH_EXIT_CODES or any(m in out for m in HOST_CRASH_MARKERS):
-            kind, detail = "호스트 도구", f"nvme-cli가 호스트에서 비정상 종료(exit {code}): {_status_line(out)}"
+            kind, detail = "호스트 도구", f"nvme-cli가 호스트에서 비정상 종료(exit {code}): {status_line(out)}"
         elif HOST_ERROR_RE.search(out):
-            kind, detail = "환경", f"호스트/장치 노드 오류: {_status_line(out)}"
+            kind, detail = "환경", f"호스트/장치 노드 오류: {status_line(out)}"
         elif expected_status(step) != "SUCCESS" and actual:
             kind, detail = ("판정 보류", f"{expected_status(step)} 거부를 기대했는데 {actual}로 거부됨 — "
-                                         f"다른 필드(NSID 등)가 원인일 수 있어 결함으로 보지 않음: {_status_line(out)}")
+                                         f"다른 필드(NSID 등)가 원인일 수 있어 결함으로 보지 않음: {status_line(out)}")
         elif _INVALID_STATUS_RE.search(out):
-            kind, detail = "인자", f"컨트롤러가 우리가 만든 인자를 거부: {_status_line(out)}"
+            kind, detail = "인자", f"컨트롤러가 우리가 만든 인자를 거부: {status_line(out)}"
+            if step.get("field_value_verified"):
+                # Not reclassified as UNSUPPORTED (a correct selector does not
+                # prove every other field valid), but the reader should know.
+                detail += (" — 조항이 지정한 선택자 값(FID/LID/CNS 등)은 스펙상 위치에 맞게 인코딩됐으므로, "
+                           "드라이브가 이 값 자체를 지원하지 않을 가능성이 큼")
         else:
-            kind, detail = "판정 불가", f"완료 상태를 읽을 수 없음(exit {code}): {_status_line(out)}"
+            kind, detail = "판정 불가", f"완료 상태를 읽을 수 없음(exit {code}): {status_line(out)}"
         return {"step_index": i, "step": step.get("name") or step.get("opcode"), "phase": step.get("phase"),
                 "kind": kind, "detail": detail}
     return None
 
 
-def describe_outcome(tc: dict) -> dict:
+def describe_outcome(tc: dict, verification: dict | None = None) -> dict:
     """{"verdict", "cause", "next"} in Korean: what the result means, why, and
-    what the tool does about it - the three things a reader has to decide on."""
+    what the tool does about it - the three things a reader has to decide on.
+
+    `verification` is the freshly recomputed `verify_tc` result when the
+    caller has one (the report). A stored PASS is only a spec PASS when that
+    recomputation agrees: records from before the contract existed say PASS
+    but prove nothing, and were shown as "검증 통과 / 조치 없음".
+    """
     status = tc.get("status")
     execution = tc.get("execution") or {}
-    verification = tc.get("verification") or {}
+    verification = verification or tc.get("verification") or {}
+    if status == "PASS" and verification.get("status") != "PASS":
+        status = verification.get("status") or "UNVERIFIED"
     if status == "PASS":
         return {"verdict": "스펙 요구사항 검증 통과", "cause": None, "next": "조치 없음"}
     if status == "FAIL":

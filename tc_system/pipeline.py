@@ -12,6 +12,7 @@ from tc_system.coverage.coverage_state import compute_coverage, pick_next_target
 from tc_system.coverage.spec_coverage_index import SpecCoverageIndexFile
 from tc_system.execution.expectation_checker import (check_expectation, check_execution, check_step_expectations,
                                                       device_hung, error_cause, evaluate_criteria, host_tool_crash,
+                                                      status_line,
                                                       rejected_arguments, unsupported_opcode)
 from shared.llm_client import LLMCallError
 from tc_system.execution.ssh_runner import DestructiveStepBlocked, device_responsive, probe_device_capabilities
@@ -29,6 +30,26 @@ def _execute_attempt(tc, executor, attempts):
     attempts.append({"attempt_id": tc["active_attempt_id"], "steps": deepcopy(tc["steps"]),
                      "execution": deepcopy(result)})
     return result
+
+
+_ARG_FIELDS = ("nsid", "cdw10", "cdw11", "cdw12", "cdw13", "cdw14", "cdw15", "data_len", "direction")
+
+
+def _changed_args(before: list[dict], after: list[dict]) -> list[str]:
+    """"스텝 0 cdw10 0x00000084 -> 0x00000184" for every field a retry changed."""
+    changes = []
+    for i, (old, new) in enumerate(zip(before, after)):
+        for field in _ARG_FIELDS:
+            if old.get(field) != new.get(field):
+                changes.append(f"스텝 {i} {field} {old.get(field)} -> {new.get(field)}")
+    return changes
+
+
+def _step_outcome(execution: dict, step_index: int) -> str:
+    result = next((r for r in execution.get("step_results", []) if r["step_index"] == step_index), None)
+    if result is None or not result.get("started", True):
+        return "실행되지 않음"
+    return status_line(str(result.get("stdout", "")))
 
 
 def _build_tc_exec_failure_context(tc: dict, execution: dict) -> dict:
@@ -191,6 +212,10 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
     meant to persist across runs *of the same physical drive*, so it must
     stay a deliberate, explicit action (CLI: `--reset-coverage`).
     """
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        # pick_next_targets stops when it has `count` targets; 0 or a negative
+        # never matches, which selected every target, destructive ones too.
+        raise ValueError(f"count must be a positive integer, got {count!r}")
     if reset_coverage:
         _reset_coverage()
     # Keep per-attempt evidence and judgments across runs. IDs already identify
@@ -306,6 +331,16 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
         # Includes the kernel cancelling the command (EINTR/EIO), the same
         # hang seen one layer lower than the SSH timeout.
         timed_out = device_hung(execution)
+        # Every retry decision, including the ones that send nothing, so the
+        # log says what was tried, what changed and what came back (measured:
+        # "Get Features FID 84h -> 실행/인자 오류" with no way to tell whether
+        # or how the retry changed the arguments).
+        retry_log = []
+        if broken_idx is not None and (precedes_destructive or timed_out):
+            retry_log.append({"kind": "none", "step_index": broken_idx,
+                              "step_name": tc["steps"][broken_idx].get("name"),
+                              "detail": ("앞 스텝에서 파괴적/펌웨어 커맨드가 이미 실행돼 재시도하지 않음"
+                                         if precedes_destructive else "장비 행(타임아웃/커널 취소)이라 재시도하지 않음")})
 
         if broken_idx is not None and not precedes_destructive and not timed_out:
             if rejection is not None and rejection[0] == broken_idx:
@@ -315,12 +350,20 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
                 # step's about-to-change shared_facts, which would otherwise
                 # go stale. For a single-step TC this degenerates to exactly
                 # today's one-step reauthor.
+                entry = {"kind": "args_rejected", "step_index": broken_idx,
+                         "step_name": tc["steps"][broken_idx].get("name"), "trigger": rejection[1]}
+                retry_log.append(entry)
                 try:
                     retry_steps = reauthor_steps(tc, resolved_steps,
                                                   {"step_index": broken_idx, "reason": rejection[1]}, active_nsid,
                                                   device_facts=device_facts)
-                except _LLM_REPLY_ERRORS:
+                except _LLM_REPLY_ERRORS as exc:
                     retry_steps = None
+                    entry["detail"] = f"인자 재생성 LLM 호출 실패로 재시도하지 않음: {exc}"
+                if retry_steps is not None and any(s.get("args_source") == "placeholder" for s in retry_steps):
+                    placeholder_step = next(s for s in retry_steps if s.get("args_source") == "placeholder")
+                    entry["detail"] = ("새 인자를 만들지 못해(placeholder) 재시도하지 않음: "
+                                       f"{placeholder_step.get('args_error', '')}")
                 # Only adopted if it will actually be sent. Assigning it to
                 # tc["steps"] first (as this once did) left a placeholder
                 # retry that was never executed stored as the TC's steps —
@@ -337,14 +380,19 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
                     candidate["retried"] = {"kind": "args_rejected", "step_index": broken_idx,
                                             "step_name": tc["steps"][broken_idx].get("name"), "reason": rejection[1]}
                     candidate["steps"] = retry_steps
+                    entry["changes"] = _changed_args(tc["steps"], retry_steps) or ["바뀐 인자 없음"]
                     try:
                         retry_execution = _execute_attempt(candidate, executor, attempts)
-                    except (DestructiveStepBlocked, ValueError):
+                    except (DestructiveStepBlocked, ValueError) as exc:
                         retry_execution = None
+                        entry["detail"] = f"재시도 인자가 전송 전 검증에서 막혀 보내지 않음: {exc}"
                     if retry_execution is not None:
                         tc, execution = candidate, retry_execution
                         step_statuses = check_step_expectations(tc, execution)
                         rejection = rejected_arguments(execution, tc)
+                        entry["result"] = _step_outcome(execution, broken_idx)
+                        entry["detail"] = ("재시도도 거부됨" if rejection and rejection[0] == broken_idx
+                                           else f"재시도 후 스텝 상태: {step_statuses[broken_idx]}")
             elif step_statuses[broken_idx] == "UNSUPPORTED" and broken_idx != action_idx:
                 # A setup/verify command that simply doesn't exist on this
                 # drive — no argument fix helps, and the dependent steps
@@ -354,6 +402,9 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
                 # if it comes back usable (not placeholder-gated itself).
                 broken_name = resolved_steps[broken_idx]["opcode_entry"]["name"]
                 replan_reason = f"{broken_name} is UNSUPPORTED (INVALID_OPCODE) on this drive"
+                entry = {"kind": "replanned", "step_index": broken_idx, "step_name": broken_name,
+                         "trigger": replan_reason}
+                retry_log.append(entry)
                 try:
                     replanned_scenario = generate_scenario(
                         section, opcode_entry, available_opcodes,
@@ -373,10 +424,15 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
                     # or whatever it did — only the broken non-action step's
                     # plan couldn't be improved) and move on below.
                     replanned_tc = None
+                    entry["detail"] = "재계획 LLM 호출/검증 실패로 원래 결과 유지"
+                if replanned_tc is not None and replanned_tc["uses_placeholder_args"]:
+                    entry["detail"] = "재계획한 체인의 인자를 만들지 못해(placeholder) 원래 결과 유지"
                 if replanned_tc is not None and not replanned_tc["uses_placeholder_args"]:
+                    entry["changes"] = [" -> ".join(s.get("name") or "?" for s in replanned_tc["steps"])]
                     try:
                         replanned_execution = _execute_attempt(replanned_tc, executor, attempts)
-                    except (DestructiveStepBlocked, ValueError):
+                    except (DestructiveStepBlocked, ValueError) as exc:
+                        entry["detail"] = f"재계획한 체인이 전송 전에 막혀 원래 결과 유지: {exc}"
                         # The replanned chain (the model's own new choice of
                         # setup/verify commands) introduced a destructive step
                         # under --no-destructive. The gate raises before
@@ -398,6 +454,14 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
                         execution = replanned_execution
                         step_statuses = check_step_expectations(tc, execution)
                         rejection = rejected_arguments(execution, tc)
+                        entry["detail"] = "재계획한 체인으로 다시 실행함"
+                        entry["result"] = "; ".join(f"스텝 {k} {st}" for k, st in enumerate(step_statuses))
+            else:
+                retry_log.append({"kind": "none", "step_index": broken_idx,
+                                  "step_name": tc["steps"][broken_idx].get("name"),
+                                  "detail": ("action 커맨드 자체가 미지원이라 재시도해도 바뀌지 않음"
+                                             if step_statuses[broken_idx] == "UNSUPPORTED"
+                                             else "컨트롤러의 인자 거부가 아니어서(환경/호스트 오류 등) 재시도 대상 아님")})
             # Else: UNSUPPORTED on the action step itself (the fixed primary
             # target — no plan change can avoid testing it) or a generic
             # host-tool/SSH ERROR with no specific rejection to act on.
@@ -406,6 +470,7 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
 
         criteria_results = evaluate_criteria(tc, execution)
         tc["attempts"] = attempts
+        tc["retry_log"] = retry_log
         tc["verification"] = verify_tc(tc, execution)
         tc["execution_status"] = check_execution(tc, execution)
         tc["status"] = check_expectation(tc, execution)

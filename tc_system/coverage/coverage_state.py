@@ -230,6 +230,8 @@ def pick_next_targets(index, tc_records: list[dict], count: int,
                    or attempts[sid] >= UNRESOLVED_ATTEMPT_LIMIT)
         return (settled, attempts[sid], pair_attempts[(sid, opcode)], _target_rank(*pair))
 
+    if count < 1:
+        return []
     candidates = sorted(((section, opcode) for section in index.list_sections()
                          for opcode in index.opcodes_for_section(section)
                          if opcode.get("name") not in UNEXECUTABLE_COMMANDS), key=key)

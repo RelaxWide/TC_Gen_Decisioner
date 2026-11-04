@@ -187,7 +187,11 @@ def generate_scenario(section: dict, opcode_entry: dict, available_opcodes: list
         except (ValueError, TypeError, KeyError) as exc:
             if attempt:
                 raise ValueError(f"scenario contract invalid: {exc}") from exc
-            prompt += f"\n\nYour plan is not executable: {exc}. Correct the contract without changing its target."
+            plan = structured.get("steps_plan")
+            indexes = ", ".join(f"{k}={s.get('opcode_name')}({s.get('phase')})" for k, s in enumerate(plan)
+                                if isinstance(s, dict)) if isinstance(plan, list) else ""
+            prompt += (f"\n\nYour plan is not executable: {exc}. Correct the contract without changing its target."
+                       + (f" Your steps_plan indexes (0-based, as checks must use them): {indexes}." if indexes else ""))
 
     return {
         "description": str(structured["description"]),

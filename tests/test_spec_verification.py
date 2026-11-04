@@ -544,3 +544,78 @@ class TestQuoteMatching(unittest.TestCase):
         ops = [{"name": "Get Features", "raw_opcode": "0x0a", "command_set": "ADMIN"}]
         with self.assertRaisesRegex(ValueError, r"requirements\[0\]\.quote .*An invented sentence"):
             validate_plan_contract(structured, [{"evidence_id": "source", "text": QUOTE}], "base:5.2.11", ops)
+
+
+
+class TestSetupOnlyRequirementBecomesAPrecondition(unittest.TestCase):
+    OPS = [{"name": "Identify", "raw_opcode": "0x06", "command_set": "ADMIN"},
+           {"name": "Get Features", "raw_opcode": "0x0a", "command_set": "ADMIN"}]
+
+    def _plan(self, steps_checked):
+        steps = [{"opcode_name": "Identify", "phase": "setup", "expected_status": "SUCCESS",
+                  "field_constraints": [{"field": "cdw10", "mask": "0xff", "value": "0x1"}]},
+                 {"opcode_name": "Get Features", "phase": "action", "expected_status": "SUCCESS",
+                  "field_constraints": [{"field": "cdw10", "mask": "0x7ff", "value": "0x84"}]}]
+        reqs = [{"evidence_id": "source", "quote": QUOTE, "description": f"requirement on step {s}",
+                 "checks": [{"kind": "completion", "step": s}]} for s in steps_checked]
+        return {"steps_plan": steps, "requirements": reqs, "preconditions": [], "precondition_checks": []}
+
+    def test_it_is_moved_when_another_requirement_checks_the_action(self):
+        plan = self._plan([0, 1])
+        validate_plan_contract(plan, [{"evidence_id": "source", "text": QUOTE}], "base:5.2.11", self.OPS)
+        self.assertEqual([r["description"] for r in plan["requirements"]], ["requirement on step 1"])
+        self.assertEqual(plan["preconditions"], ["requirement on step 0"])
+        self.assertEqual(plan["precondition_checks"][0]["checks"], [{"kind": "completion", "step": 0}])
+
+    def test_with_no_check_on_the_action_the_error_names_the_action_index(self):
+        with self.assertRaisesRegex(ValueError, r"steps_plan\[1\] \(Get Features\).*\"step\": 1"):
+            validate_plan_contract(self._plan([0]), [{"evidence_id": "source", "text": QUOTE}],
+                                   "base:5.2.11", self.OPS)
+
+
+
+class TestQuoteOperatorsKeepTheirMeaning(unittest.TestCase):
+    def setUp(self):
+        self.text = "\n".join(b["text"] for b in spec_evidence.clause_catalog().values())
+
+    def test_a_flipped_inequality_is_not_the_same_requirement(self):
+        from tc_system.verification import quote_in
+        self.assertIn("≥ NAWUN and ≥ AWUN", self.text)
+        self.assertTrue(quote_in("Namespace Atomic Boundary Size Normal (NABSN) = NAWUN", self.text))
+        self.assertTrue(quote_in("and = NABSPF | ≥ NAWUN and ≥ AWUN", self.text))
+        self.assertFalse(quote_in("and = NABSPF | ≤ NAWUN and ≤ AWUN", self.text))
+
+    def test_latex_unicode_and_ascii_spellings_of_one_operator_are_equal(self):
+        from tc_system.verification import quote_in
+        self.assertIn("$ \\geq $ AWUN", self.text)  # OCR'd LaTeX in the real evidence
+        source = "Namespace Atomic Write Unit Normal (NAWUN) | $ \\geq $ AWUN"
+        for spelling in ("≥", ">=", "$\\geq$"):
+            with self.subTest(spelling=spelling):
+                self.assertTrue(quote_in(f"Namespace Atomic Write Unit Normal (NAWUN) {spelling} AWUN", source))
+        self.assertFalse(quote_in("Namespace Atomic Write Unit Normal (NAWUN) <= AWUN", source))
+
+    def test_decimal_points_and_minus_signs_are_kept(self):
+        from tc_system.verification import quote_in
+        self.assertFalse(quote_in("the maximum value is 15 seconds for this field", "the maximum value is 1.5 seconds for this field"))
+        self.assertFalse(quote_in("the number of logical blocks is NLB + 1 for this command",
+                                  "the number of logical blocks is NLB - 1 for this command"))
+        self.assertTrue(quote_in("a zero filled buffer is transferred to the host", "a zero-filled buffer is transferred to the host"))
+
+
+class TestReportDoesNotCallALegacyPassVerified(unittest.TestCase):
+    def test_a_stored_pass_without_a_contract_is_described_from_the_recomputed_status(self):
+        from tc_system.execution.expectation_checker import describe_outcome
+        legacy = {"status": "PASS", "steps": [], "execution": {"step_results": []}}
+        recomputed = verify_tc(legacy, legacy["execution"])
+        self.assertEqual(recomputed["status"], "UNVERIFIED")
+        outcome = describe_outcome(legacy, recomputed)
+        self.assertNotIn("통과", outcome["verdict"])
+        self.assertIn("입증하지 못함", outcome["verdict"])
+        html = _tc_evidence(legacy)
+        self.assertNotIn("스펙 요구사항 검증 통과", html)
+
+    def test_a_verified_pass_is_still_described_as_passed(self):
+        from tc_system.execution.expectation_checker import describe_outcome
+        tc, execution = fixture()
+        tc.update(status="PASS", execution=execution)
+        self.assertEqual(describe_outcome(tc, verify_tc(tc, execution))["verdict"], "스펙 요구사항 검증 통과")
