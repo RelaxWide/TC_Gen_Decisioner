@@ -246,5 +246,24 @@ class TestTargetRotation(unittest.TestCase):
         self.assertFalse([sid for sid in ids if sid.startswith("base:5.4.")], ids)
 
 
+    def test_the_per_command_breakdown_counts_tcs_skips_and_unproven_passes(self):
+        from tc_system.coverage.coverage_state import target_breakdown
+        section = self.testable[0]
+        opcode = self.index.opcodes_for_section(section)[0]
+        legacy_pass = self._tc(section, "PASS")  # no contract: proves nothing
+        skip = {"section_id": section["section_id"], "opcode": opcode["opcode"], "reason": "bad reply"}
+        result = target_breakdown(self.index, [legacy_pass], [skip])
+        self.assertEqual(result["testable_targets"], 232)
+        self.assertEqual(sum(e["count"] for e in result["excluded"]), 26)
+        row = next(r for r in result["commands"] if r["name"] == opcode["name"])
+        self.assertEqual(row["statuses"], {"UNVERIFIED": 1})
+        self.assertEqual(row["skipped"], 1)
+        self.assertEqual(row["tried"], 1)
+        entry = next(s for s in row["sections"] if s["section_id"] == section["section_id"])
+        self.assertEqual((entry["status"], entry["tcs"], entry["skips"], entry["last_skip"]),
+                         ("UNVERIFIED", 1, 1, "bad reply"))
+        self.assertEqual(result["targets_tried"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

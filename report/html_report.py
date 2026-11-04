@@ -13,12 +13,27 @@ def _coverage_section(coverage: dict | None) -> str:
     if coverage is None:
         return '<div class="empty-state">아직 TC가 생성되지 않아 커버리지 데이터가 없습니다.</div>'
     s = coverage["summary"]
-    tiles = (
-        # Reachable first: it is the number that can actually reach 100%.
-        c.stat_tile("명령 실행 이력이 있는 조항", f"{s.get('reachable_pct', 0)}%",
-                     f"{s.get('reachable_covered', 0)}/{s.get('reachable_total', 0)} 조항 (opcode 연결됨)")
-        + c.stat_tile("전체 조항 중 실행 이력", f"{s['section_pct']}%",
-                       f"{s['section_covered']}/{s['section_total']} 조항 — 산문/구조 조항 포함")
+    targets = coverage.get("targets") or {}
+    testable, tried = s.get("testable_targets", 0), s.get("targets_tried", 0)
+    progress = (
+        # The denominator is what the tool can test today; excluded clauses
+        # are listed with their reason below instead of silently diluting it.
+        c.stat_tile("시도한 테스트 대상 조항", f"{tried}/{testable}",
+                    f"{round(100 * tried / testable, 1) if testable else 0.0}% — 지금 도구로 테스트 가능한 조항 기준")
+        + c.stat_tile("검증식을 평가한 요구사항", str(s.get("requirements_evaluated", 0)),
+                      f"생성된 요구사항 {s.get('requirements_total', 0)}개 중 — 전체 스펙 분모 아님")
+        + c.stat_tile("요구사항 PASS", str(s.get("requirements_passed", 0)))
+        + c.stat_tile("요구사항 FAIL / 혼재", f"{s.get('requirements_failed', 0)} / {s.get('requirements_mixed', 0)}")
+        + c.stat_tile("미검증 요구사항", str(s.get("requirements_unverified", 0)))
+    )
+    excluded = targets.get("excluded") or []
+    excluded_html = ""
+    if excluded:
+        excluded_html = ('<p class="note">테스트 대상에서 제외한 조항: '
+                         + "; ".join(f"{c.esc(e['reason'])} {e['count']}개" for e in excluded) + "</p>")
+    history = (
+        c.stat_tile("전체 조항 중 실행 이력", f"{s['section_pct']}%",
+                    f"{s['section_covered']}/{s['section_total']} 조항 — 산문/구조 조항 포함")
         + c.stat_tile("Opcode coverage", f"{s['opcode_pct']}%", f"{s['opcode_covered']}/{s['opcode_total']} opcodes")
         + c.stat_tile("명령 완료", str(s.get("section_passing", 0)), "스펙 준수 검증과 별도")
         + c.stat_tile("명령 실패 관측", str(s.get("section_failing", 0)), "원인 분류와 별도")
@@ -33,18 +48,35 @@ def _coverage_section(coverage: dict | None) -> str:
             "인자가 placeholder였거나, 실행이 우리 쪽 사유(INVALID_FIELD·호스트 크래시·SSH 실패)로 "
             "끝나 Spec에 대해 입증한 바가 없는 항목입니다.</div>"
         )
-    verified = (
-        c.stat_tile("검증식을 평가한 요구사항", str(s.get("requirements_evaluated", 0)),
-                    f"생성된 요구사항 {s.get('requirements_total', 0)}개 중 — 전체 스펙 분모 아님")
-        + c.stat_tile("요구사항 PASS", str(s.get("requirements_passed", 0)))
-        + c.stat_tile("요구사항 FAIL / 혼재", f"{s.get('requirements_failed', 0)} / {s.get('requirements_mixed', 0)}")
-        + c.stat_tile("미검증 요구사항", str(s.get("requirements_unverified", 0)))
-    )
-    explanation = '<p class="note">한 요구사항의 검증은 조항 전체의 검증 완료를 뜻하지 않습니다. '
-    explanation += '기존 기록은 보존되며, 스펙 근거·검증식이 없으면 미검증으로 표시합니다.</p>'
-    return (f'<div class="stat-row">{verified}</div>{explanation}<h3>명령 실행·지원 조사 이력</h3>'
-            f'<div class="stat-row">{tiles}</div>'
+    explanation = ('<p class="note">한 요구사항의 검증은 조항 전체의 검증 완료를 뜻하지 않습니다. '
+                   "기존 기록은 보존되며, 스펙 근거·검증식이 없으면 미검증으로 표시합니다.</p>")
+    return (f'<div class="stat-row">{progress}</div>{excluded_html}{explanation}'
+            f"<h3>커맨드별 현황</h3>{_command_table(targets.get('commands') or [])}"
+            f'<h3>명령 실행·지원 조사 이력</h3><div class="stat-row">{history}</div>'
             f'<div class="card" style="margin-top:16px">{bars}</div>{notes}')
+
+
+_STATUS_COLUMNS = (("PASS", "PASS"), ("FAIL", "FAIL"), ("UNSUPPORTED", "미지원"),
+                   ("UNVERIFIED", "미검증"), ("ERROR", "ERROR"))
+
+
+def _command_table(commands: list[dict]) -> str:
+    """One row per command: how many of its clauses were tried and how they
+    ended; the clause list (latest status, attempts, last skip) folds out."""
+    if not commands:
+        return '<div class="empty-state">테스트 대상 커맨드가 없습니다.</div>'
+    rows = []
+    for cmd in commands:
+        section_rows = [[c.esc(sec["section_id"]), c.esc(sec["title"]), c.esc(sec["status"] or "미시도"),
+                         c.esc(sec["tcs"]), c.esc(sec["skips"]), c.esc(sec["last_skip"] or "")]
+                        for sec in cmd["sections"]]
+        detail = c.table(["조항", "제목", "최근 결과", "TC 수", "건너뜀", "마지막 건너뜀 사유"], section_rows)
+        rows.append([c.details_block(c.esc(cmd["name"]), detail), c.esc(cmd["command_set"]),
+                     c.esc(f"{cmd['tried']}/{cmd['targets']}")]
+                    + [c.esc(cmd["statuses"].get(key, 0)) for key, _ in _STATUS_COLUMNS]
+                    + [c.esc(cmd["skipped"]), c.esc(cmd["verified_requirements"])])
+    return c.table(["커맨드", "커맨드셋", "시도/대상 조항"] + [label for _, label in _STATUS_COLUMNS]
+                   + ["건너뜀", "평가된 요구사항"], rows)
 
 
 def _json(value):
@@ -193,39 +225,55 @@ def _judgment_section(source: str, verdicts: list[dict], fc_by_id: dict) -> str:
     return c.table(["Run / Failure", "Timestamp", "Classification", "Confidence"], rows)
 
 
-def render_report(model: dict) -> str:
+def _page(title: str, subtitle: str, sections: list[tuple[str, str]]) -> str:
+    body = [c.STYLE, f"<h1>{c.esc(title)}</h1>", f'<div class="subtitle">{subtitle}</div>']
+    for heading, content in sections:
+        body.append(f"<h2>{c.esc(heading)}</h2>")
+        body.append(f'<div class="section-gap">{content}</div>')
+    return ("<!DOCTYPE html><html lang='ko'><head><meta charset='utf-8'>"
+            f"<title>{c.esc(title)}</title></head><body>" + "".join(body) + "</body></html>")
+
+
+def render_log_report(model: dict) -> str:
+    """QST/PULSEFZ log judgment only - a separate feature from TC generation."""
     counts = model["counts"]
-    body = [
-        c.STYLE,
-        "<h1>SSD 평가 모니터링 리포트</h1>",
-        f'<div class="subtitle">generated_at: {c.esc(model["generated_at"])} | '
-        f'QST: {counts["qst"]} | PULSEFZ: {counts["pulsefz"]} | TC 실행: {counts["tc_exec"]}</div>',
+    subtitle = (f'generated_at: {c.esc(model["generated_at"])} | QST: {counts.get("qst", 0)} | '
+                f'PULSEFZ: {counts.get("pulsefz", 0)}')
+    sections = [(f"1차 판단 — {SOURCE_LABELS[source]}",
+                 _judgment_section(source, model["verdicts_by_source"].get(source, []),
+                                   model["failure_contexts_by_id"]))
+                for source in ("qst", "pulsefz")]
+    return _page("SSD 로그 1차 판정 리포트", subtitle, sections)
 
-        "<h2>Spec 커버리지</h2>",
-        f'<div class="section-gap">{_coverage_section(model["coverage"])}</div>',
 
-        "<h2>TC 자동생성 현황</h2>",
-        f'<div class="section-gap">{_tc_table(model["tc_records"])}</div>',
+def render_tc_report(model: dict) -> str:
+    """Spec coverage, per-command results and the TC list, with the judgments
+    of failed TCs (same judge engine, but about TC executions)."""
+    subtitle = (f'generated_at: {c.esc(model["generated_at"])} | TC: {len(model["tc_records"])} | '
+                f'판정된 TC 실패: {len(model["verdicts"])}')
+    sections = [
+        ("Spec 커버리지", _coverage_section(model["coverage"])),
+        ("TC 목록", _tc_table(model["tc_records"])),
+        (f"1차 판단 — {SOURCE_LABELS['tc_exec']}",
+         _judgment_section("tc_exec", model["verdicts"], model["failure_contexts_by_id"])),
     ]
-    for source in ("qst", "pulsefz", "tc_exec"):
-        body.append(f"<h2>1차 판단 — {SOURCE_LABELS[source]}</h2>")
-        body.append(
-            f'<div class="section-gap">'
-            f'{_judgment_section(source, model["verdicts_by_source"][source], model["failure_contexts_by_id"])}'
-            f"</div>"
-        )
-    return (
-        "<!DOCTYPE html><html lang='ko'><head><meta charset='utf-8'>"
-        "<title>SSD 평가 모니터링 리포트</title></head><body>" + "".join(body) + "</body></html>"
-    )
+    return _page("TC 자동생성 · 스펙 커버리지 리포트", subtitle, sections)
 
 
-def write_report(model: dict, archive: bool = True) -> Path:
-    html_text = render_report(model)
-    config.REPORT_LATEST_PATH.write_text(html_text, encoding="utf-8")
+def _write(html_text: str, latest: Path, prefix: str, generated_at: str, archive: bool) -> Path:
+    latest.parent.mkdir(parents=True, exist_ok=True)
+    latest.write_text(html_text, encoding="utf-8")
     if archive:
-        ts = model["generated_at"].replace(":", "").replace("-", "").split(".")[0]
-        archive_dir = config.REPORT_OUTPUT_DIR / "archive"
+        ts = generated_at.replace(":", "").replace("-", "").split(".")[0]
+        archive_dir = latest.parent / "archive"
         archive_dir.mkdir(parents=True, exist_ok=True)
-        (archive_dir / f"report_{ts}.html").write_text(html_text, encoding="utf-8")
-    return config.REPORT_LATEST_PATH
+        (archive_dir / f"{prefix}_{ts}.html").write_text(html_text, encoding="utf-8")
+    return latest
+
+
+def write_log_report(model: dict, archive: bool = True) -> Path:
+    return _write(render_log_report(model), config.LOG_REPORT_PATH, "log_judgment", model["generated_at"], archive)
+
+
+def write_tc_report(model: dict, archive: bool = True) -> Path:
+    return _write(render_tc_report(model), config.TC_REPORT_PATH, "tc_coverage", model["generated_at"], archive)

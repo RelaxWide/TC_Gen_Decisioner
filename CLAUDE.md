@@ -14,8 +14,9 @@ python -m unittest tests.test_qst_parser.TestQstParser.test_name -v   # 단일 �
 
 python run_ingest.py --source all   # 로그 -> data/failure_contexts/<source>/
 python run_judge.py  --source all   # FailureContext -> data/verdicts/<source>.json
-python run_report.py                # -> report/output/report_latest.html
+python run_report.py                # -> report/output/{log_judgment,tc_coverage}_latest.html (--kind logs|tc). 각 파이프라인 종료 시 자동 생성됨
 python run_tc_pipeline.py --count 5 # 생성+실행+판정 — 실제 장비(192.168.137.9)에 명령이 나간다
+python run_tc_pipeline.py --all     # 선정 가능한 타겟 전부(~232개, 수 시간). 미시도 타겟이 먼저라 중단 후 다시 돌리면 이어서 진행
 #   --no-destructive          Format/Sanitize/Write/DSM/Firmware 계열 opcode 제외
 #   --allow-placeholder-args  placeholder 인자 TC도 실행(커버리지에선 제외)
 #   --reset-coverage          드라이브 교체 시 tc_store/coverage_state 백업 후 초기화
@@ -140,6 +141,7 @@ data/ (산출물, gitignore, 전부 재생성 가능) -> report/aggregator.py ->
 - `judge_failure_context(fc)`는 `spec_grounding`을 in place로 채운다. 호출 전 원시 FailureContext, 호출 후 grounding이 채워진 FailureContext를 저장한다.
 - `run_judge.judge_source`는 FailureContext가 사라진 고아 verdict를 삭제한다. 리포트에 근거 없는 분류 행이 남는 것을 막기 위한 것.
 - `tc_system/pipeline.py`가 TC가 판정됐을 때 `tc["verdict_id"]`뿐 아니라 `tc["failure_context_id"]`도 저장한다(`Verdict`는 애초에 `failure_context_id` 필드를 갖고 있지만, 터미널에서 바로 보이게 TC에도 복제). `run_tc_pipeline.py`의 판정 완료 출력은 `status`가 FAIL이든 ERROR든(둘 다 judge 대상이면) 항상 뜨게 되어 있다 — 예전엔 `elif status == "FAIL":` 블록 안에만 있어서 ERROR로 판정된 건은 verdict_id조차 안 보였다. 이 출력을 다시 FAIL 전용으로 좁히지 말 것.
+- **리포트는 기능별로 두 개다.** 로그 판정(QST/PULSEFZ, `render_log_report`)과 TC 자동생성(`render_tc_report` — 커버리지, 커맨드별 표, TC 목록, TC_EXEC 판정)은 목적과 보는 시점이 달라 한 파일에 섞지 않는다. TC 리포트의 진행률 분모는 `coverage_state.target_breakdown`의 **테스트 가능한 타겟**(232)이고 제외 조항은 사유별로 따로 센다(Event Type 22, Abort/AER 4) — opcode 연결 조항 258을 분모로 쓰면 절대 시도하지 않을 조항이 진행률을 깎는다. 커맨드별 결과는 `effective_status`로 세서 계약 없는 예전 PASS는 미검증으로 보인다. `run_tc_pipeline.py`(정상 종료와 Ctrl+C 중단 모두)와 `run_judge.py`가 끝나면 자동 생성하며, 리포트 생성 실패가 실행 결과를 실패로 만들지 않는다.
 - HTML 리포트는 Jinja2 없이 stdlib 문자열 조립이다(`report/components.py`). 값 삽입은 반드시 `components.esc()`를 통과시킬 것 — 로그 원문이 그대로 들어간다.
 - **테스트는 실제 장비와 실제 SSH 로그에 닿을 수 없다.** `ssh_runner._plink`과, 기본 경로의 `logs/ssh_commands.jsonl`에 쓰는 `_append_ssh_log`은 `unittest`가 로드돼 있으면 `RuntimeError`로 실패한다(`_refuse_under_tests`; 운영 진입점은 unittest를 import하지 않는다. 수동 실험은 `TC_ALLOW_REAL_SSH=1`). 실측: `execute_tc_steps`만 mock하고 `capture_dmesg`는 빠뜨린 테스트가 plink를 띄우고 실제 로그에 기록을 남겼다. SSH 경로를 테스트하려면 `_plink`을 mock하고 `config.SSH_COMMAND_LOG_PATH`를 임시 경로로 바꿀 것(`tests/test_ssh_runner.py` 방식).
 - 실제 로그 기반 회귀 사례와 분기별 합성 응답을 사용한다. 실제 스펙의 비트 위치/길이와 독립적인 테스트 벡터를 유지한다. 장비·SSH·LLM을 테스트에서 호출하지 않는다.

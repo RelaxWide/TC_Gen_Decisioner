@@ -68,7 +68,91 @@ def requirement_coverage(tc_records):
                                                           if r["status"] != "UNVERIFIED"})}
 
 
-def compute_coverage(index, tc_records: list[dict]) -> dict:
+EXCLUDED_REASONS = {
+    "unverifiable_value": "반환 데이터에서 가변 길이 레코드를 찾아야 검증됨(Event Type) — 고정 오프셋 검증식으로 불가",
+    "unexecutable_command": "동시 실행/비동기 이벤트가 필요한 커맨드뿐(Abort/AER) — 순차 실행기로 불가",
+}
+
+
+def effective_status(tc: dict) -> str | None:
+    """A stored PASS is a spec PASS only if the recomputed verification agrees
+    (records from before the contract existed say PASS but prove nothing)."""
+    status = tc.get("status")
+    if status == "PASS":
+        return verify_tc(tc, tc.get("execution") or {})["status"]
+    return status
+
+
+def target_breakdown(index, tc_records: list[dict], skip_records: list[dict] | None = None) -> dict:
+    """Per-command view over the targets pick_next_targets can actually offer.
+
+    The denominator is what this tool can test today, with every excluded
+    clause counted under its reason - not the 258 opcode-linked clauses, 26 of
+    which can never be offered.
+    """
+    name_by_opcode = {o["opcode"]: o["name"] for o in index.list_opcodes()}
+    excluded, targets = Counter(), {}
+    for section in index.list_sections():
+        opcodes = index.opcodes_for_section(section)
+        if not opcodes:
+            continue
+        if _needs_unverifiable_value(section):
+            excluded["unverifiable_value"] += 1
+            continue
+        offered = [o for o in opcodes if o.get("name") not in UNEXECUTABLE_COMMANDS]
+        if not offered:
+            excluded["unexecutable_command"] += 1
+            continue
+        targets[section["section_id"]] = (section, offered)
+
+    rows = {}
+    for section, offered in targets.values():
+        for op in offered:
+            row = rows.setdefault(op["name"], {"name": op["name"], "command_set": op["command_set"],
+                                               "targets": 0, "tried": 0, "statuses": Counter(), "skipped": 0,
+                                               "verified_requirements": set(), "sections": {}})
+            row["targets"] += 1
+            row["sections"][section["section_id"]] = {"section_id": section["section_id"],
+                                                      "title": section.get("title", ""), "status": None,
+                                                      "tcs": 0, "skips": 0, "last_skip": None}
+    for tc in tc_records:
+        pair = _action_pair(tc)
+        name = name_by_opcode.get(pair[1]) if pair else None
+        entry = rows.get(name, {}).get("sections", {}).get(pair[0]) if pair else None
+        if entry is None:
+            continue
+        status = effective_status(tc)
+        rows[name]["statuses"][status] += 1
+        entry["tcs"] += 1
+        entry["status"] = status  # tc_store is append-ordered: the last one wins
+        verification = tc.get("verification") or verify_tc(tc, tc.get("execution") or {})
+        rows[name]["verified_requirements"].update(
+            r["requirement_id"] for r in verification.get("requirements", []) if r.get("status") in ("PASS", "FAIL"))
+    for skip in skip_records or []:
+        name = name_by_opcode.get(skip.get("opcode"))
+        entry = rows.get(name, {}).get("sections", {}).get(skip.get("section_id"))
+        if entry is None:
+            continue
+        rows[name]["skipped"] += 1
+        entry["skips"] += 1
+        entry["last_skip"] = skip.get("reason")
+
+    tried_sections = set()
+    out = []
+    for row in rows.values():
+        sections = list(row["sections"].values())
+        tried = [s for s in sections if s["tcs"] or s["skips"]]
+        tried_sections.update(s["section_id"] for s in tried)
+        out.append(dict(row, tried=len(tried), statuses=dict(row["statuses"]),
+                        verified_requirements=len(row["verified_requirements"]),
+                        sections=sorted(sections, key=lambda s: s["section_id"])))
+    out.sort(key=lambda r: (-r["targets"], r["name"]))
+    return {"testable_targets": len(targets), "targets_tried": len(tried_sections),
+            "excluded": [{"reason": EXCLUDED_REASONS[k], "count": v} for k, v in excluded.items()],
+            "commands": out}
+
+
+def compute_coverage(index, tc_records: list[dict], skip_records: list[dict] | None = None) -> dict:
     section_covering: dict[str, list[tuple[str, str]]] = {}
     opcode_covering: dict[str, list[tuple[str, str]]] = {}
     excluded_tc_ids = []
@@ -141,15 +225,19 @@ def compute_coverage(index, tc_records: list[dict]) -> dict:
             doc["covered"] += 1
 
     requirements, verified_summary = requirement_coverage(tc_records)
+    targets = target_breakdown(index, tc_records, skip_records)
     return {
         "schema_version": 2,
         "requirement_coverage": requirements,
+        "targets": targets,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "section_coverage": section_coverage,
         "opcode_coverage": opcode_coverage,
         "excluded_tc_ids": excluded_tc_ids,
         "summary": {
             **verified_summary,
+            "testable_targets": targets["testable_targets"],
+            "targets_tried": targets["targets_tried"],
             "section_total": len(sections),
             "section_covered": section_covered_count,
             "section_pct": round(100 * section_covered_count / len(sections), 1) if sections else 0.0,

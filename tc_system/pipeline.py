@@ -1,4 +1,5 @@
 import shutil
+import sys
 from copy import deepcopy
 from datetime import datetime, timezone
 
@@ -203,7 +204,7 @@ def _record_skip(skipped: list, section: dict, opcode_entry: dict, reason: str, 
 _LLM_REPLY_ERRORS = (LLMCallError, ValueError, KeyError, TypeError)
 
 
-def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = False,
+def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: bool = False,
                   allow_destructive: bool = False, on_start=None, on_progress=None, on_skip=None,
                   reset_coverage: bool = False) -> dict:
     """`on_start(index, total, tc)`, if given, fires right after a TC is built —
@@ -235,10 +236,11 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
     meant to persist across runs *of the same physical drive*, so it must
     stay a deliberate, explicit action (CLI: `--reset-coverage`).
     """
-    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
-        # pick_next_targets stops when it has `count` targets; 0 or a negative
-        # never matches, which selected every target, destructive ones too.
-        raise ValueError(f"count must be a positive integer, got {count!r}")
+    # None = every target pick_next_targets can offer (CLI --all). Anything
+    # else must be a positive int: 0 or a negative once fell through to "all",
+    # destructive commands included, without anyone asking for it.
+    if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count < 1):
+        raise ValueError(f"count must be a positive integer or None (all), got {count!r}")
     if reset_coverage:
         _reset_coverage()
     # Keep per-attempt evidence and judgments across runs. IDs already identify
@@ -266,7 +268,7 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
     available_opcodes = index.list_opcodes()
 
     existing = tc_store.load_all()
-    targets = pick_next_targets(index, existing, count,
+    targets = pick_next_targets(index, existing, sys.maxsize if count is None else count,
                                 skip_records=load_json(config.TARGET_SKIPS_PATH, default=[]))
     total = len(targets)
 
@@ -573,7 +575,7 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
         # Recomputed per TC, not just after the loop: a crash or device hang
         # mid-run would otherwise leave coverage_state.json describing a store
         # that has already moved on.
-        coverage = compute_coverage(index, tc_store.load_all())
+        coverage = compute_coverage(index, tc_store.load_all(), load_json(config.TARGET_SKIPS_PATH, default=[]))
         save_json_atomic(config.COVERAGE_STATE_PATH, coverage)
 
         if on_progress:
@@ -607,7 +609,7 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
                         on_skip(j, total, remaining_section, remaining_opcode, skip_reason)
                 break
 
-    coverage = compute_coverage(index, tc_store.load_all())
+    coverage = compute_coverage(index, tc_store.load_all(), load_json(config.TARGET_SKIPS_PATH, default=[]))
     save_json_atomic(config.COVERAGE_STATE_PATH, coverage)
 
     return {"generated": len(generated), "executed": len(executed), "failed": len(failed),

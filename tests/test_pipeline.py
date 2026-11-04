@@ -1034,5 +1034,22 @@ class TestATargetThatWillNotBeSentIsNotAnnounced(PipelineTestCase):
         self.assertIn("-> 보내지 않고 건너뜀: (사유 미기록)", text)
 
 
+
+class TestRunEveryTarget(PipelineTestCase):
+    def test_count_none_runs_every_offerable_target(self):
+        executor = _FakeExecutor([[_ok(0), _ok(1)], [_ok(0), _ok(1)]])
+        result = pipeline.run_pipeline(count=None, executor=executor, allow_destructive=True)
+        self.assertEqual(result["executed"], 2)  # the fixture index has two targets
+
+    def test_the_cli_takes_all_or_count_but_not_both(self):
+        import run_tc_pipeline
+        parser = run_tc_pipeline.build_parser()
+        self.assertTrue(parser.parse_args(["--all"]).all)
+        self.assertEqual(parser.parse_args(["--count", "3"]).count, 3)
+        self.assertIsNone(parser.parse_args([]).count)
+        with self.assertRaises(SystemExit), mock.patch("sys.stderr"):
+            parser.parse_args(["--all", "--count", "3"])
+
+
 if __name__ == "__main__":
     unittest.main()

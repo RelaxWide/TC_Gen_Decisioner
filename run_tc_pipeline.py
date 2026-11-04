@@ -214,10 +214,14 @@ def _print_skip(index, total, section, opcode_entry, reason):
     _dual_label("  ", "사유", reason, width=110)
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--count", type=_positive_int, default=5,
-                        help="how many new TCs to generate+execute this run (1 or more)")
+    how_many = parser.add_mutually_exclusive_group()
+    how_many.add_argument("--count", type=_positive_int, default=None,
+                          help="how many new TCs to generate+execute this run (1 or more, default 5)")
+    how_many.add_argument("--all", action="store_true",
+                          help="every target that can be offered, once each (~232; hours). Untried "
+                               "targets come first, so an interrupted run resumes where it stopped")
     parser.add_argument("--allow-placeholder-args", action="store_true",
                          help="execute a TC even though its command arguments fell back to placeholders "
                               "(plumbing experiments only; resulting TCs are excluded from the coverage "
@@ -241,7 +245,11 @@ def main():
                          help="wipe accumulated coverage (tc_store.json/coverage_state.json, backed up to "
                               "data/coverage_backups/ first) before this run — use when the physical drive "
                               "under test has changed")
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
 
     with capture_to_file("tc_pipeline") as log_path:
         print(f"[전체 로그] {log_path}")
@@ -263,7 +271,7 @@ def _run(args) -> int:
               "(이전 내용은 data/coverage_backups/에 백업됨)")
 
     try:
-        result = run_pipeline(count=args.count,
+        result = run_pipeline(count=None if args.all else (args.count or 5),
                                allow_placeholder_args=args.allow_placeholder_args,
                                allow_destructive=not args.no_destructive,
                                on_start=on_start, on_progress=on_progress, on_skip=on_skip,
@@ -276,6 +284,12 @@ def _run(args) -> int:
         # via --no-destructive) rather than deleted outright.
         print(f"blocked: {exc}", file=sys.stderr)
         return 3
+    except KeyboardInterrupt:
+        # Every finished TC is already stored; a long --all run stopped by hand
+        # still gets a report of what it did.
+        print("\n중단됨 — 지금까지 저장된 결과로 리포트를 만듭니다. 다시 실행하면 안 해 본 타겟부터 이어집니다.")
+        _write_tc_report()
+        return 130
 
     print(f"\ngenerated={result['generated']} executed={result['executed']} "
           f"failed={result['failed']} our_bugs={result.get('our_bugs', 0)} unsupported={result.get('unsupported', 0)} "
@@ -284,12 +298,24 @@ def _run(args) -> int:
     print(f"요구사항 검증: {cov.get('requirements_evaluated', 0)}/{cov.get('requirements_total', 0)} 생성 요구사항"
           f" (PASS={cov.get('requirements_passed', 0)}, FAIL={cov.get('requirements_failed', 0)}, "
           f"미검증={cov.get('requirements_unverified', 0)}) — 전체 스펙 검증률 아님")
-    print(f"명령 실행 이력: 연결된 조항 {cov.get('reachable_pct', 0)}% ({cov.get('reachable_covered', 0)}/{cov.get('reachable_total', 0)})"
+    print(f"테스트 대상 조항: {cov.get('targets_tried', 0)}/{cov.get('testable_targets', 0)} 시도"
           f" / 전체스펙 {cov['section_pct']}% ({cov['section_covered']}/{cov['section_total']}), "
           f"opcode {cov['opcode_pct']}% ({cov['opcode_covered']}/{cov['opcode_total']})")
     print(f"  명령 완료 이력 {cov.get('section_passing', 0)} / 명령 실패 이력 {cov.get('section_failing', 0)}"
           f" / 미지원 {cov.get('section_unsupported', 0)} / 집계제외 {cov.get('excluded_tc_count', 0)}")
+    _write_tc_report()
     return 0
+
+
+def _write_tc_report():
+    """Regenerated after every run. A report failure never fails the run:
+    the results are already stored and `run_report.py --kind tc` rebuilds it."""
+    try:
+        from report.aggregator import build_tc_model
+        from report.html_report import write_tc_report
+        print(f"TC 리포트: {write_tc_report(build_tc_model())}")
+    except Exception as exc:  # noqa: BLE001 - reporting must not mask the run's result
+        print(f"⚠ TC 리포트 생성 실패(결과는 저장됨, python run_report.py --kind tc 로 다시 생성): {exc}")
 
 
 if __name__ == "__main__":

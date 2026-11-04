@@ -38,7 +38,10 @@ LLM_CALL_LOG_PATH = LOGS_DIR / "llm_calls.jsonl"
 SSH_COMMAND_LOG_PATH = LOGS_DIR / "ssh_commands.jsonl"
 
 REPORT_OUTPUT_DIR = BASE_DIR / "report" / "output"
-REPORT_LATEST_PATH = REPORT_OUTPUT_DIR / "report_latest.html"
+# Two separate features, two reports: log judgment (QST/PULSEFZ) and TC
+# generation (coverage + TCs + judgments of failed TCs).
+LOG_REPORT_PATH = REPORT_OUTPUT_DIR / "log_judgment_latest.html"
+TC_REPORT_PATH = REPORT_OUTPUT_DIR / "tc_coverage_latest.html"
 
 SECRETS_PATH = BASE_DIR / "secrets.local.json"
 

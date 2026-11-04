@@ -74,10 +74,25 @@ def main():
             print(f"  {fc_id} -> SKIPPED (will retry next run): {err}", file=sys.stderr)
         total_failures += len(failures)
 
+    _write_reports(sources)
     if total_failures:
         print(f"\n{total_failures} context(s) left unjudged due to LLM errors.", file=sys.stderr)
         return 1
     return 0
+
+
+def _write_reports(sources):
+    """The log judgment report after QST/PULSEFZ judging, the TC report after
+    re-judging TC failures. Never fails the run."""
+    try:
+        from report.aggregator import build_log_model, build_tc_model
+        from report.html_report import write_log_report, write_tc_report
+        if set(sources) & {"qst", "pulsefz"}:
+            print(f"로그 판정 리포트: {write_log_report(build_log_model())}")
+        if "tc_exec" in sources:
+            print(f"TC 리포트: {write_tc_report(build_tc_model())}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"report generation failed (run_report.py rebuilds it): {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

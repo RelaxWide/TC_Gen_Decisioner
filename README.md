@@ -9,7 +9,7 @@
 1. **로그 기반 1차 불량 판단** — QST(테스트 플랫폼), PULSEFZ(퍼저), TC 자동 실행 결과, 이 세 소스의 실패 로그를 보고 "실제 펌웨어 결함 / 테스트 환경 이슈 / 엔지니어 추가 확인 필요"를 1차로 분류하고 근거를 제시한다.
 2. **Spec 기반 TC 자동생성 + 실행 + 판정** — NVMe Spec 커버리지 인덱스를 기반으로 시나리오를 만들고, 실제 SSD(192.168.137.9)에 명령을 보내 실행하고, Expectation/Fail Criteria로 판정하고, Spec 대비 커버리지 %를 추적한다. (현재는 안전장치로 실행이 막혀있음 — 4번 참고)
 
-두 파이프라인의 판정 결과는 하나의 정적 HTML 리포트(`report/output/report_latest.html`)로 합쳐진다.
+두 기능은 리포트도 따로 만든다: 로그 판정은 `report/output/log_judgment_latest.html`(`run_judge.py`가 끝나면 자동 생성), TC 자동생성은 `report/output/tc_coverage_latest.html`(`run_tc_pipeline.py`가 끝나거나 Ctrl+C로 중단돼도 자동 생성). 이전 버전은 `report/output/archive/`에 쌓인다.
 
 ## 2. 폴더 구조
 
@@ -64,7 +64,7 @@ run_ingest.py / run_judge.py / run_tc_pipeline.py / run_report.py   CLI 진입�
 ```
 python run_ingest.py --source all      # QST/PULSEFZ 로그 -> FailureContext
 python run_judge.py  --source all      # FailureContext -> Verdict (실제 RAG 근거 + 실제 LLM 판정)
-python run_report.py                   # report/output/report_latest.html 생성
+python run_report.py                   # 두 리포트 다시 생성 (--kind logs | tc 로 하나만)
 ```
 이미 처리된 로그/판정은 재실행 시 건너뜀(매니페스트·verdict id 기반). `--force`로 강제 재처리.
 
@@ -74,6 +74,7 @@ python run_report.py                   # report/output/report_latest.html 생성
 ```
 python build_spec_index.py             # 최초 1회(또는 RAG 인덱스 갱신 시): 커버리지 인덱스 생성
 python run_tc_pipeline.py --count 12   # 미커버 조항 선정 -> 인자 생성 -> 실제 실행 -> 판정 -> 커버리지 갱신
+python run_tc_pipeline.py --all --no-destructive   # 선정 가능한 타겟 전부(~232개, 수 시간). 중단해도 다시 돌리면 안 해 본 타겟부터 이어서
 ```
 **파괴적 커맨드가 기본 포함됩니다** (대상 드라이브 데이터는 소모품 전제). 내용이 중요한 드라이브에 돌릴 때만 `--no-destructive`. 배치 안에서는 비파괴적 커맨드가 먼저 실행되도록 정렬되어, Sanitize/Format 같은 장시간·전면삭제 커맨드가 앞서 나오지 않습니다.
 
@@ -90,7 +91,8 @@ python run_tc_pipeline.py --count 12 --reset-coverage
 `tc_store.json`/`coverage_state.json`을 지우기 **전에** `data/coverage_backups/<UTC타임스탬프>/`로 복사해두므로, 잘못 눌러도 이전 커버리지 기록이 영구히 사라지지 않습니다. 같은 드라이브를 계속 쓰는 일반적인 반복 실행에서는 이 플래그를 주면 안 됩니다 — 그동안 쌓은 커버리지가 매번 날아갑니다.
 
 ### 4-3. 결과 확인
-`report/output/report_latest.html`을 브라우저로 열면 커버리지 대시보드 + TC 현황 + 3소스 판정 결과를 한 화면에서 볼 수 있다.
+- `report/output/tc_coverage_latest.html`: 시도한 테스트 대상 조항 수(지금 도구로 테스트 가능한 232개 기준)와 제외 사유별 조항 수, 요구사항 검증 결과, **커맨드별 표**(시도/대상 조항, PASS/FAIL/미지원/미검증/ERROR, 건너뜀, 평가된 요구사항 — 펼치면 조항별 최근 결과와 마지막 건너뜀 사유), TC 목록(판단·원인·다음, 재시도 이력, 근거와 실제 응답), TC 실패 판정 결과.
+- `report/output/log_judgment_latest.html`: QST/PULSEFZ 실패의 1차 판정 결과와 근거 로그.
 
 ## 5. 동작 방식 (데이터 흐름)
 
