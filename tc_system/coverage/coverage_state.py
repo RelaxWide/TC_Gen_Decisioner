@@ -37,22 +37,33 @@ def _covering_entries(tc: dict) -> list[tuple[str, str, str]]:
     return list(zip(section_ids, opcodes, statuses))
 
 
+def requirement_observations(tc: dict) -> list[tuple[dict, str]]:
+    """(requirement, status) for one TC under the single rule every count
+    uses. A requirement PASS on a chain whose commands FAILed, ERRORed or were
+    unsupported is not evidence (review: the per-command table counted a
+    dummy-firmware-activation TC the totals had excluded)."""
+    if tc.get("uses_placeholder_args", True):
+        return []
+    execution = tc.get("execution") or {}
+    verification = verify_tc(tc, execution)
+    command_status = check_execution(tc, execution) if tc.get("steps") else "ERROR"
+    observations = []
+    for req in verification["requirements"]:
+        status = req["status"]
+        if command_status in {"ERROR", "UNSUPPORTED"} or (command_status == "FAIL" and status == "PASS"):
+            status = "UNVERIFIED"
+        observations.append((req, status))
+    return observations
+
+
 def requirement_coverage(tc_records):
     rows = {}
     for tc in tc_records:
-        if tc.get("uses_placeholder_args", True):
-            continue
-        execution = tc.get("execution") or {}
-        verification = verify_tc(tc, execution)
-        command_status = check_execution(tc, execution) if tc.get("steps") else "ERROR"
-        for req in verification["requirements"]:
+        for req, status in requirement_observations(tc):
             rid = req["requirement_id"]
             row = rows.setdefault(rid, {"requirement_id": rid, "section_id": req["section_id"],
                                         "description": req["description"], "quote": req["quote"],
                                         "evidence_id": req["evidence_id"], "observations": []})
-            status = req["status"]
-            if command_status in {"ERROR", "UNSUPPORTED"} or (command_status == "FAIL" and status == "PASS"):
-                status = "UNVERIFIED"
             row["observations"].append({"tc_id": tc["tc_id"], "status": status})
     for row in rows.values():
         statuses = {o["status"] for o in row["observations"]} - {"UNVERIFIED"}
@@ -125,9 +136,8 @@ def target_breakdown(index, tc_records: list[dict], skip_records: list[dict] | N
         rows[name]["statuses"][status] += 1
         entry["tcs"] += 1
         entry["status"] = status  # tc_store is append-ordered: the last one wins
-        verification = tc.get("verification") or verify_tc(tc, tc.get("execution") or {})
         rows[name]["verified_requirements"].update(
-            r["requirement_id"] for r in verification.get("requirements", []) if r.get("status") in ("PASS", "FAIL"))
+            req["requirement_id"] for req, st in requirement_observations(tc) if st in ("PASS", "FAIL"))
     for skip in skip_records or []:
         name = name_by_opcode.get(skip.get("opcode"))
         entry = rows.get(name, {}).get("sections", {}).get(skip.get("section_id"))

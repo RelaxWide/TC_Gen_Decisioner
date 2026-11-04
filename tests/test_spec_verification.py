@@ -723,18 +723,31 @@ class TestPreconditionsThatCannotBeMeasuredAreNotes(unittest.TestCase):
         self.assertEqual(plan["precondition_checks"][0]["checks"], [early])
         self.assertEqual(plan["out_of_scope"], [])
 
-    def test_the_repaired_contract_is_consistent_for_verification(self):
+    def _tc_from(self, plan):
+        return {"steps": [dict(self.ACTION, name="Fabric Zoning Receive", opcode="0x56", direction="none", data_len=0)],
+                "scenario": {"preconditions": plan["preconditions"]},
+                "verification_contract": {"version": 2, "precondition_checks": plan["precondition_checks"],
+                                          "unmeasured_preconditions": plan["unmeasured_preconditions"],
+                                          "evidence": [{"evidence_id": "source", "text": QUOTE}],
+                                          "requirements": plan["requirements"]}}
+
+    EXECUTION = {"step_results": [{"step_index": 0, "exit_code": 0, "started": True,
+                                   "stdout": "Admin Command Fabric Zoning Receive is Success and result: 0x0"}]}
+
+    def test_an_unmeasured_precondition_still_gates_the_verdict(self):
+        # Review: a "Discovery controller" scenario that never checked the
+        # controller type ended as PASS and counted as a requirement PASS.
         plan = self._validate(self._plan([self.ACTION], ["Discovery controller"], []))
-        tc = {"steps": [dict(self.ACTION, name="Fabric Zoning Receive", opcode="0x56", direction="none", data_len=0)],
-              "scenario": {"preconditions": plan["preconditions"]},
-              "verification_contract": {"version": 2, "precondition_checks": plan["precondition_checks"],
-                                        "evidence": [{"evidence_id": "source", "text": QUOTE}],
-                                        "requirements": plan["requirements"]}}
-        execution = {"step_results": [{"step_index": 0, "exit_code": 0, "started": True,
-                                       "stdout": "Admin Command Fabric Zoning Receive is Success and result: 0x0"}]}
-        result = verify_tc(tc, execution)
-        self.assertNotIn("일부 사전조건에 실행 가능한 검증식이 없음", result["issues"])
-        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(plan["unmeasured_preconditions"], ["Discovery controller"])
+        result = verify_tc(self._tc_from(plan), self.EXECUTION)
+        self.assertEqual(result["status"], "UNVERIFIED")
+        self.assertEqual({r["status"] for r in result["requirements"]}, {"UNVERIFIED"})
+        self.assertTrue(any("사전조건 미측정" in i and "Discovery controller" in i for i in result["issues"]))
+
+    def test_with_every_precondition_measured_the_verdict_is_given(self):
+        plan = self._validate(self._plan([self.ACTION], [], []))
+        self.assertEqual(plan["unmeasured_preconditions"], [])
+        self.assertEqual(verify_tc(self._tc_from(plan), self.EXECUTION)["status"], "PASS")
 
 
 

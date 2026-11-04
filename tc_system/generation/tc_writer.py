@@ -248,6 +248,7 @@ def build_tc(tc_id: str, resolved_steps: list[dict], scenario: dict,
         "requirements": scenario.get("requirements", []),
         "precondition_checks": scenario.get("precondition_checks", []),
         "out_of_scope": scenario.get("out_of_scope", []),
+        "unmeasured_preconditions": scenario.get("unmeasured_preconditions", []),
         "evidence": scenario.get("spec_evidence", []),
     }
     if scenario.get("requirements"):

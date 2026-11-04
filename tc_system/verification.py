@@ -452,11 +452,15 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
     unmeasured += [p for p in preconditions if isinstance(p, str) and p not in measured and p not in unmeasured]
     structured["precondition_checks"] = kept
     structured["preconditions"] = [c["description"] for c in kept]
+    # Executed, but never a verdict: verify_tc keeps every requirement
+    # UNVERIFIED while this list is non-empty (review: a "Discovery controller"
+    # scenario that never checked the controller type ended as PASS).
+    structured["unmeasured_preconditions"] = unmeasured
     if unmeasured:
         notes = structured.get("out_of_scope")
         if not isinstance(notes, list):
             notes = list(structured.get("unverified_conditions") or [])
-        notes += [f"사전조건 미측정(action 전에 관측하는 스텝 없음 — 결과가 이 조건을 입증하지 않음): {d}"
+        notes += [f"사전조건 미측정(action 전에 관측하는 스텝 없음 — 이 TC의 요구사항은 PASS/FAIL로 판정하지 않음): {d}"
                   for d in unmeasured]
         structured["out_of_scope"] = notes
 
@@ -596,6 +600,12 @@ def verify_tc(tc, execution):
     checked = [p.get("description") for p in contract.get("precondition_checks", [])]
     if sorted(declared) != sorted(checked):
         issues.append("일부 사전조건에 실행 가능한 검증식이 없음")
+    unmeasured = contract.get("unmeasured_preconditions") or []
+    if unmeasured:
+        # A requirement that depends on a condition nobody measured proves
+        # nothing either way: not PASS, and a violation may be the unmet
+        # condition rather than the drive.
+        issues.append("사전조건 미측정이라 요구사항을 판정하지 않음: " + "; ".join(unmeasured))
     for step in steps:
         try:
             validate_fixed_fields(step, step.get("field_constraints", []))

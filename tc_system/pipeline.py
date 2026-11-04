@@ -534,6 +534,11 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
             "error_cause": error_cause(tc, execution) if tc["status"] == "ERROR" else None,
         }
         executed.append(tc)
+        # Stored before any judging: the device result exists now. An
+        # interrupted or failing judge used to drop it (review: Ctrl+C during
+        # judging left one execution and zero stored TCs).
+        tc["updated_at"] = datetime.now(timezone.utc).isoformat()
+        tc_store.upsert(tc)
 
         if tc["status"] == "UNSUPPORTED":
             # A valid answer about the drive, not a failure — no judging needed.
@@ -548,6 +553,7 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
             fc_path = config.FAILURE_CONTEXTS_DIR / "tc_exec" / f"{fc['failure_context_id']}.json"
             save_json_atomic(fc_path, fc)
             tc["failure_context_id"] = fc["failure_context_id"]
+            tc_store.upsert(tc)  # the stored TC points at its saved FailureContext before judging
             try:
                 verdict = judge_failure_context(fc)
             except _LLM_REPLY_ERRORS:

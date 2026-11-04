@@ -1051,5 +1051,20 @@ class TestRunEveryTarget(PipelineTestCase):
             parser.parse_args(["--all", "--count", "3"])
 
 
+
+class TestAnExecutedTcIsStoredBeforeJudging(PipelineTestCase):
+    def test_an_interrupted_judge_keeps_the_executed_tc(self):
+        # Review: Ctrl+C during judging left one execution, zero stored TCs.
+        executor = _FakeExecutor([[_ok(0), _plain_fail(1)]])
+        with mock.patch.object(pipeline, "judge_failure_context", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                pipeline.run_pipeline(count=1, executor=executor, allow_destructive=True)
+        stored = tc_store.load_all()
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["status"], "FAIL")
+        fc_path = config.FAILURE_CONTEXTS_DIR / "tc_exec" / f"{stored[0]['failure_context_id']}.json"
+        self.assertTrue(fc_path.exists())  # re-judgeable with run_judge --source tc_exec
+
+
 if __name__ == "__main__":
     unittest.main()

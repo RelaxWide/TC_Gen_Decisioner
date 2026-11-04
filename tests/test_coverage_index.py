@@ -265,5 +265,34 @@ class TestTargetRotation(unittest.TestCase):
         self.assertEqual(result["targets_tried"], 1)
 
 
+    def test_per_command_and_total_requirement_counts_use_one_rule(self):
+        # Review: a dummy-firmware-activation TC (command FAIL, requirement
+        # check satisfied) was 0 in the totals but 1 in the command table.
+        from tc_system.coverage.coverage_state import requirement_coverage, target_breakdown
+        ops = {o["name"]: o for o in self.index.list_opcodes()}
+        commit, download = ops["Firmware Commit"], ops["Firmware Image Download"]
+        quote = "The controller shall verify the firmware image before activating it."
+        ok = "Admin Command X is Success and result: 0x0"
+        steps = [{"name": "Firmware Image Download", "phase": "setup", "opcode": "0x11", "mode": "admin-passthru",
+                  "direction": "write", "data_len": 4, "cdw10": "0x0", "expected_status": "SUCCESS"},
+                 {"name": "Firmware Commit", "phase": "action", "opcode": "0x10", "mode": "admin-passthru",
+                  "direction": "none", "data_len": 0, "cdw10": "0x8", "expected_status": "SUCCESS"}]  # CA=1
+        tc = {"tc_id": "fw", "status": "FAIL", "uses_placeholder_args": False, "steps": steps,
+              "step_section_ids": [download["section_ref"], commit["section_ref"]],
+              "step_opcodes": [download["opcode"], commit["opcode"]], "scenario": {"preconditions": []},
+              "verification_contract": {"version": 2, "precondition_checks": [],
+                                        "evidence": [{"evidence_id": "e", "text": quote}],
+                                        "requirements": [{"requirement_id": "r1", "section_id": commit["section_ref"],
+                                                          "evidence_id": "e", "quote": quote, "description": "d",
+                                                          "checks": [{"kind": "completion", "step": 1}]}]},
+              "execution": {"step_results": [{"step_index": i, "exit_code": 0, "started": True, "stdout": ok}
+                                             for i in (0, 1)]}}
+        _, summary = requirement_coverage([tc])
+        row = next(r for r in target_breakdown(self.index, [tc])["commands"] if r["name"] == "Firmware Commit")
+        self.assertEqual(summary["requirements_evaluated"], 0)
+        self.assertEqual(row["verified_requirements"], summary["requirements_evaluated"])
+        self.assertEqual(row["statuses"], {"FAIL": 1})
+
+
 if __name__ == "__main__":
     unittest.main()

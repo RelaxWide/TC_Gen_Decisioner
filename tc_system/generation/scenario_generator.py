@@ -74,8 +74,8 @@ SCENARIO_SYSTEM_PROMPT = (
     "Measure one with a setup step before the action and a check on that step, e.g. Identify CNS 01h "
     "(Identify Controller, 4096 bytes) with data_field on: CNTRLTYPE byte 111 (1h I/O, 2h Discovery, "
     "3h Administrative controller), OAES bytes 95:92, CTRATT 99:96, OACS 257:256, FRMW 260, LPA 261, "
-    "SANICAP 331:328, NN 519:516, ONCS 521:520. A precondition that no earlier step can observe is not "
-    "a precondition: leave it out and mention it in out_of_scope. "
+    "SANICAP 331:328, NN 519:516, ONCS 521:520. A precondition no earlier step observes is recorded as "
+    "unmeasured, and then no requirement of this TC can PASS or FAIL - measure it to get a verdict. "
     "DEVICE LIMITS: sequential nvme-cli passthru only; no concurrent outstanding command/CID control, "
     "event injection, resets, timing measurements or dynamic runtime parameters. Abort/AER tests are "
     "not executable here. Write payloads are zero bytes unless payload_hex is explicitly provided; "
@@ -224,6 +224,7 @@ def generate_scenario(section: dict, opcode_entry: dict, available_opcodes: list
         "requirements": structured["requirements"],
         "precondition_checks": structured.get("precondition_checks", []),
         "out_of_scope": _scope_notes(structured),
+        "unmeasured_preconditions": structured.get("unmeasured_preconditions", []),
         "spec_evidence": rag["chunks"],
         "rag_response_id": rag["response_id"],
         "llm_response_id": llm["response_id"],
