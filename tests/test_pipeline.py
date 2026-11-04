@@ -825,8 +825,9 @@ class TestRetryIsLogged(PipelineTestCase):
         return json.loads(Path(config.TC_STORE_PATH).read_text(encoding="utf-8"))[0]
 
     def _authored_by_attempt(self, *a, **k):
-        # First authoring -> 0x84; the reauthor after a rejection -> 0x184.
-        return dict(_authored(a[1]), cdw10="0x00000184" if k.get("rejected") else "0x00000084")
+        # The reauthor after a rejection changes cdw13, a field nothing froze
+        # (the setup Write's LBA fields are frozen from its first authoring).
+        return dict(_authored(a[1]), cdw13="0x00000001" if k.get("rejected") else "0x00000000")
 
     def test_a_retry_rejected_again_shows_what_changed_and_what_came_back(self):
         executor = _FakeExecutor([[_rejected(0), _ok(1)], [_rejected(0), _ok(1)]])
@@ -836,9 +837,23 @@ class TestRetryIsLogged(PipelineTestCase):
         self.assertEqual(entry["kind"], "args_rejected")
         self.assertEqual(entry["step_index"], 0)
         self.assertIn("INVALID_FIELD", entry["trigger"])
-        self.assertIn("스텝 0 cdw10 0x00000084 -> 0x00000184", entry["changes"])
+        self.assertIn("스텝 0 cdw13 0x00000000 -> 0x00000001", entry["changes"])
         self.assertEqual(entry["detail"], "재시도도 거부됨")
         self.assertIn("INVALID_FIELD", entry["result"])
+
+    def test_a_retry_that_moves_a_frozen_setup_selector_is_not_sent(self):
+        # The setup Write's LBA was frozen from its first authoring; a reauthor
+        # that moves it would read back a different block than intended.
+        def author(*a, **k):
+            return dict(_authored(a[1]), cdw10="0x00000008" if k.get("rejected") else "0x00000000")
+
+        executor = _FakeExecutor([[_rejected(0), _ok(1)]])
+        with mock.patch.object(tc_writer, "author_args", side_effect=author):
+            self._run(executor)
+        entry = self._stored()["retry_log"][0]
+        self.assertIn("placeholder", entry["detail"])
+        self.assertIn("test intent mismatch: cdw10", entry["detail"])
+        self.assertEqual(len(executor.calls), 1)
 
     def test_a_retry_that_could_not_be_authored_says_why_nothing_was_resent(self):
         from tc_system.generation.args_author import ArgsAuthoringError
@@ -884,7 +899,7 @@ class TestRetryIsLogged(PipelineTestCase):
             run_tc_pipeline._print_result(1, 1, self._stored())
         text = out.getvalue()
         self.assertIn("인자 거부 → 재시도", text)
-        self.assertIn("바뀐 값: 스텝 0 cdw10 0x00000084 -> 0x00000184", text)
+        self.assertIn("바뀐 값: 스텝 0 cdw13 0x00000000 -> 0x00000001", text)
         self.assertIn("재시도 결과:", text)
 
 

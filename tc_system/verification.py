@@ -84,11 +84,36 @@ def quote_in(quote, text):
 
 
 def integer(value):
+    """int, decimal string, "0x84", or the spec's own "84h" notation."""
     if isinstance(value, bool) or not isinstance(value, (int, str)):
         raise ValueError(f"integer required: {value!r}")
     if isinstance(value, str):
-        return int(value, 16 if value.lower().startswith("0x") else 10)
+        text = value.strip().replace("_", "")
+        if re.fullmatch(r"[0-9a-fA-F]+[hH]", text):
+            return int(text[:-1], 16)
+        return int(text, 16 if text.lower().startswith("0x") else 10)
     return value
+
+
+def required_selector_masks(opcode_entry):
+    """Request fields that define WHICH test a command performs (FID/SEL, LID,
+    CNS, directive type/operation, commit action/slot, LBA range)."""
+    raw = int(opcode_entry["raw_opcode"], 16)
+    if opcode_entry["command_set"] == "ADMIN":
+        return {0x0A: {"cdw10": 0x7FF}, 0x09: {"cdw10": 0xFF},
+                0x02: {"cdw10": 0xFF}, 0x06: {"cdw10": 0xFF},
+                0x19: {"cdw11": 0xFFFF}, 0x1A: {"cdw11": 0xFFFF},
+                0x10: {"cdw10": 0x3F}}.get(raw, {})
+    if opcode_entry["command_set"] == "NVM" and raw in {1, 2, 5}:
+        return {"cdw10": 0xFFFFFFFF, "cdw11": 0xFFFFFFFF, "cdw12": 0xFFFF}
+    return {}
+
+
+def add_scope_notes(structured, new_notes):
+    notes = structured.get("out_of_scope")
+    if not isinstance(notes, list):
+        notes = list(structured.get("unverified_conditions") or [])
+    structured["out_of_scope"] = notes + list(new_notes)
 
 
 def completion_status(result):
@@ -283,8 +308,12 @@ def validate_check(check, n_steps):
 
 def validate_plan_contract(structured, evidence, section_id, available_opcodes):
     steps = structured["steps_plan"]
-    if set(structured.get("required_capabilities", [])) - CAPABILITIES:
-        raise ValueError("scenario requires capabilities this executor does not implement")
+    capabilities = structured.get("required_capabilities") or []
+    capabilities = [capabilities] if isinstance(capabilities, str) else capabilities
+    unknown = sorted({str(c) for c in capabilities} - CAPABILITIES) if isinstance(capabilities, list) else []
+    # Not a gate: what this executor can actually observe is enforced by the
+    # finite check kinds below. Rejecting on a capability *name* the model
+    # spelled its own way skipped otherwise executable scenarios.
     # Notes on what this TC deliberately leaves untested are recorded, not
     # rejected (measured: the model listed honest scope limits such as "other
     # LIDs are not covered by this single-action TC", and every target was
@@ -293,14 +322,18 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
     notes = structured.get("out_of_scope", structured.get("unverified_conditions", []))
     if not isinstance(notes, list) or not all(isinstance(n, str) for n in notes):
         raise ValueError("out_of_scope must be an array of strings")
+    if unknown:
+        add_scope_notes(structured, [f"실행기 역량 목록에 없는 요구(무시함, 검증식 종류로만 판단): {', '.join(unknown)}"])
     action = next(i for i, s in enumerate(steps) if s["phase"] == "action")
     by_name = {o["name"]: o for o in available_opcodes}
-    for step in steps:
+    for k, step in enumerate(steps):
         if step["opcode_name"] in UNEXECUTABLE_COMMANDS:
             raise ValueError("Abort/AER requires asynchronous command/event control, unavailable in this executor")
         status = step.get("expected_status")
+        if (status is None or (isinstance(status, str) and not status.strip())) and k != action:
+            status = "SUCCESS"  # a supporting step is there to succeed; only the action must say
         if not isinstance(status, str) or not status.strip():
-            raise ValueError("every step must explicitly declare its expected completion status")
+            raise ValueError(f"steps_plan[{k}] (the action) must declare its expected completion status")
         step["expected_status"] = canonical_status(status)  # stored in nvme-cli's spelling
         if step.get("payload_hex") is not None:
             try:
@@ -308,8 +341,13 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"payload_hex is not a hex byte string: {exc}") from exc
         constraints = step.get("field_constraints")
+        if constraints is None:
+            constraints = []
+        elif isinstance(constraints, dict):
+            constraints = [constraints]
         if not isinstance(constraints, list):
-            raise ValueError("every step must declare field_constraints (possibly empty)")
+            raise ValueError(f"steps_plan[{k}].field_constraints must be an array")
+        step["field_constraints"] = constraints
         masks = {}
         for c in constraints:
             if not isinstance(c, dict):
@@ -320,18 +358,15 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
             if not 0 < mask <= 0xFFFFFFFF or value < 0 or value & ~mask:
                 raise ValueError("invalid command constraint mask/value")
             masks[c["field"]] = masks.get(c["field"], 0) | mask
-        op = by_name[step["opcode_name"]]
-        raw = int(op["raw_opcode"], 16)
-        required = {}
-        if op["command_set"] == "ADMIN":
-            required = {0x0A: {"cdw10": 0x7FF}, 0x09: {"cdw10": 0xFF},
-                        0x02: {"cdw10": 0xFF}, 0x06: {"cdw10": 0xFF},
-                        0x19: {"cdw11": 0xFFFF}, 0x1A: {"cdw11": 0xFFFF},
-                        0x10: {"cdw10": 0x3F}}.get(raw, {})
-        elif op["command_set"] == "NVM" and raw in {1, 2, 5}:
-            required = {"cdw10": 0xFFFFFFFF, "cdw11": 0xFFFFFFFF, "cdw12": 0xFFFF}
-        if any(masks.get(field, 0) & mask != mask for field, mask in required.items()):
-            raise ValueError(f"{step['opcode_name']}: scenario must fix its selector/address fields {required}")
+        required = required_selector_masks(by_name[step["opcode_name"]])
+        # The action's selectors ARE the test, so the scenario must state them.
+        # A setup/verify step that leaves them open gets them frozen from its
+        # first authoring instead (tc_writer.freeze_selectors), so a retry still
+        # cannot switch e.g. Identify CNS under a precondition check.
+        if k == action and any(masks.get(field, 0) & mask != mask for field, mask in required.items()):
+            raise ValueError(f"steps_plan[{k}] {step['opcode_name']} (the action): field_constraints must fix "
+                             f"its selector/address fields {{field: mask}} = "
+                             + ", ".join(f"{f}: {hex(m)}" for f, m in required.items()))
     _validate_comparisons(structured, steps, by_name)
     evidence_by_id = {e["evidence_id"]: e for e in evidence if e.get("evidence_id")}
     requirements = structured.get("requirements")
@@ -384,20 +419,39 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
             conditions.append({"description": req["description"], "checks": req["checks"],
                                "moved_from_requirement": True})
     covered_conditions = structured.get("precondition_checks", [])
-    if not isinstance(covered_conditions, list):
-        raise ValueError("precondition_checks must be an array")
+    preconditions = structured.get("preconditions", [])
+    if not isinstance(covered_conditions, list) or not isinstance(preconditions, list):
+        raise ValueError("preconditions and precondition_checks must be arrays")
     if not all(isinstance(c, dict) and isinstance(c.get("description"), str) for c in covered_conditions):
         raise ValueError("precondition checks need objects with descriptions")
-    descriptions = [c.get("description") for c in covered_conditions]
-    if sorted(descriptions) != sorted(structured.get("preconditions", [])):
-        raise ValueError("every precondition needs observable checks; unstated assumptions are not verified")
+    # A precondition gates the action, so only checks on steps BEFORE it count.
+    # One that nothing before the action observes (a check on the action
+    # itself, no check, or a description that matches no check) is kept as a
+    # visible "not measured" note instead of rejecting the whole scenario:
+    # measured, base:5.4.6/5.4.7 (Fabrics-only commands, "must be a Discovery
+    # controller") were skipped this way, every run. The note makes plain the
+    # result does not establish that condition; requirements still need checks.
+    kept, unmeasured = [], []
     for condition in covered_conditions:
-        if not condition.get("checks"):
-            raise ValueError("precondition has no executable checks")
-        for check in condition["checks"]:
-            validate_check(check, len(steps))
-            if integer(check["step"]) >= action:
-                raise ValueError("preconditions must be observable before the action")
+        checks = [c for c in condition.get("checks") or [] if isinstance(c, dict)]
+        for check in checks:
+            validate_check(check, len(steps))  # a malformed check is still an error
+        early = [c for c in checks if integer(c["step"]) < action]
+        if early:
+            kept.append(dict(condition, checks=early))
+        else:
+            unmeasured.append(condition["description"])
+    measured = {c["description"] for c in kept}
+    unmeasured += [p for p in preconditions if isinstance(p, str) and p not in measured and p not in unmeasured]
+    structured["precondition_checks"] = kept
+    structured["preconditions"] = [c["description"] for c in kept]
+    if unmeasured:
+        notes = structured.get("out_of_scope")
+        if not isinstance(notes, list):
+            notes = list(structured.get("unverified_conditions") or [])
+        notes += [f"사전조건 미측정(action 전에 관측하는 스텝 없음 — 결과가 이 조건을 입증하지 않음): {d}"
+                  for d in unmeasured]
+        structured["out_of_scope"] = notes
 
 
 def _planned_range(plan_step, op):

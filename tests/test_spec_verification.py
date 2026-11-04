@@ -674,3 +674,130 @@ class TestExpectedStatusUsesNvmeCliTokens(unittest.TestCase):
         tc, _ = self._tc("INVALID_FIELD")
         tc["status"] = "UNSUPPORTED"
         self.assertIn("기대 INVALID_FIELD", describe_outcome(tc)["cause"])
+
+
+
+class TestPreconditionsThatCannotBeMeasuredAreNotes(unittest.TestCase):
+    """Measured: base:5.4.6/5.4.7 (Fabric Zoning Receive/Send) were skipped with
+    "preconditions must be observable before the action" every run."""
+    OPS = [{"name": "Identify", "raw_opcode": "0x06", "command_set": "ADMIN"},
+           {"name": "Fabric Zoning Receive", "raw_opcode": "0x56", "command_set": "ADMIN"}]
+
+    def _plan(self, steps, preconditions, precondition_checks):
+        return {"steps_plan": steps, "preconditions": preconditions, "precondition_checks": precondition_checks,
+                "out_of_scope": [],
+                "requirements": [{"evidence_id": "source", "quote": QUOTE, "description": "FZR completion",
+                                  "checks": [{"kind": "completion", "step": len(steps) - 1}]}]}
+
+    def _validate(self, plan):
+        validate_plan_contract(plan, [{"evidence_id": "source", "text": QUOTE}], "base:5.4.6", self.OPS)
+        return plan
+
+    ACTION = {"opcode_name": "Fabric Zoning Receive", "phase": "action", "expected_status": "SUCCESS",
+              "field_constraints": []}
+    IDENTIFY = {"opcode_name": "Identify", "phase": "setup", "expected_status": "SUCCESS",
+                "field_constraints": [{"field": "cdw10", "mask": "0xff", "value": "0x1"}]}
+
+    def test_a_precondition_checked_on_the_action_itself_becomes_a_note(self):
+        plan = self._validate(self._plan([self.ACTION], ["Discovery controller"],
+                                         [{"description": "Discovery controller",
+                                           "checks": [{"kind": "completion", "step": 0}]}]))
+        self.assertEqual(plan["preconditions"], [])
+        self.assertEqual(plan["precondition_checks"], [])
+        self.assertTrue(any("사전조건 미측정" in n and "Discovery controller" in n for n in plan["out_of_scope"]))
+
+    def test_unchecked_or_unmatched_preconditions_become_notes_too(self):
+        early = {"kind": "data_field", "step": 0, "offset": 111, "width": 1, "mask": "0xff", "value": "0x2"}
+        plan = self._validate(self._plan([self.IDENTIFY, self.ACTION], ["A", "CNTRLTYPE is 2h"],
+                                         [{"description": "CNTRLTYPE = 2h", "checks": [early]}]))
+        self.assertEqual(plan["preconditions"], ["CNTRLTYPE = 2h"])  # the measured one, as the check names it
+        notes = " ".join(plan["out_of_scope"])
+        self.assertIn(": A", notes)
+        self.assertIn("CNTRLTYPE is 2h", notes)
+
+    def test_checks_after_the_action_are_dropped_and_earlier_ones_kept(self):
+        early = {"kind": "data_field", "step": 0, "offset": 111, "width": 1, "mask": "0xff", "value": "0x2"}
+        plan = self._validate(self._plan([self.IDENTIFY, self.ACTION], ["Discovery controller"],
+                                         [{"description": "Discovery controller",
+                                           "checks": [early, {"kind": "completion", "step": 1}]}]))
+        self.assertEqual(plan["precondition_checks"][0]["checks"], [early])
+        self.assertEqual(plan["out_of_scope"], [])
+
+    def test_the_repaired_contract_is_consistent_for_verification(self):
+        plan = self._validate(self._plan([self.ACTION], ["Discovery controller"], []))
+        tc = {"steps": [dict(self.ACTION, name="Fabric Zoning Receive", opcode="0x56", direction="none", data_len=0)],
+              "scenario": {"preconditions": plan["preconditions"]},
+              "verification_contract": {"version": 2, "precondition_checks": plan["precondition_checks"],
+                                        "evidence": [{"evidence_id": "source", "text": QUOTE}],
+                                        "requirements": plan["requirements"]}}
+        execution = {"step_results": [{"step_index": 0, "exit_code": 0, "started": True,
+                                       "stdout": "Admin Command Fabric Zoning Receive is Success and result: 0x0"}]}
+        result = verify_tc(tc, execution)
+        self.assertNotIn("일부 사전조건에 실행 가능한 검증식이 없음", result["issues"])
+        self.assertEqual(result["status"], "PASS")
+
+
+
+class TestContractLeniencyForSupportingSteps(unittest.TestCase):
+    """The five scenario-contract rules relaxed after listing every skip path."""
+    OPS = [{"name": "Identify", "raw_opcode": "0x06", "command_set": "ADMIN"},
+           {"name": "Get Features", "raw_opcode": "0x0a", "command_set": "ADMIN"}]
+    ACTION_FIXED = [{"field": "cdw10", "mask": "0x7ff", "value": "0x84"}]
+
+    def _plan(self, setup=None, action=None, **extra):
+        setup = {"opcode_name": "Identify", "phase": "setup", **(setup or {})}
+        action = {"opcode_name": "Get Features", "phase": "action", "expected_status": "SUCCESS",
+                  "field_constraints": self.ACTION_FIXED, **(action or {})}
+        plan = {"steps_plan": [setup, action], "preconditions": [], "precondition_checks": [], "out_of_scope": [],
+                "requirements": [{"evidence_id": "source", "quote": QUOTE, "description": "d",
+                                  "checks": [{"kind": "completion", "step": 1}]}]}
+        plan.update(extra)
+        return plan
+
+    def _validate(self, plan):
+        validate_plan_contract(plan, [{"evidence_id": "source", "text": QUOTE}], "base:5.2.11", self.OPS)
+        return plan
+
+    def test_unknown_capability_names_are_noted_not_rejected(self):
+        plan = self._validate(self._plan(required_capabilities=["sequential", "feature_readback"]))
+        self.assertTrue(any("feature_readback" in n for n in plan["out_of_scope"]))
+
+    def test_a_supporting_step_without_expected_status_expects_success(self):
+        plan = self._validate(self._plan())
+        self.assertEqual(plan["steps_plan"][0]["expected_status"], "SUCCESS")
+
+    def test_the_action_must_still_declare_its_expected_status(self):
+        with self.assertRaisesRegex(ValueError, r"steps_plan\[1\] \(the action\)"):
+            self._validate(self._plan(action={"expected_status": None}))
+
+    def test_missing_field_constraints_mean_none(self):
+        plan = self._validate(self._plan())
+        self.assertEqual(plan["steps_plan"][0]["field_constraints"], [])
+
+    def test_spec_hex_notation_is_accepted(self):
+        from tc_system.verification import integer
+        self.assertEqual((integer("84h"), integer("0084H"), integer("0x84"), integer("10")), (0x84, 0x84, 0x84, 10))
+        plan = self._validate(self._plan(action={"field_constraints": [{"field": "cdw10", "mask": "7FFh",
+                                                                         "value": "84h"}]}))
+        self.assertEqual(plan["steps_plan"][1]["field_constraints"][0]["value"], "84h")
+
+    def test_only_the_action_must_fix_its_selectors(self):
+        self._validate(self._plan())  # setup Identify with CNS open: accepted
+        with self.assertRaisesRegex(ValueError, r"steps_plan\[1\] Get Features \(the action\).*cdw10: 0x7ff"):
+            self._validate(self._plan(action={"field_constraints": []}))
+
+    def test_an_open_setup_selector_is_frozen_from_its_first_authoring(self):
+        from tc_system.generation import tc_writer
+        authored = {"cdw10": "0x00000001", "cdw11": "0x0", "cdw12": "0x0", "nsid": 0, "data_len": 4096,
+                    "direction": "read", "shared_facts": {}, "field_breakdown": "CNS=1"}
+        identify = {"name": "Identify", "raw_opcode": "0x06", "command_set": "ADMIN", "opcode": "a06"}
+        intent = {"field_constraints": [], "expected_status": "SUCCESS"}
+        with mock.patch.object(tc_writer, "author_args", return_value=authored):
+            setup = tc_writer._command_step({"section_id": "s"}, identify, "/dev/nvme0", "/dev/nvme0n1", 1,
+                                            phase="setup", test_intent=dict(intent))
+            action = tc_writer._command_step({"section_id": "s"}, identify, "/dev/nvme0", "/dev/nvme0n1", 1,
+                                             phase="action", test_intent=dict(intent))
+        frozen = [c for c in setup["field_constraints"] if c.get("frozen_from_first_authoring")]
+        self.assertEqual([(c["field"], c["mask"], c["value"]) for c in frozen], [("cdw10", "0xff", "0x1")])
+        self.assertEqual(setup["test_intent"]["field_constraints"], setup["field_constraints"])  # reauthor keeps it
+        self.assertEqual(action["field_constraints"], [])  # the action's selectors come from the scenario

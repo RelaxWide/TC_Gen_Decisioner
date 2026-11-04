@@ -17,7 +17,8 @@ how many setup/verify steps surround it.
 import re
 
 from tc_system.generation.args_author import ArgsAuthoringError, author_args
-from tc_system.verification import VERSION, payload_for_step, validate_fixed_fields
+from tc_system.verification import (VERSION, integer, payload_for_step, required_selector_masks,
+                                    validate_fixed_fields)
 
 PLACEHOLDER_ARGS = "placeholder"
 AUTHORED_ARGS = "authored"
@@ -108,9 +109,38 @@ def _command_step(section: dict, opcode_entry: dict, nvme_ctrl: str, nvme_ns: st
         "field_value_verified": authored.get("field_value_verified", False),
         "args_llm_response_id": authored.get("llm_response_id"),
     })
-    validate_fixed_fields(step, step["field_constraints"])
-    payload_for_step(step)  # Reject a promised payload that does not fit the buffer.
+    try:
+        validate_fixed_fields(step, step["field_constraints"])
+        payload_for_step(step)  # Reject a promised payload that does not fit the buffer.
+    except ValueError as exc:
+        # Same outcome as an authoring failure (author_args checks both first),
+        # so the retry log names the real reason instead of an "LLM failure".
+        step["args_source"] = PLACEHOLDER_ARGS
+        step["args_error"] = str(exc)
+        return step
+    if phase != "action":
+        freeze_selectors(step, opcode_entry)
     return step
+
+
+def freeze_selectors(step: dict, opcode_entry: dict) -> None:
+    """Pin a setup/verify step's selector/address fields to the values it was
+    first authored with, when the scenario did not fix them. Stored in both the
+    step and its test_intent, which a reauthor reuses, so a retry keeps e.g. the
+    same Identify CNS a precondition check reads from."""
+    constraints = list(step.get("field_constraints") or [])
+    fixed = {}
+    for c in constraints:
+        fixed[c["field"]] = fixed.get(c["field"], 0) | integer(c["mask"])
+    added = []
+    for field, mask in required_selector_masks(opcode_entry).items():
+        open_bits = mask & ~fixed.get(field, 0)
+        if open_bits:
+            added.append({"field": field, "mask": hex(open_bits), "value": hex(integer(step[field]) & open_bits),
+                          "frozen_from_first_authoring": True})
+    if added:
+        step["field_constraints"] = constraints + added
+        step["test_intent"] = dict(step.get("test_intent") or {}, field_constraints=step["field_constraints"])
 
 
 def _prior_steps_up_to(resolved_steps: list[dict], steps: list[dict], upto: int) -> list[dict]:
