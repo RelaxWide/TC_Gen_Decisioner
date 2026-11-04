@@ -13,6 +13,7 @@ _STATUS_LABEL = {"PASS": "PASS", "FAIL": "FAIL", "ERROR": "실행/인자 오류"
                  "UNVERIFIED": "미검증"}
 _PHASE_LABEL = {"setup": "사전조건", "action": "본동작", "verify": "확인"}
 _tc_start_times = {}
+_announced = set()  # target indexes whose header/commands were already printed
 
 
 def _positive_int(text):
@@ -56,6 +57,7 @@ def _dual_label(indent, label, text, width=100):
 
 def _print_start(index, total, tc):
     _tc_start_times[tc["tc_id"]] = time.monotonic()
+    _announced.add(index)
     steps = tc["steps"]
     scenario = tc.get("scenario") or {}
     expectation = tc.get("expectation") or {}
@@ -117,8 +119,11 @@ def _print_result(index, total, tc):
     else:
         print(f"  <- 결과: {label} ({elapsed:.1f}s)")
         step_statuses = tc.get("step_statuses") or [status] * len(steps)
+        unsent = {r["step_index"] for r in (tc.get("execution") or {}).get("step_results", [])
+                  if r.get("blocked_reason")}
         for i, step in enumerate(steps):
-            step_label = _STATUS_LABEL.get(step_statuses[i], step_statuses[i])
+            step_label = ("미실행(체인 중단)" if i in unsent
+                          else _STATUS_LABEL.get(step_statuses[i], step_statuses[i]))
             print(f"    [{i}] {step.get('name') or '?'}  {step_label}  cdw10={step['cdw10']} data_len={step['data_len']}")
 
     # Every retry decision: what triggered it, which argument values changed,
@@ -153,10 +158,24 @@ def _print_result(index, total, tc):
     if status in ("PASS", "FAIL", "UNVERIFIED"):
         # The commands completed, so the requirement checks were evaluated.
         print(f"     스펙 검증: {verification.get('status', 'UNVERIFIED')}")
+        for condition in verification.get("preconditions", []):
+            results = condition.get("results", [])
+            state = ("충족" if results and all(c["result"] == "satisfied" for c in results)
+                     else "불충족" if any(c["result"] == "violated" for c in results) else "확인 불가")
+            _dual_label("     ", f"사전조건 {state}", condition.get("description"))
+            for check in results:
+                if check["result"] != "satisfied":
+                    _dual_label("       ", check["result"], check["detail"])
         for req in verification.get("requirements", []):
             _dual_label("     ", req["status"], req["description"])
+            # One line per distinct outcome: checks on steps the chain never
+            # sent all say the same thing and used to print once each.
+            seen = set()
             for check in req.get("results", []):
-                _dual_label("       ", check["result"], check["detail"])
+                key = (check["result"], check["detail"])
+                if key not in seen:
+                    seen.add(key)
+                    _dual_label("       ", check["result"], check["detail"])
     else:
         # ERROR/UNSUPPORTED: nothing was evaluated; per-check "unevaluated"
         # lines would only repeat that. Show what the TC set out to verify.
@@ -182,6 +201,13 @@ def _print_skip(index, total, section, opcode_entry, reason):
     # nothing at all — indistinguishable on screen from a hang, which is
     # exactly the confusion on_start/on_progress already exist to avoid for
     # TCs that do reach a final status.
+    reason = reason or "(사유 미기록)"
+    if index in _announced:
+        # Already announced with its commands: continue that block instead of
+        # a second "[i/N]" header that read as the run jumping back.
+        _announced.discard(index)
+        _dual_label("  ", "-> 보내지 않고 건너뜀", reason, width=110)
+        return
     print(f"\n[{index}/{total}] {section['section_id']} ({opcode_entry['name']}) — 건너뜀, 다음 타겟으로 진행")
     _dual_label("  ", "사유", reason, width=110)
 

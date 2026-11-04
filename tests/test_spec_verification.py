@@ -801,3 +801,55 @@ class TestContractLeniencyForSupportingSteps(unittest.TestCase):
         self.assertEqual([(c["field"], c["mask"], c["value"]) for c in frozen], [("cdw10", "0xff", "0x1")])
         self.assertEqual(setup["test_intent"]["field_constraints"], setup["field_constraints"])  # reauthor keeps it
         self.assertEqual(action["field_constraints"], [])  # the action's selectors come from the scenario
+
+
+
+class TestAStoppedChainSaysWhy(unittest.TestCase):
+    """Measured: UNVERIFIED with "unevaluated: step did not complete" printed
+    once per check and "재시도 안 함: 스텝 1 Set Features" blaming the
+    environment, when the chain had stopped on an unmet precondition."""
+
+    def _tc(self):
+        get = {"name": "Get Features", "phase": "setup", "opcode": "0x0a", "direction": "none", "data_len": 0,
+               "expected_status": "SUCCESS", "cdw10": "0x2"}
+        set_ = dict(get, name="Set Features", phase="action", opcode="0x09")
+        verify = dict(get, phase="verify")
+        return {"tc_id": "t", "steps": [get, set_, verify], "verification_contract": {
+            "version": 2, "precondition_checks": [{"description": "Power State 0 is current",
+                                                   "checks": [{"kind": "result_bits", "step": 0,
+                                                               "mask": "0x1f", "value": "0x0"}]}]}}
+
+    def _run(self, replies):
+        reply = iter(replies)
+
+        def wire(steps, **kw):
+            return {"step_results": [dict(next(reply), step_index=0)], "batch_stderr": "",
+                    "timed_out": False, "dmesg_captured_scoped": True, "dmesg_text": ""}
+
+        with mock.patch("tc_system.execution.ssh_runner.passthru_cmd"), \
+             mock.patch("tc_system.execution.ssh_runner.execute_tc_steps", side_effect=wire), \
+             mock.patch("tc_system.execution.ssh_runner.capture_dmesg", return_value=""):
+            return SSHTCExecutor().execute(self._tc())
+
+    def test_an_unmet_precondition_names_the_condition_and_the_observed_value(self):
+        result = self._run([{"exit_code": 0, "started": True,
+                             "stdout": "Admin Command Get Features is Success and result: 0x00000002"}])
+        reason = result["step_results"][1]["blocked_reason"]
+        self.assertIn("Power State 0 is current", reason)
+        self.assertIn("불충족", reason)
+        self.assertIn("2 eq 0", reason)
+        self.assertEqual(result["step_results"][2]["blocked_reason"], reason)
+
+    def test_an_unexpected_completion_names_expected_and_actual(self):
+        result = self._run([{"exit_code": 22, "started": True,
+                             "stdout": "NVMe status: INVALID_FIELD: x(0x2)"}])
+        reason = result["step_results"][1]["blocked_reason"]
+        self.assertIn("기대 완료 상태 SUCCESS", reason)
+        self.assertIn("INVALID_FIELD", reason)
+
+    def test_checks_on_unsent_steps_say_not_run(self):
+        from tc_system.verification import evaluate_check
+        tc = self._tc()
+        results = {1: {"step_index": 1, "started": False, "exit_code": None, "stdout": "", "blocked_reason": "x"}}
+        outcome = evaluate_check({"kind": "completion", "step": 1}, tc["steps"], results)
+        self.assertEqual(outcome["detail"], "step 1 not run (chain stopped earlier)")

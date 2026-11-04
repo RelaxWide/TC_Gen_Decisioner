@@ -15,7 +15,8 @@ from tc_system.execution.expectation_checker import (check_expectation, check_ex
                                                       status_line,
                                                       rejected_arguments, unsupported_opcode)
 from shared.llm_client import LLMCallError
-from tc_system.execution.ssh_runner import DestructiveStepBlocked, device_responsive, probe_device_capabilities
+from tc_system.execution.ssh_runner import (DestructiveStepBlocked, device_responsive, passthru_cmd,
+                                            probe_device_capabilities)
 from tc_system.execution.tc_executor import SSHTCExecutor
 from tc_system.generation.device_capabilities import in_use_lba_bytes, summarize_device_capabilities
 from tc_system.generation.scenario_generator import generate_scenario
@@ -161,6 +162,28 @@ def _reset_coverage() -> None:
     save_json_atomic(config.TARGET_SKIPS_PATH, [])
 
 
+def _preflight(tc: dict, allow_destructive: bool) -> None:
+    """The checks the executor makes before anything reaches the wire, run
+    before the TC is announced. Otherwise the terminal printed the TC, its
+    commands and "실행 중...", then a second "[i/N] ... 건너뜀" header for the
+    same index, while nothing had been sent (so no SSH log either)."""
+    for i, step in enumerate(tc["steps"]):
+        passthru_cmd(step)  # the same field validation execute_tc_steps applies
+        if not allow_destructive and (step.get("destructive") or step.get("firmware_state")):
+            kind = "펌웨어 상태 변경" if step.get("firmware_state") else "데이터 파괴"
+            raise DestructiveStepBlocked(
+                f"--no-destructive: 스텝 {i} {step.get('name') or '?'}(opcode {step.get('opcode')}, {kind})이 "
+                "체인에 포함돼 보내지 않음 — 허용하려면 --no-destructive 없이 실행")
+
+
+def _placeholder_reason(tc: dict) -> str:
+    failed = [(k, s) for k, s in enumerate(tc["steps"]) if s.get("args_source") == "placeholder"]
+    where = "; ".join(f"스텝 {k} {s.get('name') or '?'}: {s.get('args_error') or '사유 미기록'}" for k, s in failed)
+    return (f"인자 생성이 재시도까지 실패해 placeholder 인자(cdw10=0 등)만 남음 — {where}. "
+            "placeholder 값은 대부분 reserved라 결과가 무의미하므로 보내지 않음"
+            "(실험용으로 보내려면 --allow-placeholder-args, 그 결과는 커버리지 제외)")
+
+
 def _record_skip(skipped: list, section: dict, opcode_entry: dict, reason: str, kind: str) -> None:
     """A target that was tried but never reached the device. Persisted so the
     next `pick_next_targets` counts it as an attempt and moves on."""
@@ -270,13 +293,11 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
             # losing every target after it even though they were unrelated).
             # Nothing was built or sent to the device, so this section is
             # simply offered again next run.
-            _record_skip(skipped, section, opcode_entry, str(exc), "generation_failed")
+            reason = str(exc) or type(exc).__name__
+            _record_skip(skipped, section, opcode_entry, reason, "generation_failed")
             if on_skip:
-                on_skip(i, total, section, opcode_entry, str(exc))
+                on_skip(i, total, section, opcode_entry, reason)
             continue
-
-        if on_start:
-            on_start(i, total, tc)
 
         # Gate on what actually makes the command meaningless — placeholder
         # arguments hardcoded in tc_writer — not on whether the LLM is a stub.
@@ -286,19 +307,26 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
         # the model couldn't argue real values for took nine unrelated targets
         # down with it) — now it's a skip like the LLMCallError case above:
         # nothing was sent to the device, so the section is offered again.
+        # Measured on the target: cdw10=0 is a reserved value for most admin
+        # commands (INVALID_FIELD/exit 22) and NVM Read 0x02 exits 0 while
+        # transferring nothing, which would be recorded as a false PASS.
         if tc["uses_placeholder_args"] and not allow_placeholder_args:
-            reason = (
-                f"{tc['name']} carries placeholder command arguments (cdw10=0, data_len=0) after "
-                "the one retry — measured on the target, cdw10=0 is a reserved field value (admin "
-                "0x06/0x02/0x0A return INVALID_FIELD(0x2)/exit 22, and NVM Read 0x02 exits 0 while "
-                "transferring nothing, which would be recorded as a false PASS). Pass "
-                "allow_placeholder_args=True (CLI: --allow-placeholder-args) to execute it anyway "
-                "for plumbing experiments — those records are excluded from the coverage claim."
-            )
+            reason = _placeholder_reason(tc)
             _record_skip(skipped, section, opcode_entry, reason, "placeholder_args")
             if on_skip:
                 on_skip(i, total, section, opcode_entry, reason)
             continue
+        try:
+            _preflight(tc, allow_destructive)
+        except (DestructiveStepBlocked, ValueError) as exc:
+            reason = str(exc) or type(exc).__name__
+            _record_skip(skipped, section, opcode_entry, reason, "blocked_before_wire")
+            if on_skip:
+                on_skip(i, total, section, opcode_entry, reason)
+            continue
+
+        if on_start:
+            on_start(i, total, tc)
         generated.append(tc)
 
         try:
@@ -309,15 +337,18 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
             # exists for --no-destructive — unrelated to this one target's
             # own correctness, so it must not take the rest of the batch with
             # it either.
-            _record_skip(skipped, section, opcode_entry, str(exc), "blocked_before_wire")
+            reason = str(exc) or type(exc).__name__
+            _record_skip(skipped, section, opcode_entry, reason, "blocked_before_wire")
             if on_skip:
-                on_skip(i, total, section, opcode_entry, str(exc))
+                on_skip(i, total, section, opcode_entry, reason)
             continue
         step_statuses = check_step_expectations(tc, execution)
         rejection = rejected_arguments(execution, tc)  # (step_index, reason) | None
 
         action_idx = next(j for j, rs in enumerate(resolved_steps) if rs["phase"] == "action")
-        broken_idx = next((j for j, st in enumerate(step_statuses) if st in ("ERROR", "UNSUPPORTED")), None)
+        unsent = {r["step_index"]: r["blocked_reason"] for r in execution["step_results"] if r.get("blocked_reason")}
+        broken_idx = next((j for j, st in enumerate(step_statuses)
+                           if st in ("ERROR", "UNSUPPORTED") and j not in unsent), None)
         # Retrying at all after a destructive/firmware_state step already ran
         # risks re-sending that step purely to fix an unrelated later one —
         # SSH batches can't be partially replayed, so any retry resends
@@ -336,6 +367,12 @@ def run_pipeline(count: int = 5, executor=None, allow_placeholder_args: bool = F
         # "Get Features FID 84h -> 실행/인자 오류" with no way to tell whether
         # or how the retry changed the arguments).
         retry_log = []
+        if broken_idx is None and unsent:
+            first_unsent = min(unsent)
+            retry_log.append({"kind": "none", "step_index": first_unsent,
+                              "step_name": tc["steps"][first_unsent].get("name"),
+                              "detail": (f"체인 중단: {unsent[first_unsent]}. 사전조건/기대 상태 불충족은 "
+                                         "인자를 바꿔 고칠 문제가 아니라 재시도하지 않음")})
         if broken_idx is not None and (precedes_destructive or timed_out):
             retry_log.append({"kind": "none", "step_index": broken_idx,
                               "step_name": tc["steps"][broken_idx].get("name"),

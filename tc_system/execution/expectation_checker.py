@@ -424,6 +424,12 @@ def describe_outcome(tc: dict, verification: dict | None = None) -> dict:
                 "next": "선택(O) 기능이면 정상. 필수(M)라면 결함 후보이니 스펙의 M/O 표를 확인"}
     if status == "UNVERIFIED":
         issues = verification.get("issues") or []
+        stopped = next((r["blocked_reason"] for r in execution.get("step_results", []) if r.get("blocked_reason")), None)
+        if stopped:
+            return {"verdict": "체인이 중간에 멈춰 요구사항을 평가하지 못함 — 결함 아님",
+                    "cause": stopped,
+                    "next": "커버리지에 넣지 않고 다음 실행에서 다시 시도. 사전조건이 이 드라이브에서 성립하지 "
+                            "않는 것이면 3회 뒤 후순위로 밀림"}
         return {"verdict": "명령은 정상 완료됐지만 요구사항을 입증하지 못함 — 결함 아님",
                 "cause": "; ".join(issues) or None,
                 "next": "커버리지에 넣지 않고, 다음 실행에서 다른 요구사항/방식으로 다시 시도"}

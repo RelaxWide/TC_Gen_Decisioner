@@ -501,8 +501,12 @@ def evaluate_check(check, steps, results):
         validate_check(check, len(steps))
         i = integer(check["step"])
         step, result = steps[i], results.get(i)
-        if not result or not result.get("started", True) or result.get("exit_code") is None:
-            raise ValueError("step did not complete")
+        if result and result.get("blocked_reason"):
+            raise ValueError(f"step {i} not run (chain stopped earlier)")
+        if not result or not result.get("started", True):
+            raise ValueError(f"step {i} not run")
+        if result.get("exit_code") is None:
+            raise ValueError(f"step {i} did not complete (no exit status)")
         kind = check["kind"]
         if kind == "completion":
             observed, expected = completion_status(result), expected_status(step)

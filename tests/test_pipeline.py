@@ -795,8 +795,9 @@ class TestFieldValueRejectionDoesNotProveUnsupported(PipelineTestCase):
                     "chain_summary": "", "rag_response_id": "r", "llm_response_id": "l"}
 
         def _verified_author_args(section, opcode_entry, active_nsid, **kwargs):
-            return {"cdw10": "0x00000001", "cdw11": "0x00000000", "cdw12": "0x00000000", "data_len": 0,
-                    "direction": "none", "nsid": 0, "shared_facts": {}, "field_breakdown": "LID=01h",
+            # A wire-valid Get Log Page: LID 01h, NUMD=0 -> one dword (4 bytes) read.
+            return {"cdw10": "0x00000001", "cdw11": "0x00000000", "cdw12": "0x00000000", "data_len": 4,
+                    "direction": "read", "nsid": 0, "shared_facts": {}, "field_breakdown": "LID=01h",
                     "field_value_verified": True}
 
         refused = [{"step_index": 0, "exit_code": 22, "stdout":
@@ -943,6 +944,94 @@ class TestCountMustBePositive(PipelineTestCase):
             with self.subTest(text=text), self.assertRaises(argparse.ArgumentTypeError):
                 run_tc_pipeline._positive_int(text)
         self.assertEqual(run_tc_pipeline._positive_int("3"), 3)
+
+
+
+class TestAStoppedChainIsNotBlamedOnTheEnvironment(PipelineTestCase):
+    REASON = "사전조건 'X' 불충족(스텝 0 관측: 2 eq 0) — 이후 스텝을 보내지 않음"
+
+    def _stopped(self):
+        return [_ok(0), {"step_index": 1, "started": False, "exit_code": None, "stdout": "",
+                         "blocked_reason": self.REASON}]
+
+    def test_the_retry_log_and_the_outcome_name_the_stop_reason(self):
+        from tc_system.execution.expectation_checker import describe_outcome
+        self._run(_FakeExecutor([self._stopped()]))
+        tc = json.loads(Path(config.TC_STORE_PATH).read_text(encoding="utf-8"))[0]
+        self.assertEqual(tc["status"], "UNVERIFIED")
+        entry = tc["retry_log"][0]
+        self.assertEqual((entry["kind"], entry["step_index"]), ("none", 1))
+        self.assertIn("체인 중단", entry["detail"])
+        self.assertIn(self.REASON, entry["detail"])
+        self.assertNotIn("환경/호스트", entry["detail"])
+        outcome = describe_outcome(tc)
+        self.assertIn("체인이 중간에 멈춰", outcome["verdict"])
+        self.assertEqual(outcome["cause"], self.REASON)
+
+    def test_the_terminal_marks_the_unsent_step_and_prints_repeated_lines_once(self):
+        import contextlib
+        import io
+        import run_tc_pipeline
+        self._run(_FakeExecutor([self._stopped()]))
+        tc = json.loads(Path(config.TC_STORE_PATH).read_text(encoding="utf-8"))[0]
+        tc["verification"] = {"status": "UNVERIFIED", "preconditions": [], "requirements": [
+            {"status": "UNVERIFIED", "description": "r", "results": [
+                {"result": "unevaluated", "detail": "step 1 not run (chain stopped earlier)"}] * 3}]}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run_tc_pipeline._print_result(1, 1, tc)
+        text = out.getvalue()
+        self.assertIn("미실행(체인 중단)", text)
+        self.assertEqual(text.count("step 1 not run (chain stopped earlier)"), 1)
+
+
+
+class TestATargetThatWillNotBeSentIsNotAnnounced(PipelineTestCase):
+    """Measured: "-> 실행 중..." followed by a second "[1/10]" header for the
+    same target, with nothing in the SSH log - the skip was decided after the
+    TC had been announced."""
+
+    def _calls(self, **kw):
+        starts, skips = [], []
+        pipeline.run_pipeline(count=1, executor=kw.pop("executor", _FakeExecutor([])),
+                              on_start=lambda i, n, tc: starts.append(i),
+                              on_skip=lambda i, n, s, o, reason: skips.append(reason), **kw)
+        return starts, skips
+
+    def test_a_destructive_step_under_no_destructive_is_skipped_before_announcing(self):
+        executor = _FakeExecutor([])
+        starts, skips = self._calls(executor=executor, allow_destructive=False)
+        self.assertEqual(starts, [])
+        self.assertEqual(len(skips), 1)
+        self.assertIn("--no-destructive", skips[0])
+        self.assertIn("스텝 0 Write(opcode 0x01", skips[0])
+        self.assertEqual(executor.calls, [])
+
+    def test_placeholder_args_are_skipped_before_announcing_and_say_which_step(self):
+        from tc_system.generation.args_author import ArgsAuthoringError
+
+        def author(*a, **k):
+            if a[1]["name"] == "Write":
+                raise ArgsAuthoringError("direction='read' conflicts with opcode 0x01")
+            return _authored(a[1])
+
+        with mock.patch.object(tc_writer, "author_args", side_effect=author):
+            starts, skips = self._calls(allow_destructive=True)
+        self.assertEqual(starts, [])
+        self.assertIn("스텝 0 Write: direction='read' conflicts with opcode 0x01", skips[0])
+
+    def test_a_late_skip_continues_the_announced_block_instead_of_a_new_header(self):
+        import contextlib
+        import io
+        import run_tc_pipeline
+        tc = {"tc_id": "late", "name": "TC_X", "steps": [], "scenario": {}, "expectation": {}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run_tc_pipeline._print_start(1, 10, tc)
+            run_tc_pipeline._print_skip(1, 10, {"section_id": "base:1"}, {"name": "X"}, "")
+        text = out.getvalue()
+        self.assertEqual(text.count("[1/10]"), 1)
+        self.assertIn("-> 보내지 않고 건너뜀: (사유 미기록)", text)
 
 
 if __name__ == "__main__":
