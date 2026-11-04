@@ -98,6 +98,8 @@ def _print_start(index, total, tc):
             cmd = f"(명령 생성 불가 — {exc})"
         print(f"        $ {cmd}")
         print(f"        기대 완료 상태: {expected_status(step)}")
+        if step.get("constraint_overrides"):
+            _dual_label("        ", "시나리오 고정값 적용", ", ".join(step["constraint_overrides"]))
 
     _dual_label("  ", "Expectation", expectation.get("description"))
     fail_criteria = expectation.get("fail_criteria") or []

@@ -118,11 +118,25 @@ def _validate_steps_plan(plan, opcode_entry: dict, available_opcodes: list[dict]
     by_name = {o["name"]: o for o in available_opcodes}
 
     action_indices = [i for i, s in enumerate(plan) if isinstance(s, dict) and s.get("phase") == "action"]
+    target_indices = [i for i, s in enumerate(plan) if s.get("opcode_name") == opcode_entry["name"]]
+    # Two declared actions are ambiguous and stay an error.
+    if len(action_indices) <= 1 and target_indices and (
+            not action_indices or plan[action_indices[0]].get("opcode_name") != opcode_entry["name"]):
+        # The order is right but the label is not, e.g. "Set Features (action)
+        # -> Get Log Page (verify)" for a Get Log Page clause: the target
+        # command is the action and what runs before it is its setup.
+        # Measured: base:5.2.12.1.14.2.11 was skipped over this label alone.
+        after = [i for i in target_indices if action_indices and i > action_indices[0]]
+        new_action = after[0] if after else target_indices[-1]
+        for i, step in enumerate(plan):
+            step["phase"] = "setup" if i < new_action else "action" if i == new_action else "verify"
+        action_indices = [new_action]
     if len(action_indices) != 1:
         raise ValueError(f"steps_plan must have exactly one phase=='action' step, got {len(action_indices)}")
     action_index = action_indices[0]
     if plan[action_index].get("opcode_name") != opcode_entry["name"]:
-        raise ValueError("the action step's opcode_name must be the target command")
+        raise ValueError(f"the target command {opcode_entry['name']} is not in steps_plan; "
+                         "it must be the action step")
 
     for i, step in enumerate(plan):
         name = step.get("opcode_name")

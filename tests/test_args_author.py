@@ -368,5 +368,52 @@ class TestAuthorArgs(unittest.TestCase):
         self.assertIn("0x00000000", captured["prompt"])
 
 
+
+class TestPersistentEventLogCasesFromTheField(unittest.TestCase):
+    """The three skips reported for base:5.2.12.1.14 / 5.2.12.1.14.2.1."""
+    GLP = {"name": "Get Log Page", "raw_opcode": "0x02", "command_set": "ADMIN"}
+    SECTION = {"section_id": "base:5.2.12.1.14", "spec_doc": "NVM-Express-Base-Specification"}
+
+    def _author(self, replies, constraints):
+        llm = mock.Mock(side_effect=[{"structured": r, "response_id": f"l{n}"} for n, r in enumerate(replies)])
+        with mock.patch.object(args_author, "generate_rag_response",
+                               return_value={"chunks": [{"text": "spec"}], "response_id": "r"}), \
+             mock.patch.object(args_author, "generate_llm_response", llm):
+            try:
+                return author_args(self.SECTION, self.GLP, ACTIVE_NSID,
+                                   test_intent={"field_constraints": constraints}), llm
+            except ArgsAuthoringError as exc:
+                return exc, llm
+
+    @staticmethod
+    def _reply(cdw10, cdw11="0x0", data_len=512):
+        return {"cdw10": cdw10, "cdw11": cdw11, "cdw12": "0x0", "nsid": 0, "data_len": data_len,
+                "direction": "read", "shared_facts": {}, "field_breakdown": "x"}
+
+    def test_a_fixed_action_field_is_applied_not_a_reason_to_skip(self):
+        # Scenario: ACT (CDW10[9:8]) = 11b "Establish Context and Read 512 Bytes
+        # of Header"; the author wrote 10b "Release Context".
+        result, llm = self._author([self._reply("0x007F020D")],
+                                   [{"field": "cdw10", "mask": "0x3FF", "value": "0x30D"}])
+        self.assertEqual(result["cdw10"], "0x007F030D")
+        self.assertEqual(result["constraint_overrides"], ["cdw10 0x007F020D -> 0x007F030D"])
+        self.assertEqual(llm.call_count, 1)
+
+    def test_numdl_in_the_wrong_register_gets_a_retry_that_says_where_it_goes(self):
+        # 0x7F written into CDW11 (NUMDU): 32 MB requested into 512 bytes.
+        result, llm = self._author([self._reply("0x0000000D", cdw11="0x7F")] * 2, [])
+        self.assertIsInstance(result, ArgsAuthoringError)
+        retry_prompt = llm.call_args_list[1][0][0]
+        self.assertIn("NUMDU(CDW11[15:0]=0x007F)", retry_prompt)
+        self.assertIn("for data_len=512 set CDW10[31:16]=0x007F and CDW11[15:0]=0x0000", retry_prompt)
+
+    def test_a_fixed_numd_makes_the_retry_ask_for_the_matching_length(self):
+        constraints = [{"field": "cdw10", "mask": "0xFFFF00FF", "value": "0x4000000D"}]
+        result, llm = self._author([self._reply("0x03FF000D", data_len=4096),
+                                    self._reply("0x03FF000D", data_len=65540)], constraints)
+        self.assertIn("data_len=65540", llm.call_args_list[1][0][0])
+        self.assertEqual((result["cdw10"], result["data_len"]), ("0x4000000D", 65540))
+
+
 if __name__ == "__main__":
     unittest.main()

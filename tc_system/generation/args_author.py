@@ -20,7 +20,7 @@ import json
 
 from shared.spec_evidence import format_evidence
 from tc_system.command_fields import verify_selectors, validate_transfer
-from tc_system.verification import validate_fixed_fields, integer, payload_for_step
+from tc_system.verification import apply_fixed_fields, validate_fixed_fields, integer, payload_for_step
 
 from shared.llm_client import LLMCallError, generate_llm_response
 from shared.rag_client import generate_rag_response
@@ -107,6 +107,8 @@ SYSTEM_PROMPT = (
     "3 replaces/activates immediately, 6 replaces a boot partition, 7 marks it active. "
     "Do not infer invalid image acceptance without evidence of the actual preceding download.\n\n"
     "TEST_INTENT: the scenario, this step's role, checks and field_constraints define the test. "
+    "The harness writes the field_constraints bits itself after your reply; choose every other field, "
+    "above all the transfer length (NUMD/NLB) and data_len, to be consistent with those fixed bits. "
     "Preserve them exactly, INCLUDING during retries. Never switch FID/LID/CNS, address or expected "
     "outcome to make a different command succeed. Negative tests deliberately expect an error; "
     "do not turn them into positive tests. If the fixed constraints cannot be encoded, report the "
@@ -209,6 +211,11 @@ def _author_once(prompt: str, opcode_entry: dict, active_nsid: int,
               for i in range(10, 16)}
     fields.update(nsid=nsid, data_len=data_len, direction=direction)
     try:
+        overrides = apply_fixed_fields(fields, (test_intent or {}).get("field_constraints", []))
+        if fields["nsid"] not in allowed_nsids:
+            raise ValueError(f"fixed nsid={fields['nsid']} is not one of {sorted(allowed_nsids)}")
+        if not 0 <= fields["data_len"] <= MAX_DATA_LEN:
+            raise ValueError(f"fixed data_len out of range: {fields['data_len']}")
         field_value_verified = verify_selectors(fields, opcode_entry, required_field_values)
         validate_fixed_fields(fields, (test_intent or {}).get("field_constraints", []))
         validate_transfer(fields, opcode_entry, lba_bytes=(test_intent or {}).get("lba_bytes"))
@@ -216,12 +223,13 @@ def _author_once(prompt: str, opcode_entry: dict, active_nsid: int,
         if payload_hex is not None and direction == "write":
             # Caught here, inside the one-retry loop, instead of later in
             # tc_writer where it skipped the whole target with no second try.
-            payload_for_step({"direction": direction, "data_len": data_len, "payload_hex": payload_hex})
+            payload_for_step({"direction": direction, "data_len": fields["data_len"], "payload_hex": payload_hex})
     except ValueError as exc:
         raise ArgsAuthoringError(str(exc)) from exc
     return dict(fields, shared_facts=dict(shared_facts),
                 field_breakdown=str(structured["field_breakdown"]),
-                field_value_verified=field_value_verified, llm_response_id=llm["response_id"])
+                field_value_verified=field_value_verified, llm_response_id=llm["response_id"],
+                constraint_overrides=overrides)
 
 
 def author_args(section: dict, opcode_entry: dict, active_nsid: int,

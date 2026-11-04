@@ -21,6 +21,13 @@ CAPABILITIES = {"sequential", "zero_payload", "hex_payload", "completion_status"
 # nvme-cli passthru executor cannot produce. Scenario validation rejects them,
 # and target selection does not offer them at all.
 UNEXECUTABLE_COMMANDS = {"Abort", "Asynchronous Event Request"}
+# Clause values that are found in returned data, not set in the request. An
+# Event Type clause (Persistent Event Log, 22 clauses) is verified by locating
+# a variable-length event record of that type; the finite checks here only
+# read fixed offsets, and several events (thermal excursion, ...) cannot be
+# caused from this host. Measured: every one of them was skipped or built a
+# contract that tested something else. Not offered until a record check exists.
+UNVERIFIABLE_FIELD_VALUES = {"Event Type"}
 STATUS_RE = re.compile(r"NVMe status:\s*([A-Z][A-Z0-9_]+)", re.I)
 HOST_ERROR_RE = re.compile(
     r"No such file or directory|Resource temporarily unavailable|Permission denied|"
@@ -486,6 +493,27 @@ def _validate_comparisons(structured, steps, by_name):
             if pattern is None or not any(payload_bytes(pattern)):
                 raise ValueError(f"data_matches_write: step {j} needs a non-zero payload_hex")
         _check_window(f"step {i} vs step {j}", _planned_range(steps[i], op_i), _planned_range(steps[j], op_j))
+
+
+def apply_fixed_fields(fields, constraints):
+    """Write the scenario's fixed bits into `fields` and return what changed.
+
+    The scenario already states those bits exactly; asking the argument
+    author to copy them and rejecting any slip skipped whole targets
+    (measured: Persistent Event Log ACT=3 rewritten to 2, NUMDL 0x4000 to
+    0x03FF). The author still chooses every other bit and the buffer length,
+    which are then checked against these values.
+    """
+    changes = []
+    for c in constraints or []:
+        field, mask, value = c["field"], integer(c["mask"]), integer(c["value"])
+        current = integer(fields[field])
+        merged = (current & ~mask) | value
+        if merged != current:
+            new = f"0x{merged:08X}" if field.startswith("cdw") else merged
+            changes.append(f"{field} {fields[field]} -> {new}")
+            fields[field] = new
+    return changes
 
 
 def validate_fixed_fields(step, constraints):

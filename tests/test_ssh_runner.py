@@ -297,5 +297,20 @@ class TestDeviceResponsive(unittest.TestCase):
         self.assertTrue(lines[0]["health_check"])
 
 
+
+class TestTestsCannotReachTheRealTarget(unittest.TestCase):
+    """Measured: a test that mocked execute_tc_steps but not capture_dmesg
+    launched plink and appended a record to the real logs/ssh_commands.jsonl."""
+
+    def test_an_unmocked_plink_call_fails_the_test(self):
+        with self.assertRaisesRegex(RuntimeError, "real plink/SSH call from a test"):
+            ssh_runner._plink({"host": "h", "user": "u", "password": "p"}, "true")
+
+    def test_writing_the_real_ssh_log_fails_the_test(self):
+        self.assertEqual(config.SSH_COMMAND_LOG_PATH, ssh_runner._REAL_SSH_LOG_PATH)
+        with self.assertRaisesRegex(RuntimeError, "real logs/ssh_commands.jsonl"):
+            ssh_runner._append_ssh_log({"tc_id": "should-not-be-written"})
+
+
 if __name__ == "__main__":
     unittest.main()

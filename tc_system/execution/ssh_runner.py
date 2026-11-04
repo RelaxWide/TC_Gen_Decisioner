@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -100,6 +101,7 @@ class _Timeout:
 
 
 def _plink(target: dict, command: str, stdin: str | None = None, timeout: int = 60):
+    _refuse_under_tests("real plink/SSH call")
     fd, pwfile_path = tempfile.mkstemp(prefix="plinkpw-")
     try:
         with os.fdopen(fd, "w") as f:
@@ -153,7 +155,23 @@ class DestructiveStepBlocked(RuntimeError):
     pass
 
 
+# The real log file, captured at import (tests redirect config's path later).
+_REAL_SSH_LOG_PATH = config.SSH_COMMAND_LOG_PATH
+
+
+def _refuse_under_tests(what: str) -> None:
+    """A test that reaches the real wire or the real log forgot a mock. Fail it
+    loudly instead (measured: one such test launched plink and appended a
+    record to logs/ssh_commands.jsonl). The production entry points never
+    import unittest; TC_ALLOW_REAL_SSH=1 overrides for manual experiments."""
+    if "unittest" in sys.modules and not os.environ.get("TC_ALLOW_REAL_SSH"):
+        raise RuntimeError(f"{what} from a test - mock ssh_runner (execute_tc_steps, capture_dmesg, "
+                           "_plink, ...) or redirect config.SSH_COMMAND_LOG_PATH")
+
+
 def _append_ssh_log(record: dict) -> None:
+    if config.SSH_COMMAND_LOG_PATH == _REAL_SSH_LOG_PATH:
+        _refuse_under_tests("write to the real logs/ssh_commands.jsonl")
     config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
     with config.SSH_COMMAND_LOG_PATH.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")

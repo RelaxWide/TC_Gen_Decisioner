@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 from collections import Counter
 
-from tc_system.verification import UNEXECUTABLE_COMMANDS, verify_tc
+from collections import defaultdict
+
+from tc_system.verification import UNEXECUTABLE_COMMANDS, UNVERIFIABLE_FIELD_VALUES, verify_tc
 from tc_system.execution.expectation_checker import check_step_expectations, check_execution
 
 # Historical command exposure only. Requirement verification is separately
@@ -187,7 +189,10 @@ def _target_rank(section: dict, opcode: dict) -> tuple:
     else:  # index predating risk_class
         risk = 3 if opcode.get("firmware_state") else 2 if opcode.get("destructive") else 0
     authoritative = 0 if opcode.get("section_ref") == section["section_id"] else 1
-    return (risk, authoritative, section["section_id"])
+    # Message-Based Transport (Fabrics) admin commands: a PCIe controller
+    # answers them with INVALID_OPCODE. Still offered, after everything else.
+    fabrics_only = 1 if section["section_id"].startswith("base:5.4.") else 0
+    return (fabrics_only, risk, authoritative, section["section_id"])
 
 
 def pick_next_targets(index, tc_records: list[dict], count: int,
@@ -234,18 +239,37 @@ def pick_next_targets(index, tc_records: list[dict], count: int,
         return []
     candidates = sorted(((section, opcode) for section in index.list_sections()
                          for opcode in index.opcodes_for_section(section)
-                         if opcode.get("name") not in UNEXECUTABLE_COMMANDS), key=key)
+                         if opcode.get("name") not in UNEXECUTABLE_COMMANDS
+                         and not _needs_unverifiable_value(section)), key=key)
+    # Round-robin over commands inside each priority band: sorted by section
+    # id alone, a batch walked straight through one command's sub-clauses
+    # (measured: 22 Persistent Event Log event types back to back).
+    bands = defaultdict(list)
+    for pair in candidates:
+        bands[key(pair)[0]].append(pair)
     picked, seen_sections = [], set()
-    for section, opcode in candidates:
-        # One opcode per clause per batch; the others rotate in on later runs
-        # through pair_attempts.
-        if section["section_id"] in seen_sections:
-            continue
-        seen_sections.add(section["section_id"])
-        picked.append((section, opcode))
-        if len(picked) == count:
-            break
+    for band in sorted(bands):
+        pool, per_command, level = list(bands[band]), defaultdict(int), 0
+        while pool and len(picked) < count:
+            for pair in list(pool):
+                section, opcode = pair
+                if section["section_id"] in seen_sections:  # one opcode per clause per batch
+                    pool.remove(pair)
+                    continue
+                if per_command[opcode["name"]] != level:
+                    continue
+                pool.remove(pair)
+                seen_sections.add(section["section_id"])
+                per_command[opcode["name"]] += 1
+                picked.append(pair)
+                if len(picked) == count:
+                    break
+            level += 1
     return picked
+
+
+def _needs_unverifiable_value(section: dict) -> bool:
+    return any(f.get("field_name") in UNVERIFIABLE_FIELD_VALUES for f in section.get("field_values") or [])
 
 
 # Attempts without a verified requirement or an INVALID_OPCODE after which a

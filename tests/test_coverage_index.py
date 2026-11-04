@@ -1,6 +1,7 @@
 import unittest
 
 import config
+from tc_system.coverage.coverage_state import _needs_unverifiable_value
 from tc_system.verification import UNEXECUTABLE_COMMANDS
 from tc_system.coverage.coverage_state import (UNRESOLVED_ATTEMPT_LIMIT, compute_coverage,
                                               pick_next_targets)
@@ -185,7 +186,8 @@ class TestTargetRotation(unittest.TestCase):
         # Clauses whose every opcode is executable here (Abort/AER are never offered).
         self.testable = [s for s in self.index.list_sections() if self.index.opcodes_for_section(s)
                          and all(o["name"] not in UNEXECUTABLE_COMMANDS
-                                 for o in self.index.opcodes_for_section(s))]
+                                 for o in self.index.opcodes_for_section(s))
+                         and not _needs_unverifiable_value(s)]
 
     def _tc(self, section, status, n=0):
         opcode = self.index.opcodes_for_section(section)[0]
@@ -226,6 +228,22 @@ class TestTargetRotation(unittest.TestCase):
     def test_commands_this_executor_cannot_run_are_never_offered(self):
         picked = pick_next_targets(self.index, [], count=10000)
         self.assertFalse([o["name"] for _, o in picked if o["name"] in UNEXECUTABLE_COMMANDS])
+
+
+    def test_event_type_clauses_are_not_offered(self):
+        # Verifying one needs a variable-length event record found in the log;
+        # measured: all 22 were skipped or tested something else.
+        picked = pick_next_targets(self.index, [], count=10000)
+        self.assertFalse([s["section_id"] for s, _ in picked
+                          if any(f.get("field_name") == "Event Type" for f in s.get("field_values") or [])])
+
+    def test_a_batch_spreads_over_commands(self):
+        names = [o["name"] for _, o in pick_next_targets(self.index, [], count=10)]
+        self.assertEqual(len(names), len(set(names)), names)
+
+    def test_fabrics_only_clauses_come_after_the_others(self):
+        ids = [s["section_id"] for s, _ in pick_next_targets(self.index, [], count=30)]
+        self.assertFalse([sid for sid in ids if sid.startswith("base:5.4.")], ids)
 
 
 if __name__ == "__main__":

@@ -174,6 +174,21 @@ class TestStepsPlanValidation(unittest.TestCase):
         self.assertEqual(out["steps_plan"], prepared(dict(GOOD_STRUCTURED, steps_plan=plan))["steps_plan"])
 
 
+    def test_a_trigger_then_target_plan_is_relabelled_not_rejected(self):
+        # Measured (base:5.2.12.1.14.2.11): "Set Features (action) -> Get Log
+        # Page (verify)" for a Get Log Page clause. Right order, wrong label.
+        plan = [{"opcode_name": "Write", "role": "trigger", "phase": "action"},
+                {"opcode_name": "Read", "role": "observe", "phase": "verify"}]
+        requirements = [{"description": "Read completion", "evidence_id": "spec-fixture",
+                         "quote": EVIDENCE["text"], "checks": [{"kind": "completion", "step": 1}]}]
+        out = _run(dict(GOOD_STRUCTURED, steps_plan=plan, requirements=requirements))
+        self.assertEqual([s["phase"] for s in out["steps_plan"]], ["setup", "action"])
+
+    def test_a_plan_without_the_target_command_is_still_rejected(self):
+        plan = [{"opcode_name": "Write", "role": "x", "phase": "action"}]
+        with self.assertRaisesRegex(ValueError, "not in steps_plan"):
+            _run(dict(GOOD_STRUCTURED, steps_plan=plan))
+
 class TestReplanFeedback(unittest.TestCase):
     def test_feedback_reaches_the_prompt(self):
         captured = {}

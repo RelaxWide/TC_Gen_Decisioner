@@ -108,6 +108,8 @@ def _command_step(section: dict, opcode_entry: dict, nvme_ctrl: str, nvme_ns: st
         # (a real finding) apart from "we authored a malformed argument".
         "field_value_verified": authored.get("field_value_verified", False),
         "args_llm_response_id": authored.get("llm_response_id"),
+        # Bits the harness wrote over the author's reply (scenario field_constraints).
+        "constraint_overrides": authored.get("constraint_overrides", []),
     })
     try:
         validate_fixed_fields(step, step["field_constraints"])

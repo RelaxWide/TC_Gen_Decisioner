@@ -87,16 +87,35 @@ def validate_transfer(fields, opcode_entry, lba_bytes=None):
     if opcode_entry["command_set"] != "ADMIN":
         return
     opcode = int(opcode_entry["raw_opcode"], 16)
-    length = fields["data_len"]
+    length, direction = fields["data_len"], fields["direction"]
+    # The message is fed back to the argument author for its one retry, so it
+    # says where each field lives and what would agree (measured: NUMDL 0x7F
+    # written into CDW11, i.e. NUMDU, asked for 32 MB into a 512-byte buffer,
+    # and the retry repeated it because the error only said "33292292 bytes").
+    fix = None
     if opcode == 0x02:  # Get Log Page NUMDL/NUMDU, both 0-based together.
-        numd = ((integer(fields["cdw11"]) & 0xFFFF) << 16) | (integer(fields["cdw10"]) >> 16)
+        numdu, numdl = integer(fields["cdw11"]) & 0xFFFF, integer(fields["cdw10"]) >> 16
+        numd = (numdu << 16) | numdl
         required = (numd + 1) * 4
-    elif opcode in {0x11, 0x19, 0x1A} and fields["direction"] != "none":
-        required = (integer(fields["cdw10"]) + 1) * 4
+        encoded = (f"NUMD = NUMDU(CDW11[15:0]=0x{numdu:04X})<<16 | NUMDL(CDW10[31:16]=0x{numdl:04X}) "
+                   f"= 0x{numd:X} dwords, 0-based")
+        if length > 0 and length % 4 == 0:
+            want = length // 4 - 1
+            fix = f"CDW10[31:16]=0x{want & 0xFFFF:04X} and CDW11[15:0]=0x{want >> 16:04X}"
+    elif opcode in {0x11, 0x19, 0x1A} and direction != "none":
+        numd = integer(fields["cdw10"])
+        required = (numd + 1) * 4
+        encoded = f"NUMD = CDW10 = 0x{numd:X} dwords, 0-based"
+        if length > 0 and length % 4 == 0:
+            fix = f"CDW10=0x{length // 4 - 1:08X}"
     elif opcode == 0x06:
-        required = 4096
+        required, encoded = 4096, "Identify always returns one 4096-byte data structure"
     else:
         return
-    if length != required or fields["direction"] == "none":
-        raise ValueError(f"{opcode_entry['name']} encodes {required} bytes but buffer is {length} "
-                         f"with direction={fields['direction']}")
+    if length != required or direction == "none":
+        message = (f"{opcode_entry['name']}: {encoded} -> {required} bytes, but data_len={length} "
+                   f"direction={direction}. Make them agree: data_len={required} with direction=read/write "
+                   "as the opcode requires")
+        if fix and length != required:
+            message += f", or for data_len={length} set {fix} (keep the other bits)"
+        raise ValueError(message)

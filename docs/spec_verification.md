@@ -31,9 +31,11 @@
 
 건너뛴 타겟은 `data/target_skips.json`에 남아 시도 횟수로 세며, 3회가 쌓이면 후순위로 밀린다. 아래가 전부다.
 
+타겟으로 아예 뽑지 않는 것: Abort/AER(순차 실행기로 만들 수 없음), Event Type 조항 22개(가변 길이 이벤트 레코드를 찾아야 검증되며 고정 오프셋 검증식으로는 불가). Fabrics 전용(base:5.4.x)은 뒤로 미루고, 한 배치 안에서는 커맨드를 돌아가며 뽑는다.
+
 1. **시나리오 생성** (`scenario contract invalid: ...`, 오류 문구를 주고 1회 재시도)
    - LLM 응답 실패: 호출 실패, 빈 응답, JSON 파싱 실패, 스키마 키 누락.
-   - 체인 구조: 스텝 없음/객체 아님, action이 정확히 1개가 아님, action이 타겟 커맨드가 아님, 목록에 없는 커맨드, 잘못된 phase, setup이 action 뒤·verify가 action 앞.
+   - 체인 구조: 스텝 없음/객체 아님, action이 2개 이상, 타겟 커맨드가 체인에 없음(있으면 그 스텝을 action으로 고침), 목록에 없는 커맨드, 잘못된 phase, setup이 action 뒤·verify가 action 앞.
    - 실행기 한계: 어느 스텝이든 Abort/AER.
    - **action 스텝**: 기대 완료 상태 누락, 선택자/주소 필드(FID/SEL, LID, CNS, Directive, Commit, SLBA/NLB) 미고정.
    - 고정 필드·`payload_hex` 형식 오류(필드 이름, mask/value 모순, hex 아님).
