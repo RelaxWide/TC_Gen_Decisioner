@@ -80,6 +80,26 @@ def get_pmu():
     return pmu if pmu.get("enabled") and pmu.get("script") else None
 
 
+def pmu_status():
+    """(settings or None, why it is off) for the start-of-run line: a PMU
+    section that is present but disabled or incomplete used to switch the
+    power cycle off without a word (2026-11-06 run)."""
+    enabled = get_pmu()
+    if enabled:
+        return enabled, ""
+    try:
+        pmu = _load_secrets().get("pmu")
+    except Exception:  # noqa: BLE001
+        return None, "secrets.local.json 없음"
+    if not pmu:
+        return None, "secrets.local.json에 pmu 항목 없음"
+    if not pmu.get("enabled"):
+        return None, "pmu.enabled=false"
+    if not pmu.get("script"):
+        return None, "pmu.script(대상 호스트의 pmu_4_1.py 경로) 없음"
+    return None, "PMU 설정을 읽지 못함"
+
+
 def get_ssh_target():
     secrets = _load_secrets()
     return {

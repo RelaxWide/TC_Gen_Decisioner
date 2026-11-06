@@ -20,7 +20,7 @@ import json
 import re
 
 from tc_system import spec_fields
-from tc_system.verification import (canonical_status, completion_status, expected_status, integer, payload_for_step,
+from tc_system.verification import (FIRMWARE_PENDING_NOTE, canonical_status, completion_status, expected_status, integer, payload_for_step,
                                     plain_text, selector_in_text, validate_check, _UNSUPPORTED_PREMISE_RE)
 
 LEVELS = ("info", "recommend", "must")
@@ -150,6 +150,9 @@ def code_review(tc, verdict=None):
             _reason(reasons, "recommend", "premise_refuted", issue)
         if "사전조건 미측정" in issue:
             _reason(reasons, "must" if status == "FAIL" else "recommend", "premise_unmeasured", issue)
+        if FIRMWARE_PENDING_NOTE in issue:
+            # Someone has to reset the drive; every later TC runs in this state.
+            _reason(reasons, "must", "fw_activation_pending", issue)
 
     # Setup step refused: the action never ran in the intended state.
     action_idx = next((i for i, s in enumerate(steps) if s.get("phase") == "action"), len(steps))
@@ -167,6 +170,13 @@ def code_review(tc, verdict=None):
             continue
         if r.get("cleanup_skipped"):
             _reason(reasons, "must", "cleanup_skipped", f"원복 스텝 {i} {steps[i].get('name')} 생략: {r['cleanup_skipped']}")
+        elif r and completion_status(r) == "INVALID_OPCODE":
+            # The restore command itself is not implemented: the same command
+            # cannot have changed anything either (2026-11-06: a Capacity
+            # Management cleanup after an unsupported action was "꼭 확인").
+            _reason(reasons, "recommend", "cleanup_failed",
+                    f"원복 스텝 {i} {steps[i].get('name')}가 INVALID_OPCODE — 이 커맨드는 미지원이라 바꾼 상태도 없을 것"
+                    " (다른 변경 스텝이 성공했는지 확인)")
         elif r and completion_status(r) != "SUCCESS":
             _reason(reasons, "must", "cleanup_failed",
                     f"원복 스텝 {i} {steps[i].get('name')}가 성공하지 않음: {completion_status(r) or r.get('stdout', '')[:120]}")
@@ -217,6 +227,12 @@ def code_review(tc, verdict=None):
                         and c.get("kind") == "data_field" and c.get("step") == check.get("step")
                         for i in [spec_fields.interpret_check(c, structure)] if i and i.get("field")}
             problem = spec_fields.check_matches_description(check, structure, group.get("description"), siblings)
+            read = spec_fields.interpret_check(check, structure) or {}
+            if not problem and "정의되지 않은 비트" in str(read.get("label")):
+                # 2026-11-06: "VERS" premises read SANICAP bit 4 / bit 9.
+                _reason(reasons, "recommend", "undefined_bit",
+                        f"{label} '{group.get('description', '')[:70]}'의 검사식이 {read['label']}를 읽음 — "
+                        "설명한 필드인지 확인할 수 없음")
             if problem:
                 gating = label == "사전조건" and group.get("description", "") and group["description"] in blocked_by
                 level = "must" if status in ("PASS", "FAIL") else "recommend"
@@ -254,9 +270,19 @@ def code_review(tc, verdict=None):
                     "설정값 저장/조회만 관측 — 인용이 말하는 동작(인터럽트/이벤트/원자성/전원 등)은 시험하지 않음")
         if expected_status(action).startswith("INVALID") and action.get("selector_support") is None \
                 and action.get("mode") == "admin-passthru" and _raw_op(action) in (0x02, 0x09, 0x0A):
-            _reason(reasons, "recommend", "support_unknown",
-                    "부정 테스트 PASS인데 그 FID/LID의 지원 여부가 측정되지 않음 — 거부 원인이 의도한 필드인지 불확실")
+            if tc.get("variant_id"):
+                # A code variant of a value the spec table reserves, every
+                # other field 0: the oracle is the table, not a device claim
+                # (2026-11-06: 63 reserved-FID PASSes all "확인 권장").
+                _reason(reasons, "info", "support_unknown",
+                        "예약값 변형: 이 FID/LID는 시작 조회 범위 밖이라 장비 지원 여부는 측정하지 않음 — "
+                        "근거는 스펙 표의 Reserved(다른 필드는 전부 0)")
+            else:
+                _reason(reasons, "recommend", "support_unknown",
+                        "부정 테스트 PASS인데 그 FID/LID의 지원 여부가 측정되지 않음 — 거부 원인이 의도한 필드인지 불확실")
         for req in verification.get("requirements") or []:
+            if req.get("unobserved"):
+                _reason(reasons, "recommend", "target_unobserved", f"'{req.get('description', '')[:60]}': {req['unobserved']}")
             kinds = {c.get("kind") for c in req.get("checks") or []}
             text = f"{req.get('quote', '')} {req.get('description', '')}"
             if _ALL_RE.search(text) and "data_field" in kinds and not kinds & {"data_all", "data_equal", "data_matches_write"}:
@@ -287,7 +313,9 @@ def code_review(tc, verdict=None):
         if cls == "firmware_defect":
             _reason(reasons, "must", "verdict_defect", f"판정 LLM: 펌웨어 결함 의심({verdict.get('confidence')})")
         elif cls == "needs_engineer_review":
-            _reason(reasons, "must", "verdict_review", "판정 LLM: 엔지니어 검토 필요")
+            # Only a FAIL is a defect candidate; on ERROR the harness already
+            # holds the verdict (2026-11-06: 7 of 8 "꼭 확인" ERRORs were this).
+            _reason(reasons, "must" if status == "FAIL" else "recommend", "verdict_review", "판정 LLM: 엔지니어 검토 필요")
         elif cls == "test_env_issue" and status == "FAIL":
             _reason(reasons, "must", "verdict_conflict",
                     "기계 판정은 FAIL인데 판정 LLM은 테스트/환경 문제로 봄 — 테스트 정의를 고친 뒤 재평가 대상")
@@ -337,11 +365,28 @@ AUDIT_SYSTEM_PROMPT = (
     "the requirement (a fragment, a condition about another controller type, a SHOULD), a PASS that observed "
     "only a configuration round trip or an unsupported-command response, a FAIL whose premise (e.g. 'this value "
     "is unsupported') was never measured, a state the test changed and did not restore. decoded_checks are "
-    "computed by code from the spec tables and are authoritative about which field a check reads. Only raise "
+    "computed by code from the spec tables and are authoritative about which field a check reads; likewise "
+    "steps[].decoded gives each command's register fields decoded by code from the spec's command layouts and "
+    "steps[].cdw*/data_len are the values actually sent - never re-decode cdw values yourself. Only raise "
     "an objection you can point to in the given data (cite step index, field, value). level \"must\" means the "
-    "result is likely wrong; \"recommend\" means it is narrower than claimed. An empty list is a valid answer. "
+    "result is likely wrong and you can point to a decoded field, a sent value or an observed status that "
+    "shows it; \"recommend\" means it is narrower than claimed. An empty list is a valid answer. "
     "Write text, evidence and summary in Korean (한국어)."
 )
+
+
+def decode_command(step, sent=None):
+    """{field: value} for the registers this step sent, by the spec layout
+    (`command_fields.REGISTER_LAYOUTS`). 2026-11-06: the auditor LLM decoded
+    CDW10 itself and raised "꼭 확인" on LID 7Fh (it was NUMDL; LID 00h),
+    Firmware Commit CA=000b (0x19 is CA=011b FS=1) and QID 1 (0x00018000 is
+    QID 8000h)."""
+    from tc_system.command_fields import decode_fields
+    command_set = {"admin-passthru": "ADMIN", "io-passthru": "NVM"}.get(step.get("mode"))
+    raw = _raw_op(step)
+    if command_set is None or raw is None:
+        return None
+    return decode_fields(command_set, raw, dict(step, **(sent or {})))
 
 
 def _audit_prompt(tc, reasons):
@@ -351,9 +396,13 @@ def _audit_prompt(tc, reasons):
     for i, s in enumerate(steps):
         r = results.get(i) or {}
         code = spec_fields.status_code_in_output(r.get("stdout", ""))
+        # What went on the wire: a restore step's value is filled in at run
+        # time (the plan's CDW11=0 was read as "restored to a fixed 0").
+        sent = {k: v for k, v in (r.get("sent") or {}).items() if v is not None}
         view.append({"index": i, "name": s.get("name"), "phase": s.get("phase"), "role": s.get("role"),
                      "harness": s.get("harness"), "nsid": s.get("nsid"),
-                     **{k: s.get(k) for k in ("cdw10", "cdw11", "cdw12", "cdw13", "data_len", "direction")},
+                     **{k: sent.get(k, s.get(k)) for k in ("cdw10", "cdw11", "cdw12", "cdw13", "data_len", "direction")},
+                     "decoded": decode_command(s, sent),
                      "payload_hex": (s.get("payload_hex") or "")[:64] or None,
                      "expected_status": s.get("expected_status"), "completion": completion_status(r),
                      "status_code": code and {"sct": code[0], "sc": f"{code[1]:02X}h"},
@@ -402,12 +451,35 @@ def llm_audit(tc, reasons):
     return out, llm.get("response_id")
 
 
+# Code reasons that come from an LLM (the judge) do not corroborate the auditor.
+_NOT_INDEPENDENT = {"verdict_defect", "verdict_review", "verdict_conflict", "llm_audit"}
+
+
+def escalation(tc, code_reasons, objections):
+    """The auditor's "must" stands on a FAIL (the engineer looks at it anyway,
+    and a doubt about its premise belongs there) or when code independently
+    flagged the same TC. Alone it is "recommend": in the 2026-11-06 run, 67 of
+    88 "꼭 확인" came from the auditor alone - 41 on code variants, several
+    from registers it decoded wrongly. The engineer wants the must list to be
+    what must be looked at; nothing is dropped, only the level."""
+    corroborated = any(r["level"] in ("recommend", "must") and r["code"] not in _NOT_INDEPENDENT
+                       and r.get("source") == "code" for r in code_reasons)
+    if tc.get("status") == "FAIL" or corroborated:
+        return objections
+    return [dict(o, level="recommend", llm_level="must", text="(LLM 단독 의견) " + o["text"])
+            if o["level"] == "must" else o for o in objections]
+
+
 def review_tc(tc, verdict=None, use_llm=False):
     reasons = code_review(tc, verdict)
     audit_id = None
-    if use_llm and tc.get("status") in ("PASS", "FAIL"):
+    # A code variant's PASS is one code-built command whose oracle is the spec
+    # table: nothing for an auditor to find (2026-11-06: 93 audit calls, and
+    # most of their "꼭 확인" objections were "support not measured").
+    variant_pass = bool(tc.get("variant_id")) and tc.get("status") == "PASS"
+    if use_llm and tc.get("status") in ("PASS", "FAIL") and not variant_pass:
         objections, audit_id = llm_audit(tc, reasons)
-        reasons += objections
+        reasons += escalation(tc, reasons, objections)
     level = max((r["level"] for r in reasons), key=LEVELS.index, default="info")
     return {"level": level, "label": LEVEL_LABELS[level], "reasons": reasons,
             "scope": claim_scope(tc) if tc.get("status") == "PASS" else None, "audit_llm_response_id": audit_id}
@@ -418,7 +490,8 @@ def downgrade_verdict(verdict, review):
     cannot stand alone (measured: Self-test judged firmware_defect 0.75 on a
     check that ignored the newer, passing self-test result)."""
     blocking = {"status_alias", "self_length", "wrong_field", "role_selector", "roundtrip_expectation",
-                "setup_failed", "premise_refuted", "premise_unmeasured", "in_progress_once", "actor"}
+                "setup_failed", "premise_refuted", "premise_unmeasured", "in_progress_once", "actor",
+                "fw_activation_pending"}
     hits = [r["text"] for r in review.get("reasons", []) if r["code"] in blocking and r["source"] == "code"]
     if verdict and verdict.get("classification") == "firmware_defect" and hits:
         verdict = dict(verdict, classification="needs_engineer_review",

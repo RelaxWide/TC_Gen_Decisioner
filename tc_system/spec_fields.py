@@ -97,6 +97,11 @@ ID_CTRL = {
         "NVMDSMSV": _b(2, "Dataset Management"), "NVMWZSV": _b(3, "Write Zeroes"),
         "SSFS": _b(4, "Save and Select", "Save/Select"), "RESERVS": _b(5, "Reservation"),
         "TSS": _b(6, "Timestamp"), "NVMVFYS": _b(7, "Verify"), "NVMCPYS": _b(8, "Copy"),
+        # Not in the local ONCS table; Base 2.3 (ratified 2025-08-01, the
+        # same date as the local NVM Command Set 1.2) puts it at bit 12. Without
+        # it the model read NVMWZSV (bit 3, Write Zeroes) as "NSZ supported"
+        # and three Write Zeroes FAILs demanded a whole-namespace clear.
+        "NSZS": _b(12, "Namespace Zeroes"),
     }, ("Optional NVM Command Support",)),
     "FUSES": _f(522, 2), "FNA": _f(524, 1, names=("Format NVM Attributes",)),
     "VWC": _f(525, 1, {"VWCP": _b(0, "Volatile Write Cache Present")}, ("Volatile Write Cache",)),
@@ -385,6 +390,15 @@ STATUS_CODES = {
     "WRITE_FAULT": (2, 0x80), "READ_ERROR": (2, 0x81), "GUARD_CHECK": (2, 0x82), "APPTAG_CHECK": (2, 0x83),
     "REFTAG_CHECK": (2, 0x84), "COMPARE_FAILED": (2, 0x85), "ACCESS_DENIED": (2, 0x86),
     "UNWRITTEN_BLOCK": (2, 0x87),
+    # Added after the 2026-11-06 run, each from the local spec's status tables
+    # (Figures 102 generic, 103/104 command specific, 107 path related):
+    # expected statuses the model named that resolved to no code were compared
+    # by name only, and READ_ERROR (2/81h) "violated" UNRECOVERED_ERROR.
+    "INVALID_USE_OF_CONTROLLER_MEMORY_BUFFER": (0, 0x12), "HOST_IDENTIFIER_INCONSISTENT_FORMAT": (0, 0x18),
+    "FDP_DISABLED": (0, 0x29), "SANITIZE_PROHIBITED_WHILE_PERSISTENT_MEMORY_REGION_IS_ENABLED": (1, 0x23),
+    "INSUFFICIENT_CAPACITY": (1, 0x26), "INVALID_POWER_LIMIT": (1, 0x3E), "FAST_COPY_NOT_POSSIBLE": (1, 0x86),
+    "OVERLAPPING_I_O_RANGE": (1, 0x87),
+    "ANA_PERSISTENT_LOSS": (3, 0x01), "ANA_INACCESSIBLE": (3, 0x02), "ANA_TRANSITION": (3, 0x03),
 }
 # Rejections of the command's own parameters: the controller aborts the
 # command instead of processing it, so the value it would set is untouched.
@@ -422,6 +436,17 @@ STATUS_NAMES = {
     "ATTEMPTED_WRITE_TO_READ_ONLY_RANGE": "READ_ONLY_RANGE", "UNRECOVERED_READ_ERROR": "READ_ERROR",
     "END_TO_END_GUARD_CHECK_ERROR": "GUARD_CHECK", "COMPARE_FAILURE": "COMPARE_FAILED",
     "DEALLOCATED_OR_UNWRITTEN_LOGICAL_BLOCK": "UNWRITTEN_BLOCK", "INVALID_FORMAT": "INVALID_FORMAT",
+    # Spellings the model used in the 2026-11-06 run.
+    "COMMAND_SIZE_LIMIT_EXCEEDED": "CMD_SIZE_LIMIT_EXCEEDED",
+    "FIRMWARE_ACTIVATION_REQUIRES_CONVENTIONAL_RESET": "FW_NEEDS_CONV_RESET",
+    "FIRMWARE_ACTIVATION_REQUIRES_CONTROLLER_LEVEL_RESET": "FW_NEEDS_RESET",
+    "FIRMWARE_ACTIVATION_REQUIRES_NVM_SUBSYSTEM_RESET": "FW_NEEDS_SUBSYS_RESET",
+    "DULB": "UNWRITTEN_BLOCK", "DEALLOCATED": "UNWRITTEN_BLOCK", "INSUFFICIENT_CAP": "INSUFFICIENT_CAPACITY",
+    "NAMESPACE_WRITE_PROTECTED": "NS_WRITE_PROTECTED", "INVALID_PROT_INFO": "INVALID_PI",
+    "UNRECOVERED_ERROR": "READ_ERROR", "INVALID_QUEUE_ID": "QID_INVALID", "COMPARE_FAIL": "COMPARE_FAILED",
+    "INVALID_NS_OR_FORMAT": "INVALID_NS", "OVERLAPPING_IO_RANGE": "OVERLAPPING_I_O_RANGE",
+    "ASYMMETRIC_ACCESS_PERSISTENT_LOSS": "ANA_PERSISTENT_LOSS",
+    "ASYMMETRIC_ACCESS_INACCESSIBLE": "ANA_INACCESSIBLE", "ASYMMETRIC_ACCESS_TRANSITION": "ANA_TRANSITION",
 }
 _STATUS_VALUE_RE = re.compile(r"NVMe status:[^\n]*\((0x[0-9a-fA-F]+)\)")
 

@@ -355,7 +355,7 @@ def plan_state_restore(steps: list[dict], nvme_ctrl: str, nvme_ns: str, lba_byte
 
 
 def _shift_repairs(repairs, n):
-    return [dict(r, step=r["step"] + n) for r in repairs or []]
+    return [dict(r, step=r["step"] + n) if isinstance(r.get("step"), int) else r for r in repairs or []]
 
 
 def _shift_checks(groups, n):

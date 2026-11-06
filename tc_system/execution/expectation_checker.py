@@ -12,7 +12,8 @@ leaves stdout empty, so without that merge these rules can never fire.
 """
 import re
 
-from tc_system.verification import (HOST_ERROR_RE, KERNEL_ABORT_RE, completion_status, matches_expected,
+from tc_system.verification import (FIRMWARE_PENDING_NOTE, HOST_ERROR_RE, KERNEL_ABORT_RE, completion_status,
+                                    matches_expected,
                                     expected_status, payload_for_step, verify_tc)
 
 TIMEOUT_MARKERS = ("timed out", "TimeoutExpired", "command timeout", "I/O timeout")
@@ -393,7 +394,8 @@ def check_expectation(tc_record: dict, execution_result: dict) -> str:
         # leaves it unjudged (review R07: an unmeasured "Discovery controller"
         # premise still produced FAIL and a firmware-defect verdict).
         if verification["status"] != "FAIL" and any(
-                "전제가 장비 응답으로 반증" in issue or "사전조건 미측정" in issue for issue in verification["issues"]):
+                "전제가 장비 응답으로 반증" in issue or "사전조건 미측정" in issue or FIRMWARE_PENDING_NOTE in issue
+                for issue in verification["issues"]):
             return "UNVERIFIED"
     if status != "PASS":
         return status

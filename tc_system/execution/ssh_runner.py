@@ -12,6 +12,7 @@ with raw shell interpolation.
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -213,7 +214,7 @@ def _timed_plink(target: dict, command: str, stage: str, **kwargs):
     }
 
 
-def probe_device_capabilities(nvme_ctrl: str, nvme_ns: str) -> dict[str, str]:
+def probe_device_capabilities(nvme_ctrl: str, nvme_ns: str, pmu_script: str | None = None) -> dict[str, str]:
     """Runs a handful of read-only diagnostic nvme-cli commands against the
     real target once per pipeline run (not once per TC) and returns their raw
     stdout, keyed by a fixed label — Identify Controller/Namespace plus (best
@@ -249,9 +250,14 @@ def probe_device_capabilities(nvme_ctrl: str, nvme_ns: str) -> dict[str, str]:
         # ERRORs were Get Features/Get Log Page of features the drive lacks).
         ("supported_logs", f"sudo nvme get-log {nvme_ctrl} --log-id=0 --log-len=1024 2>&1"),
         ("fid_support", fid_loop),
+        # Firmware Slot Information: a committed image waiting for a reset
+        # makes Sanitize and others abort with "Firmware Activation Requires
+        # ... Reset" (2026-11-06: AFI 11h left by an earlier Firmware Commit).
+        ("fw_log", f"sudo nvme fw-log {nvme_ctrl} 2>&1"),
         # Recorded in the run manifest: results depend on the host tool too.
         ("host_versions", "nvme version 2>&1; uname -r"),
-    ):
+    ) + ((("pmu_script", f"if [ -f {shlex.quote(pmu_script)} ] && command -v python3 >/dev/null; "
+                         "then echo PMU_SCRIPT_OK; else echo PMU_SCRIPT_MISSING; fi"),) if pmu_script else ()):
         proc, stage = _timed_plink(target, cmd, f"probe_{key}", timeout=30)
         log_record["stages"].append(stage)
         outputs[key] = proc.stdout

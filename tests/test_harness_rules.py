@@ -55,7 +55,7 @@ SPEC_CHUNKS = config.RAG_INDEX_DIR / "v20260922_172200" / "chunks.jsonl"
 # row we can match (split across pages / OCR). Listed so a new entry must be
 # confirmed against the spec or added here on purpose.
 UNCONFIRMED = {"OAES.NSAN", "CTRATT.FDPS", "FRMW.SLOT1RO", "LPA.SMARTS", "LPA.CSES", "LPA.LPEDS", "LPA.TS",
-               "LPA.PELS", "HCTMA.HCTMS", "SANICAP.NODMMAS", "ONCS.TSS", "ONCS.NVMVFYS", "ONCS.NVMCPYS",
+               "LPA.PELS", "HCTMA.HCTMS", "SANICAP.NODMMAS", "ONCS.TSS", "ONCS.NVMVFYS", "ONCS.NVMCPYS", "ONCS.NSZS",
                "VWC.VWCP", "NMIC.SHRNS"}
 UNCONFIRMED_ROWS = {"HMMAXD", "SGLS", "LBAF0"}
 

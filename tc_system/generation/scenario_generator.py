@@ -223,7 +223,11 @@ def _validate_steps_plan(plan, opcode_entry: dict, available_opcodes: list[dict]
     for i, step in enumerate(plan):
         name = step.get("opcode_name")
         if name not in by_name:
-            raise ValueError(f"step {i} names {name!r}, which is not in available_commands")
+            hint = (" - this run has no PMU board (secrets.local.json pmu.enabled/script, or the script is missing "
+                    "on the target): do not plan a power cycle; use 'Controller Reset' only if the sentence allows "
+                    "a reset, otherwise test what is observable without one"
+                    if str(name).lower().startswith("power cycle") else "")
+            raise ValueError(f"step {i} names {name!r}, which is not in available_commands{hint}")
         phase = step.get("phase")
         if phase not in ("setup", "action", "verify", "cleanup"):
             raise ValueError(f"step {i} has invalid phase {phase!r}")
@@ -244,6 +248,15 @@ def _validate_steps_plan(plan, opcode_entry: dict, available_opcodes: list[dict]
     # risk_class here is only ever a batch-ordering preference, not a hard
     # safety limit, so it has no business blocking a legitimate plan.
     return plan
+
+
+def run_capabilities(available_opcodes):
+    """What THIS run can do: the host-step capabilities only when the step is
+    offered. 2026-11-06: "power_cycle" was always listed while no PMU was
+    configured; the model planned "Power Cycle (PMU)" and the plan was refused
+    ("not in available_commands") - Flush and FUA targets skipped."""
+    offered = {o.get("host_action") for o in available_opcodes if o.get("host_action")}
+    return {c for c in CAPABILITIES if c not in ("controller_reset", "power_cycle") or c in offered}
 
 
 def generate_scenario(section: dict, opcode_entry: dict, available_opcodes: list[dict],
@@ -275,7 +288,7 @@ def generate_scenario(section: dict, opcode_entry: dict, available_opcodes: list
         f"spec_doc={section['spec_doc']} section={section['section_id']} title={section['title']} "
         f"opcode={opcode_entry['raw_opcode']} command_set={opcode_entry['command_set']}\n"
         f"available_commands={', '.join(available_names)}\n"
-        f"executor_capabilities={sorted(CAPABILITIES)}\n"
+        f"executor_capabilities={sorted(run_capabilities(available_opcodes))}\n"
         f"previously_verified_requirements={json.dumps(section.get('previous_requirements', []), ensure_ascii=False)}\n"
         f"spec_context=\n" + format_evidence(rag["chunks"])
     )

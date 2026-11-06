@@ -418,7 +418,7 @@ NVM_OPS = [{"name": "Write", "raw_opcode": "0x01", "command_set": "NVM"}, NVM_RE
 def _io(opcode, slba=0, nlb0=0, data_len=512, direction="read", payload=None, nsid=1, phase="action"):
     step = {"mode": "io-passthru", "device": "/dev/nvme0n1", "opcode": opcode, "nsid": nsid, "phase": phase,
             "cdw10": hex(slba & 0xFFFFFFFF), "cdw11": hex(slba >> 32), "cdw12": hex(nlb0),
-            "data_len": data_len, "direction": direction, "expected_status": "SUCCESS"}
+            "data_len": data_len, "direction": direction, "expected_status": "SUCCESS", "lba_bytes": 512}
     if payload is not None:
         step["payload_hex"] = payload
     return step

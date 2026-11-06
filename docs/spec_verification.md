@@ -54,22 +54,26 @@
 
 타겟으로 아예 뽑지 않는 것: Abort/AER(순차 실행기로 만들 수 없음), Event Type 조항 22개(가변 길이 이벤트 레코드를 찾아야 검증되며 고정 오프셋 검증식으로는 불가). Fabrics 전용(base:5.4.x)은 뒤로 미루고, 한 배치 안에서는 커맨드를 돌아가며 뽑는다.
 
-0. **LLM 호출 전**: 같은 실행에서 그 커맨드가 이미 INVALID_OPCODE로 미지원 확인됨(`opcode_unsupported_in_run`, 다음 실행부터는 답이 있는 타겟으로 뒤로 밀림). 리셋/전원 사이클 전후 문장인데 이 실행에서 쓸 수 있는 호스트 스텝이 없음(전원 사이클만 되는 문장 + PMU 미설정 또는 `--no-destructive`, `host_step_unavailable`).
+0. **LLM 호출 전**: 같은 실행에서 그 커맨드가 이미 미지원으로 확인됨(`opcode_unsupported_in_run` — action이 INVALID_OPCODE였거나, 사전조건이 그 커맨드 자신의 지원 비트(OACS/ONCS의 해당 비트, CSE CSUPP)를 0으로 읽어 action을 보내지 않은 경우. 다음 실행부터는 답이 있는 타겟으로 뒤로 밀림). 리셋/전원 사이클 전후 문장인데 이 실행에서 쓸 수 있는 호스트 스텝이 없음(전원 사이클만 되는 문장 + PMU 미설정 또는 `--no-destructive`, `host_step_unavailable`).
 1. **시나리오 생성** (`scenario contract invalid: ...`, 오류 문구를 주고 1회 재시도)
    - LLM 응답 실패: 호출 실패, 빈 응답, JSON 파싱 실패, 스키마 키 누락.
    - 체인 구조: 스텝 없음/객체 아님, action이 2개 이상, 타겟 커맨드가 체인에 없음(있으면 그 스텝을 action으로 고침), 목록에 없는 커맨드, 잘못된 phase, setup이 action 뒤·verify가 action 앞.
    - 실행기 한계: 어느 스텝이든 Abort/AER. I/O 큐 Create/Delete를 성공으로 기대하거나 QID가 0도 0x8000 이상도 아님(드라이버가 쓰는 큐·PRP 없음). Set Features로 HMB(FID 0Dh) 변경.
-   - 필드 검사: 이름 모르는 필드, 구조(CNS/LID)를 알 수 없는 스텝의 이름 검사, 설명과 다른 필드·비트·0/1 조건, 필드 경계를 어긋난 오프셋, 역할의 FID/LID/CNS와 다른 고정값, 항상 참인 검사, `data_length`만 있는 요구사항, cleanup 스텝을 확인하는 요구사항.
+   - 필드 검사: 이름 모르는 필드, 구조(CNS/LID)를 알 수 없는 스텝의 이름 검사(offset/width/mask/value가 다 있으면 이름은 라벨로 보고 통과), 설명과 다른 필드·비트·0/1 조건, 필드 경계를 어긋난 오프셋, 역할의 FID/LID/CNS와 다른 고정값, 항상 참인 검사, `data_length`만 있는 요구사항, cleanup 스텝을 확인하는 요구사항.
    - 지원 전제(실행 시작 조회가 있을 때): 지원한다고 확인된 LID에 INVALID_LOG_PAGE 기대, 미지원 FID로 다른 필드의 INVALID_FIELD를 시험. 지원 여부를 모르면 실행하되 "사전조건 미측정"으로 기록.
    - **action 스텝**: 기대 완료 상태 누락, 선택자/주소 필드(FID/SEL, LID, CNS, Directive, Commit, SLBA/NLB) 미고정.
+   - 기대 완료 상태가 (SCT, SC) 코드로 풀리지 않는 이름(어느 스텝이든 SUCCESS가 아니면): 이름으로만 비교하면 같은 코드의 다른 철자가 "위반"이 된다(2026-11-06: READ_ERROR 2/81h vs UNRECOVERED_ERROR). 오류에 가까운 상태 이름을 제안한다.
    - 고정 필드·`payload_hex` 형식 오류(필드 이름, mask/value 모순, hex 아님).
    - 요구사항: 없음, 설명/검증식 없음, 인용이 근거에 없음(번역·의역·의미 반전), action을 확인하는 요구사항이 하나도 없음, 검증식 형식 오류.
    - 타겟 요구사항: 그 문장을 인용하는 요구사항이 없음, 거부 규칙인데 action의 기대 상태가 그 상태가 아님, 리셋/전원 사이클 전후 문장인데 호스트 스텝이 없거나 요구사항이 그 스텝 뒤를 확인하지 않음.
-   - 데이터 비교: 쓰기 비교인데 상대가 쓰기가 아님/0이 아닌 패턴 없음, 읽는 LBA가 쓴 범위 밖, LBA와 비-LBA 비교.
+   - 데이터 비교: 쓰기 비교인데 상대가 쓰기가 아님/0이 아닌 패턴 없음, 읽는 LBA가 쓴 범위 밖, LBA와 비-LBA 비교, 스스로 바뀌는 로그(LID 02h/03h) 전체 비교.
+   - 반환 레이아웃: Get Features 완료 DW0의 정의되지 않은(예약) 비트 검사, SEL=011b 결과에서 bits 2:0 밖 검사.
    - 사전조건/메모가 배열이 아님, 사전조건 검증식 형식 오류.
-2. **인자 생성** (`placeholder command arguments`, 스텝마다 1회 재시도, 어느 스텝이든 실패하면 TC 전체): LLM 실패, cdw 형식, direction 값이 read/write/none이 아님, 허용 밖 nsid(관리 명령은 기대 상태가 INVALID_NS일 때만 다른 NSID 허용, I/O 명령은 활성 NSID만 — 커널이 다른 값을 장치에 보내기 전에 버림), 위험한 큐 명령, HMB Set Features, data_len 범위, 버퍼 크기를 계산할 수 없는 커맨드의 빈 전송(방향은 있는데 data_len=0)·버퍼 없는 커맨드에 data_len, 선택자 레지스터 위치 불일치, 고정 필드 위반, 시나리오가 길이 필드와 data_len을 둘 다 고정했는데 서로 어긋남, payload가 data_len보다 김. 길이 필드(NUMD/NLB)↔data_len 불일치, opcode 방향 비트 모순, Get/Set Features의 FID별 버퍼 크기(HMB 4096B, Timestamp 8B, APST 256B, Host Behavior·PLM 512B, LBA Range Type 4096B, SEL=011b·값이 DW0인 FID는 0), 조항 선택자(LID/FID/CNS) 값은 거부하지 않고 하네스가 계산해 쓴다(`derive_transfer`, 터미널 `하네스 계산값 적용`/`시나리오 고정값 적용`). Identify Controller/Namespace setup·verify 스텝은 LLM 없이 코드가 만든다.
+2. **인자 생성** (`placeholder command arguments`, 스텝마다 1회 재시도, 어느 스텝이든 실패하면 TC 전체): LLM 실패, 스텝 역할의 `NAME=값`(DEAC, NSZ, CA, SEL 등)과 실제 인코딩 불일치, 성공을 기대하는 Set Features의 CDW11 예약 비트, cdw 형식, direction 값이 read/write/none이 아님, 허용 밖 nsid(관리 명령은 기대 상태가 INVALID_NS일 때만 다른 NSID 허용, I/O 명령은 활성 NSID만 — 커널이 다른 값을 장치에 보내기 전에 버림), 위험한 큐 명령, HMB Set Features, data_len 범위, 버퍼 크기를 계산할 수 없는 커맨드의 빈 전송(방향은 있는데 data_len=0)·버퍼 없는 커맨드에 data_len, 선택자 레지스터 위치 불일치, 고정 필드 위반, 시나리오가 길이 필드와 data_len을 둘 다 고정했는데 서로 어긋남, payload가 data_len보다 김. 길이 필드(NUMD/NLB)↔data_len 불일치, opcode 방향 비트 모순, Get/Set Features의 FID별 버퍼 크기(HMB 4096B, Timestamp 8B, APST 256B, Host Behavior·PLM 512B, LBA Range Type 4096B, SEL=011b·값이 DW0인 FID는 0), 조항 선택자(LID/FID/CNS) 값은 거부하지 않고 하네스가 계산해 쓴다(`derive_transfer`, 터미널 `하네스 계산값 적용`/`시나리오 고정값 적용`). Identify Controller/Namespace setup·verify 스텝은 LLM 없이 코드가 만든다.
 3. **전송 직전**: `--no-destructive`에서 파괴적/펌웨어 스텝, 스텝 형식 검증 실패, I/O 명령 nsid가 네임스페이스 장치와 다름, 위험한 큐 명령, HMB Set Features.
 4. **헬스체크 실패**: 앞 TC 뒤 장비 무응답이면 남은 타겟 전체(시도 횟수에 넣지 않음).
+
+거부하지 않고 하네스가 고쳐 쓰는 형식 실수(`check_repairs`, 터미널 `검사식 보정`): offset/width가 있는 검사의 종류 이름(`offset`/`data` → `data_field`), mask 없는 `data_field`(폭 전체), 이름에 적은 오프셋(`GENCTR@0+8`), mask 없는 고정 필드(필드 전체), mask 0인 고정 필드(제거), `cdw1`(NSID)·`cdw010` 같은 필드 철자.
 
 거부하지 않고 메모(`out_of_scope`)나 기본값으로 처리하는 것: 범위 메모, 측정하지 못한 사전조건("사전조건 미측정" — 실행은 하되 요구사항은 미검증), 목록 밖 실행기 역량 이름, setup/verify의 기대 상태 누락(SUCCESS), 고정 필드 키 누락(없음), setup/verify의 선택자 미고정(첫 인자 생성 값으로 고정), 잘못 붙은 근거 ID, setup만 보는 요구사항(사전조건으로 이동), 스펙식 hex 표기(`84h`), 스펙식 상태 이름(`INVALID_COMMAND_OPCODE`), 역할에 적힌 FID/LID/CNS(고정되지 않았으면 그 값으로 고정), `data_length` 검사(빠지고 메모).
 

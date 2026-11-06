@@ -1,4 +1,5 @@
 """Deterministic encodings checked against the local NVMe specification tables."""
+import re
 from tc_system.spec_fields import feature_buffer
 from tc_system.verification import integer
 
@@ -22,6 +23,96 @@ for command_set, opcodes in (("ADMIN", (0x45, 0x42, 0x41, 0x3E, 0x3D, 0x31, 0x2D
                              ("NVM", (0x12, 0x1D))):
     for opcode in opcodes:
         SELECTORS[command_set, opcode, "Management Operation"] = ("cdw10", 0, 0xFF)
+
+
+# Register layouts, from the local spec's command figures ( Get Log
+# Page/Identify/Set Features/Create and Delete queue CDW10, Read/Write/
+# Verify/Compare/Write Zeroes CDW12, Firmware Commit, Format NVM, Device
+# Self-test, Sanitize). Used to show the auditor what was sent and to check a
+# step's role text against its encoding.
+_NVM_CDW12 = [("cdw12", "NLB(0-based)", 15, 0), ("cdw12", "STC", 24, 24), ("cdw12", "PRINFO", 29, 26),
+              ("cdw12", "PRACT", 29, 29), ("cdw12", "FUA", 30, 30), ("cdw12", "LR", 31, 31)]
+REGISTER_LAYOUTS = {
+    ("ADMIN", 0x02): [("cdw10", "LID", 7, 0), ("cdw10", "LSP", 14, 8), ("cdw10", "RAE", 15, 15),
+                               ("cdw10", "NUMDL", 31, 16), ("cdw11", "NUMDU", 15, 0)],
+    ("ADMIN", 0x06): [("cdw10", "CNS", 7, 0), ("cdw10", "CNTID", 31, 16)],
+    ("ADMIN", 0x09): [("cdw10", "FID", 7, 0), ("cdw10", "SV", 31, 31)],
+    ("ADMIN", 0x0A): [("cdw10", "FID", 7, 0), ("cdw10", "SEL", 10, 8)],
+    ("ADMIN", 0x10): [("cdw10", "FS", 2, 0), ("cdw10", "CA", 5, 3), ("cdw10", "BPID", 31, 31)],
+    ("ADMIN", 0x05): [("cdw10", "QID", 15, 0), ("cdw10", "QSIZE(0-based)", 31, 16),
+                               ("cdw11", "PC", 0, 0), ("cdw11", "IEN", 1, 1), ("cdw11", "IV", 31, 16)],
+    ("ADMIN", 0x01): [("cdw10", "QID", 15, 0), ("cdw10", "QSIZE(0-based)", 31, 16),
+                               ("cdw11", "PC", 0, 0), ("cdw11", "QPRIO", 2, 1), ("cdw11", "CQID", 31, 16)],
+    ("ADMIN", 0x00): [("cdw10", "QID", 15, 0)],
+    ("ADMIN", 0x04): [("cdw10", "QID", 15, 0)],
+    ("ADMIN", 0x14): [("cdw10", "STC", 3, 0)],
+    ("ADMIN", 0x80): [("cdw10", "LBAFL", 3, 0), ("cdw10", "MSET", 4, 4), ("cdw10", "PI", 7, 5),
+                               ("cdw10", "PIL", 8, 8), ("cdw10", "SES", 11, 9), ("cdw10", "LBAFU", 13, 12)],
+    ("ADMIN", 0x84): [("cdw10", "SANACT", 2, 0), ("cdw10", "AUSE", 3, 3), ("cdw10", "OWPASS", 7, 4),
+                               ("cdw10", "OIPBP", 8, 8), ("cdw10", "NDAS", 9, 9), ("cdw10", "EMVS", 10, 10)],
+    ("NVM", 0x01): _NVM_CDW12 + [("cdw12", "DTYPE", 23, 20)],
+    ("NVM", 0x02): _NVM_CDW12, ("NVM", 0x05): _NVM_CDW12, ("NVM", 0x0C): _NVM_CDW12,
+    ("NVM", 0x08): [("cdw12", "NLB(0-based)", 15, 0), ("cdw12", "DTYPE", 22, 20), ("cdw12", "NSZ", 23, 23),
+                            ("cdw12", "STC", 24, 24), ("cdw12", "DEAC", 25, 25), ("cdw12", "PRINFO", 29, 26),
+                            ("cdw12", "PRACT", 29, 29), ("cdw12", "FUA", 30, 30), ("cdw12", "LR", 31, 31)],
+    ("NVM", 0x04): [("cdw12", "NLB(0-based)", 15, 0)],
+}
+
+
+
+
+def decode_fields(command_set, raw, values):
+    """{field: hex value} by REGISTER_LAYOUTS, or None for an unlisted command."""
+    layout = REGISTER_LAYOUTS.get((command_set, raw))
+    if not layout:
+        return None
+    out = {}
+    try:
+        for register, name, hi, lo in layout:
+            out[name] = hex((integer(values.get(register, "0x0")) >> lo) & ((1 << (hi - lo + 1)) - 1))
+        if command_set == "NVM" and raw in (0x01, 0x02, 0x04, 0x05, 0x08, 0x0C):
+            out["SLBA"] = hex(integer(values.get("cdw11", "0x0")) << 32 | integer(values.get("cdw10", "0x0")))
+    except (TypeError, ValueError):
+        return None
+    return out
+
+
+# Selectors have their own check (verification.selector_in_text).
+_ROLE_SKIP = {"LID", "FID", "CNS", "NLB(0-based)", "QSIZE(0-based)", "NUMDL", "NUMDU", "SLBA"}
+
+
+def _role_value(text):
+    text = text.strip().lower()
+    if text.endswith("b") and set(text[:-1]) <= {"0", "1"}:
+        return int(text[:-1], 2)
+    if text.endswith("h"):
+        return int(text[:-1], 16)
+    return int(text, 0)
+
+
+def role_field_mismatch(command_set, raw, fields, role):
+    """A step's role says NAME=value for a field it encodes otherwise. 2026-11-06:
+    a Write Zeroes role said "NSZ=1, DEAC=1" while CDW12=0x01800001 set NSZ and
+    STC with DEAC=0; the FAIL that followed was about a command never sent."""
+    decoded = decode_fields(command_set, raw, fields)
+    if not decoded or not role:
+        return None
+    wrong = []
+    for name, actual in decoded.items():
+        if name in _ROLE_SKIP:
+            continue
+        said = {m for m in re.findall(rf"(?<![A-Za-z]){re.escape(name)}\s*=\s*(0x[0-9a-fA-F]+|[01]+b|[0-9a-fA-F]+h|\d+)"
+                                      rf"(?![0-9A-Za-z])", str(role))}
+        try:
+            values = {_role_value(v) for v in said}
+        except ValueError:
+            continue
+        if len(values) == 1 and values != {int(actual, 16)}:
+            wrong.append(f"{name}={next(iter(values))} (encoded {name}={int(actual, 16)})")
+    if wrong:
+        return ("the step's role says " + ", ".join(wrong) + " - encode the fields the role describes "
+                f"(layout: {', '.join(f'{n} {r}[{h}:{l}]' for r, n, h, l in REGISTER_LAYOUTS[command_set, raw])})")
+    return None
 
 
 def verify_selectors(fields, opcode_entry, required):

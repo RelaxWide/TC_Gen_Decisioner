@@ -226,13 +226,13 @@ class TestProbeDeviceCapabilities(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_runs_the_read_only_probes_and_returns_their_raw_stdout(self):
-        names = ["id-ctrl output", "id-ns output", "effects-log output", "logs", "fids", "versions"]
+        names = ["id-ctrl output", "id-ns output", "effects-log output", "logs", "fids", "fw", "versions"]
         fakes = [_FakeProc(returncode=0, stdout=n) for n in names]
         with mock.patch.object(ssh_runner, "_plink", side_effect=fakes) as plink:
             out = probe_device_capabilities("/dev/nvme0", "/dev/nvme0n1")
         self.assertEqual(out, {"id_ctrl": "id-ctrl output", "id_ns": "id-ns output",
                                 "effects_log": "effects-log output", "supported_logs": "logs",
-                                "fid_support": "fids", "host_versions": "versions"})
+                                "fid_support": "fids", "fw_log": "fw", "host_versions": "versions"})
         commands = [call.args[1] for call in plink.call_args_list]
         self.assertIn("sudo nvme id-ctrl /dev/nvme0", commands)
         self.assertIn("sudo nvme id-ns /dev/nvme0n1", commands)
@@ -244,13 +244,13 @@ class TestProbeDeviceCapabilities(unittest.TestCase):
         self.assertNotIn("set-feature", " ".join(commands))
 
     def test_commands_and_timing_are_logged(self):
-        fakes = [_FakeProc(returncode=0) for _ in range(6)]
+        fakes = [_FakeProc(returncode=0) for _ in range(7)]
         with mock.patch.object(ssh_runner, "_plink", side_effect=fakes):
             probe_device_capabilities("/dev/nvme0", "/dev/nvme0n1")
         lines = [json.loads(l) for l in config.SSH_COMMAND_LOG_PATH.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0]["probe"])
-        self.assertEqual(len(lines[0]["stages"]), 6)
+        self.assertEqual(len(lines[0]["stages"]), 7)
         for stage in lines[0]["stages"]:
             self.assertIn("elapsed_sec", stage)
 

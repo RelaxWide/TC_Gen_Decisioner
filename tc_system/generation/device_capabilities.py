@@ -17,7 +17,13 @@ import re
 
 _FIELD_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*:\s*(\S+)", re.M)
 _EFFECTS_RE = re.compile(r"^\s*(?:ACS|IOCS)\s+\d+\s*\(([^)]+)\)\s+CSUPP\+", re.M)
+# `nvme id-ns -H` prints "Data Size: 512 bytes ... (in use)"; plain `nvme
+# id-ns` (what the probe sends) prints "lbaf  0 : ms:0 lbads:9 rp:0 (in use)".
+# Only the -H form was read: the 2026-11-06 run had lba_bytes=None for every
+# TC (a 4-block Write with a 4096-byte buffer passed and "failed" from byte
+# 2048, and no LBA boundary variant was generated).
 _LBA_IN_USE_RE = re.compile(r"Data Size:\s*(\d+)\s*bytes.*\(in use\)")
+_LBADS_IN_USE_RE = re.compile(r"lbads\s*:\s*(\d+)[^\n]*\(in use\)")
 
 # NVMe Base Specification, Identify Controller data structure.
 _OACS_BITS = {
@@ -99,10 +105,29 @@ def namespace_size(raw: dict[str, str] | None) -> int | None:
     return _as_int(_parse_fields((raw or {}).get("id_ns", "")).get("nsze"))
 
 
+_AFI_RE = re.compile(r"^\s*afi\s*:\s*(0x[0-9a-fA-F]+|\d+)", re.M)
+
+
+def firmware_activation_pending(raw: dict[str, str] | None) -> int | None:
+    """AFI (Firmware Slot Information byte 0) when bits 6:4 name a slot to
+    activate at the next reset, else None (also None when not readable)."""
+    match = _AFI_RE.search((raw or {}).get("fw_log", "") or "")
+    if not match:
+        return None
+    afi = int(match.group(1), 0)
+    return afi if (afi >> 4) & 0x7 else None
+
+
 def in_use_lba_bytes(raw: dict[str, str] | None) -> int | None:
     """LBA data size of the namespace's in-use format, or None if unknown."""
-    match = _LBA_IN_USE_RE.search((raw or {}).get("id_ns", "") or "")
-    return int(match.group(1)) if match else None
+    text = (raw or {}).get("id_ns", "") or ""
+    match = _LBA_IN_USE_RE.search(text)
+    if match:
+        return int(match.group(1))
+    match = _LBADS_IN_USE_RE.search(text)
+    lbads = int(match.group(1)) if match else None
+    # LBADS is a power of two; the spec requires >= 9 (512 B).
+    return 1 << lbads if lbads is not None and 9 <= lbads <= 16 else None
 
 
 def summarize_device_capabilities(raw: dict[str, str]) -> str:
@@ -135,9 +160,14 @@ def summarize_device_capabilities(raw: dict[str, str]) -> str:
     nsze = _as_int(ns_fields.get("nsze"))
     if nsze is not None:
         lines.append(f"네임스페이스 크기(NSZE)=0x{nsze:X} LBA — LBA는 이 범위 안에서만 유효함")
-    lba_match = _LBA_IN_USE_RE.search((raw or {}).get("id_ns", "") or "")
-    if lba_match:
-        lines.append(f"현재 사용 중인 LBA 포맷의 섹터 크기={lba_match.group(1)} bytes")
+    lba_bytes = in_use_lba_bytes(raw)
+    if lba_bytes:
+        lines.append(f"현재 사용 중인 LBA 포맷의 섹터 크기={lba_bytes} bytes")
+
+    afi = firmware_activation_pending(raw)
+    if afi is not None:
+        lines.append(f"펌웨어 활성화 대기 중(AFI=0x{afi:02X}: 다음 리셋에서 슬롯 {(afi >> 4) & 7} 활성화) — "
+                     "Sanitize 등이 Firmware Activation Requires Reset 상태로 거부될 수 있음")
 
     support = device_support(raw)
     if support["lids"]:

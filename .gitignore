@@ -15,3 +15,8 @@ PULSEFZ/
 
 # Generated reports embed raw log excerpts; regenerate with run_report.py
 report/output/archive/
+
+# Run reviews and copies of real runs: analysis of device logs, not needed to run anything
+docs/reviews/
+TC_Gen_Decisioner-main/
+TC_Gen_Decisioner-main.zip

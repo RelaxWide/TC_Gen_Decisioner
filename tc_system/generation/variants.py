@@ -144,7 +144,8 @@ def variant_targets(index, nsze: int | None = None, lba_bytes: int | None = None
 
 
 def build_variant_tc(tc_id: str, variant: dict, opcode_entry: dict, nvme_ctrl: str, nvme_ns: str,
-                     active_nsid: int, lba_bytes: int | None = None) -> dict:
+                     active_nsid: int, lba_bytes: int | None = None, device_support: dict | None = None) -> dict:
+    from tc_system.generation.tc_writer import _selector_support
     from tc_system.models import make_tc_record
     is_admin = opcode_entry["command_set"] == "ADMIN"
     zero = "0x00000000"
@@ -161,6 +162,10 @@ def build_variant_tc(tc_id: str, variant: dict, opcode_entry: dict, nvme_ctrl: s
             "also_accept": list(variant.get("also_accept") or []),
             "payload_hex": None, "lba_bytes": lba_bytes, "variant": True}
     step.update(variant["fields"])
+    # The start-of-run probe reads Supported Log Pages for every LID: a
+    # reserved LID's support is measured, not assumed (2026-11-06: all 31
+    # reserved-LID PASSes were flagged "support not measured").
+    step["selector_support"] = _selector_support(opcode_entry, step, device_support)
     requirement = {"requirement_id": stable_id("vreq", variant["requirement_id"]),
                    "section_id": variant["section_id"], "evidence_id": variant["evidence"]["evidence_id"],
                    "quote": variant["text"], "description": variant["description"],

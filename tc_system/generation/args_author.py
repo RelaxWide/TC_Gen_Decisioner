@@ -20,7 +20,7 @@ import json
 
 from shared.spec_evidence import format_evidence
 from tc_system import spec_fields
-from tc_system.command_fields import SELECTORS, derive_transfer, verify_selectors, validate_transfer
+from tc_system.command_fields import role_field_mismatch, SELECTORS, derive_transfer, verify_selectors, validate_transfer
 from tc_system.verification import (apply_fixed_fields, canonical_status, validate_fixed_fields, integer,
                                     payload_for_step)
 
@@ -233,6 +233,18 @@ def _author_once(prompt: str, opcode_entry: dict, active_nsid: int,
         if fid not in spec_fields.FEATURE_CODECS and expected_status == "SUCCESS":
             raise ArgsAuthoringError(f"Set Features FID {fid:02X}h expected to succeed: the harness cannot restore "
                                      "this feature's original value, so it is not changed")
+        codec = spec_fields.FEATURE_CODECS.get(fid) or {}
+        defined = codec.get("value", 0) | codec.get("instance", 0)
+        reserved = integer(fields["cdw11"]) & ~defined & 0xFFFFFFFF
+        if defined and reserved and expected_status == "SUCCESS":
+            # 2026-11-06: Arbitration CDW11=0x01020308 set reserved bit 3 (AB
+            # is bits 2:0); the drive cleared it and the round trip "failed".
+            raise ArgsAuthoringError(f"Set Features FID {fid:02X}h CDW11={fields['cdw11']} sets reserved bits "
+                                     f"{hex(reserved)} (defined bits {hex(defined)}); encode only the defined fields")
+    mismatch = role_field_mismatch(opcode_entry["command_set"], int(opcode_entry["raw_opcode"], 16), fields,
+                                   (test_intent or {}).get("role"))
+    if mismatch:
+        raise ArgsAuthoringError(mismatch)
     if not 0 <= data_len <= MAX_DATA_LEN:
         raise ArgsAuthoringError(f"data_len out of range: {data_len}")
     # A declared direction with no buffer is the vacuous-success shape — a

@@ -28,13 +28,14 @@ from tc_system.execution.ssh_runner import (DestructiveStepBlocked, device_respo
                                             probe_device_capabilities)
 from tc_system.execution.tc_executor import SSHTCExecutor
 from tc_system.generation.variants import build_variant_tc, variant_targets
-from tc_system.generation.device_capabilities import (device_support as probed_support, host_versions,
+from tc_system.generation.device_capabilities import (device_support as probed_support, firmware_activation_pending,
+                                                     host_versions,
                                                      in_use_lba_bytes, namespace_size, summarize_device_capabilities)
 from tc_system.generation.scenario_generator import generate_scenario
 from tc_system.generation.tc_writer import build_tc, namespace_id_from_device_path, reauthor_steps
 from tc_system.review import apply_tc_verdict, code_review, review_tc
 from tc_system.store import tc_store
-from tc_system.verification import completion_status, verify_tc
+from tc_system.verification import command_support_measured_absent, completion_status, verify_tc
 
 
 def _execute_attempt(tc, executor, attempts):
@@ -414,7 +415,7 @@ def _prepare_target(section, opcode_entry, ctx) -> dict:
         if variant:
             # Built by code: the swept value IS the test, no LLM involved.
             tc = build_variant_tc(tc_id, variant, opcode_entry, target["nvme_ctrl"], target["nvme_ns"],
-                                  ctx["active_nsid"], ctx["lba_bytes"])
+                                  ctx["active_nsid"], ctx["lba_bytes"], ctx.get("device_support"))
             scenario = {"description": variant["description"]}
             resolved_steps = [{"section": section, "opcode_entry": opcode_entry, "phase": "action",
                                "role": variant["description"]}]
@@ -499,11 +500,13 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
     active_nsid = namespace_id_from_device_path(target["nvme_ns"])
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     probe, support = None, None
+    pmu, pmu_off = config.pmu_status()
     try:
         # Best-effort and run exactly once per batch, not once per TC: a probe
         # failure (unreachable target, an nvme-cli version missing a
         # subcommand) must never block the run it only exists to speed up.
-        probe = probe_device_capabilities(target["nvme_ctrl"], target["nvme_ns"])
+        probe = probe_device_capabilities(target["nvme_ctrl"], target["nvme_ns"],
+                                          (pmu or {}).get("script"))
         device_facts = summarize_device_capabilities(probe)
         # Measured, not assumed: NVM Read/Write/Compare buffers are checked
         # against NLB x this before anything reaches the wire.
@@ -520,6 +523,15 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
                                                    "probed_at": datetime.now(timezone.utc).isoformat()})
     except Exception:
         device_facts, lba_bytes, nsze = None, None, None
+    pending_afi = firmware_activation_pending(probe) if probe is not None else None
+    if pending_afi is not None:
+        print(f"[경고] 장비가 펌웨어 활성화 대기 상태(AFI=0x{pending_afi:02X}) - 이전 Firmware Commit이 남긴 상태. "
+              "Sanitize 등 일부 명령이 거부되고 그 TC는 판정하지 않음. nvme reset 또는 전원 사이클 후 실행 권장")
+    if probe is not None and not lba_bytes:
+        # Silent before: a whole run went without it (2026-11-06).
+        # cp949-safe text: a console that cannot encode a symbol must not end the run.
+        print("[경고] 장비 조회에서 LBA 크기를 읽지 못함 - NVM Read/Write/Compare 버퍼를 NLB x LBA로 검사하지 못하고 "
+              "LBA 경계 변형 TC도 만들지 않음(nvme id-ns 출력 형식 확인 필요)")
     if support is not None and not support["lids"] and not support["fids"]:
         support = None
     workers = config.TC_GENERATION_WORKERS if generation_workers is None else generation_workers
@@ -536,7 +548,14 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
     # ADMIN/NVM combos are allowed in one chain, so the model is always shown
     # the whole table, not just the primary target's own command_set.
     # Host steps (reset, PMU power cycle) can be setup/verify steps of a chain.
-    available_opcodes = index.list_opcodes() + host_action_entries(config.get_pmu())
+    if pmu and probe is not None and "PMU_SCRIPT_MISSING" in (probe.get("pmu_script") or ""):
+        pmu, pmu_off = None, f"대상 호스트에 {pmu['script']}(또는 python3)가 없음"
+    # Said once at the start: which host steps this run offers, and why not
+    # the power cycle (2026-11-06: off for the whole run, never mentioned).
+    print("호스트 스텝: Controller Reset" + (", Power Cycle (PMU)" if pmu and allow_destructive else "")
+          + ("" if pmu and allow_destructive else
+             f" - 전원 사이클 없음({pmu_off or '--no-destructive'}); 전원 사이클 전후 문장은 건너뜀"))
+    available_opcodes = index.list_opcodes() + host_action_entries(pmu)
 
     existing = tc_store.load_all()
     targets = pick_next_targets(index, existing, sys.maxsize if count is None else count,
@@ -583,7 +602,7 @@ def _run_targets(targets, total, ctx, pool, futures, _ensure, unsupported_in_run
             # UNSUPPORTED TCs over 23 opcodes, 18 of them repeats).
             ahead = futures.get(i - 1)
             spent = ahead is not None and not ahead.cancelled() and (ahead.done() or ahead.running())
-            reason = (f"같은 실행에서 {opcode_entry['name']}({opcode_entry['raw_opcode']})가 이미 INVALID_OPCODE로 "
+            reason = (f"같은 실행에서 {opcode_entry['name']}({opcode_entry['raw_opcode']})가 이미 "
                       f"미지원 확인됨({unsupported_in_run[key]}) — 전송 생략"
                       + ("(미리 생성은 이미 진행돼 결과를 버림)" if spent else ", LLM 호출도 생략"))
             _record_skip(skipped, section, opcode_entry, reason, "opcode_unsupported_in_run", run_id=run_id)
@@ -885,8 +904,14 @@ def _run_targets(targets, total, ctx, pool, futures, _ensure, unsupported_in_run
             tc["review"] = {"level": "must", "label": "꼭 확인", "scope": None, "audit_llm_response_id": None,
                             "reasons": [{"level": "must", "code": "review_error", "source": "code",
                                          "text": f"검토 사유 계산 실패: {exc}"}]}
-        if _action_unsupported_opcode(tc) and _opcode_key(opcode_entry):
-            unsupported_in_run.setdefault(_opcode_key(opcode_entry), section["section_id"])
+        # The drive answered for the command itself: INVALID_OPCODE on the
+        # action, or a precondition read the command's own support bit as 0
+        # (OACS/ONCS bit, CSUPP) and the action was not sent.
+        absent = None if _action_unsupported_opcode(tc) else command_support_measured_absent(tc)
+        if (_action_unsupported_opcode(tc) or absent) and _opcode_key(opcode_entry):
+            unsupported_in_run.setdefault(_opcode_key(opcode_entry),
+                                          f"{section['section_id']}: "
+                                          + (f"사전조건 측정 {absent}" if absent else "INVALID_OPCODE"))
             # Prefetched generation for the same command that has not started
             # yet is dropped before it spends LLM calls.
             for j, ahead in futures.items():
