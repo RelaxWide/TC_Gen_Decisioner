@@ -20,3 +20,7 @@ report/output/archive/
 docs/reviews/
 TC_Gen_Decisioner-main/
 TC_Gen_Decisioner-main.zip
+
+# PMU board script and its IP file: placed by hand in the project folder (pmu.run_on=local)
+/pmu_4_1.py
+/pmu_ip.json

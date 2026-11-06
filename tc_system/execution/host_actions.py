@@ -13,10 +13,20 @@ power OFF first, then remove the PCIe device (a live link removed first
 broke re-enumeration behind some bridges), discharge wait, power ON, then
 rescan + `nvme id-ctrl` until the controller answers or the boot wait ends.
 PMU commands: `<script> 7 <dev>` power off, `<script> 4 <dev> <mV> 0 12000 0 0`
-power on.
+power on, `<script> 3 <dev>` read the current (read-only, used as the
+start-of-run check).
+
+Where the PMU script runs (`pmu.run_on`):
+- "local" (default): on the PC that runs this pipeline, `pmu_4_1.py` and its
+  `pmu_ip.json` (the board's IP) in the project folder. The PMU board is
+  reached over the network; only the PCIe remove/rescan and the readiness
+  wait go to the target host over SSH (`ssh_runner._local_power_cycle`).
+- "target": on the target host as root, like the fuzzer (`host_action_script`).
 """
 import re
 import shlex
+import sys
+from pathlib import Path
 
 # name shown to the scenario author -> action key
 HOST_ACTIONS = {
@@ -81,6 +91,74 @@ def _entry(name, action, destructive):
             "direction": "none"}
 
 
+def pmu_runs_locally(pmu: dict | None) -> bool:
+    return bool(pmu) and pmu.get("run_on", "local") == "local"
+
+
+def pmu_timing(pmu: dict) -> tuple[int, int, float, float, int]:
+    """(dev_idx, mV, power-off wait, rescan delay, boot wait); defaults are
+    the fuzzer's (fuzzer_config.json power.por_*)."""
+    return (int(pmu.get("dev_idx", 1)), int(pmu.get("voltage_mv", 3300)),
+            float(pmu.get("poweroff_wait_sec", 3)), float(pmu.get("rescan_delay_sec", 10)),
+            int(pmu.get("boot_wait_sec", 30)))
+
+
+def pmu_args(pmu: dict, what: str) -> list[str]:
+    dev, mv = pmu_timing(pmu)[:2]
+    return {"off": ["7", str(dev)], "on": ["4", str(dev), str(mv), "0", "12000", "0", "0"],
+            "current": ["3", str(dev)]}[what]
+
+
+def local_pmu_argv(pmu: dict, what: str) -> list[str]:
+    """argv for the PMU script on this PC: the interpreter running the
+    pipeline unless `pmu.python` names another one."""
+    return [pmu.get("python") or sys.executable, str(pmu["script"]), *pmu_args(pmu, what)]
+
+
+def local_pmu_files_problem(pmu: dict) -> str:
+    """Why the local PMU files are not usable, or "". pmu_ip.json sits next to
+    the script (the script is run with that folder as its working directory)."""
+    script = Path(pmu["script"])
+    if not script.is_file():
+        return f"{script} 없음"
+    ip_file = script.with_name(pmu.get("ip_file", "pmu_ip.json"))
+    if not ip_file.is_file():
+        return f"{ip_file} 없음(PMU IP 파일, pmu_4_1.py와 같은 폴더)"
+    return ""
+
+
+_BDF_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
+
+
+def pcie_locate_script(nvme_ctrl: str) -> str:
+    """Sets EP (the SSD) and ROOT (the topmost bridge above it) and prints
+    them. Run while the drive is still powered: after power off it can be gone
+    from sysfs."""
+    name = nvme_ctrl.rsplit("/", 1)[-1]
+    return (f"P=$(readlink -f /sys/class/nvme/{shlex.quote(name)}/device); "
+            "EP=$(basename \"$P\"); ROOT=$(echo \"$P\" | cut -d/ -f5); echo PCIE_EP=$EP PCIE_ROOT=$ROOT; ")
+
+
+def pcie_remove_target(remove: str, located: str) -> str | None:
+    """The BDF to remove from `pcie_locate_script` output: the SSD (endpoint),
+    the topmost bridge (root, the fuzzer's auto-root for P9/P7 PMU boards), or
+    None (remove="none", or nothing usable was found)."""
+    key = {"endpoint": "PCIE_EP", "root": "PCIE_ROOT"}.get(remove)
+    m = key and re.search(key + r"=(\S+)", located or "")
+    return m.group(1) if m and _BDF_RE.match(m.group(1)) else None
+
+
+def pcie_remove_command(bdf: str) -> str:
+    if not _BDF_RE.match(bdf):
+        raise ValueError(f"not a PCIe address: {bdf!r}")
+    return f"echo 1 > /sys/bus/pci/devices/{bdf}/remove 2>/dev/null; echo REMOVED={bdf}"
+
+
+def wait_ready_script(nvme_ctrl: str, seconds: int) -> str:
+    """Rescan + `nvme id-ctrl` until the controller answers (exit 98 if not)."""
+    return _wait_ready(nvme_ctrl, seconds, rescan=True)
+
+
 def _wait_ready(nvme_ctrl: str, seconds: int, rescan: bool) -> str:
     ctrl = shlex.quote(nvme_ctrl)
     rescan_cmd = "echo 1 > /sys/bus/pci/rescan 2>/dev/null; " if rescan else ""
@@ -98,29 +176,25 @@ def host_action_script(action: str, nvme_ctrl: str, pmu: dict | None) -> tuple[s
     if action == "power_cycle":
         if not pmu:
             raise ValueError("Power Cycle needs a PMU board configured (secrets.local.json \"pmu\")")
+        if pmu_runs_locally(pmu):
+            raise ValueError("pmu.run_on=local: the power cycle runs from this PC (ssh_runner.run_host_action)")
         script = shlex.quote(pmu["script"])
-        dev, mv = int(pmu.get("dev_idx", 1)), int(pmu.get("voltage_mv", 3300))
-        off_wait = float(pmu.get("poweroff_wait_sec", 3))
-        rescan_delay = float(pmu.get("rescan_delay_sec", 10))
-        boot_wait = int(pmu.get("boot_wait_sec", 30))
+        _, _, off_wait, rescan_delay, boot_wait = pmu_timing(pmu)
+        off, on = " ".join(pmu_args(pmu, "off")), " ".join(pmu_args(pmu, "on"))
         # endpoint: the SSD itself; root: the topmost bridge above it (some
         # PMU boards only cycle cleanly that way); none: no remove at all.
-        remove = pmu.get("remove", "endpoint")
-        name = nvme_ctrl.rsplit("/", 1)[-1]
-        locate = (f"P=$(readlink -f /sys/class/nvme/{shlex.quote(name)}/device); "
-                  "EP=$(basename \"$P\"); ROOT=$(echo \"$P\" | cut -d/ -f5); ")
-        target = {"endpoint": "$EP", "root": "$ROOT"}.get(remove)
+        target = {"endpoint": "$EP", "root": "$ROOT"}.get(pmu.get("remove", "endpoint"))
         remove_cmd = (f"echo 1 > /sys/bus/pci/devices/{target}/remove 2>/dev/null; echo REMOVED={target}; "
                       if target else "")
-        body = (locate
+        body = (pcie_locate_script(nvme_ctrl)
                 # A failed OFF is no power loss: power back on in case it half
                 # worked, and stop with a PMU error (not 98, which means the
                 # drive never came back) so nothing after it is judged.
-                + f"python3 {script} 7 {dev}; off=$?; echo POWER_OFF_RC=$off; "
-                + f"if [ $off -ne 0 ]; then python3 {script} 4 {dev} {mv} 0 12000 0 0; exit 96; fi; "
+                + f"python3 {script} {off}; off=$?; echo POWER_OFF_RC=$off; "
+                + f"if [ $off -ne 0 ]; then python3 {script} {on}; exit 96; fi; "
                 + remove_cmd
                 + f"sleep {off_wait}; "
-                + f"python3 {script} 4 {dev} {mv} 0 12000 0 0; rc=$?; echo POWER_ON_RC=$rc; "
+                + f"python3 {script} {on}; rc=$?; echo POWER_ON_RC=$rc; "
                 + "[ $rc -eq 0 ] || exit $rc; "
                 + f"sleep {rescan_delay}; "
                 + _wait_ready(nvme_ctrl, boot_wait, rescan=True))

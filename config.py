@@ -72,12 +72,21 @@ def _load_secrets():
 
 def get_pmu():
     """PMU board settings (secrets.local.json "pmu") when enabled, else None.
-    Without it the Power Cycle host step is not offered at all."""
+    Without it the Power Cycle host step is not offered at all.
+
+    run_on "local" (default): the script runs on this PC; a relative `script`
+    (default "pmu_4_1.py") is under the project folder, next to pmu_ip.json.
+    run_on "target": `script` is a path on the target host."""
     try:
-        pmu = _load_secrets().get("pmu") or {}
+        pmu = dict(_load_secrets().get("pmu") or {})
     except Exception:  # noqa: BLE001 - no secrets file: no PMU
         return None
-    return pmu if pmu.get("enabled") and pmu.get("script") else None
+    if not pmu.get("enabled") or pmu.get("run_on", "local") not in ("local", "target"):
+        return None
+    if pmu.get("run_on", "local") == "local":
+        script = Path(pmu.get("script") or "pmu_4_1.py")
+        pmu["script"] = str(script if script.is_absolute() else BASE_DIR / script)
+    return pmu if pmu.get("script") else None
 
 
 def pmu_status():
@@ -95,8 +104,10 @@ def pmu_status():
         return None, "secrets.local.json에 pmu 항목 없음"
     if not pmu.get("enabled"):
         return None, "pmu.enabled=false"
+    if pmu.get("run_on", "local") not in ("local", "target"):
+        return None, f"pmu.run_on={pmu.get('run_on')!r} (local 또는 target)"
     if not pmu.get("script"):
-        return None, "pmu.script(대상 호스트의 pmu_4_1.py 경로) 없음"
+        return None, "pmu.script(run_on=target이면 대상 호스트의 pmu_4_1.py 경로) 없음"
     return None, "PMU 설정을 읽지 못함"
 
 

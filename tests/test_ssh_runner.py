@@ -320,7 +320,7 @@ class TestTestsCannotReachTheRealTarget(unittest.TestCase):
 
 class TestHostActions(unittest.TestCase):
     """Controller reset / PMU power cycle, sequence as in pc_sampling_fuzzer_v11.5 POR."""
-    PMU = {"enabled": True, "script": "/opt/pmu/pmu_4_1.py", "dev_idx": 1, "voltage_mv": 3300,
+    PMU = {"enabled": True, "run_on": "target", "script": "/opt/pmu/pmu_4_1.py", "dev_idx": 1, "voltage_mv": 3300,
            "poweroff_wait_sec": 3, "rescan_delay_sec": 10, "boot_wait_sec": 30, "remove": "root"}
 
     def test_power_cycle_follows_the_fuzzer_por_order(self):
@@ -391,6 +391,119 @@ class TestRunHostActionOverSsh(unittest.TestCase):
         log = config.SSH_COMMAND_LOG_PATH.read_text(encoding="utf-8")
         self.assertIn('"host_action": "controller_reset"', log)
         self.assertNotIn("pw-not-logged", log)
+
+
+class TestLocalPmu(unittest.TestCase):
+    """pmu.run_on=local: pmu_4_1.py and pmu_ip.json in the project folder on the
+    PC running the pipeline; the board is driven from there, the PCIe remove /
+    rescan / readiness wait still go to the target host."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pmu = {"enabled": True, "run_on": "local", "script": str(Path(self.tmp.name) / "pmu_4_1.py"),
+                    "dev_idx": 1, "voltage_mv": 3300, "poweroff_wait_sec": 3, "rescan_delay_sec": 10,
+                    "boot_wait_sec": 30, "remove": "root"}
+        for name, value in (("SSH_COMMAND_LOG_PATH", Path(self.tmp.name) / "ssh.jsonl"),
+                            ("get_ssh_target", lambda: {"host": "h", "user": "u", "password": "pw-not-logged",
+                                                        "nvme_ctrl": "/dev/nvme0", "nvme_ns": "/dev/nvme0n1"}),
+                            ("get_pmu", lambda: self.pmu)):
+            patcher = mock.patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _run(self, pmu_rcs):
+        events = []
+
+        def fake_pmu(pmu, what, timeout=30):
+            events.append(("pmu", what))
+            return pmu_rcs.get(what, 0), f"{what} done", {"stage": f"pmu_{what}", "command": f"py pmu_4_1.py {what}"}
+
+        def fake_plink(target, command, stdin=None, timeout=60):
+            if "readlink" in command:
+                events.append(("ssh", "locate"))
+                return _FakeProc(stdout="PCIE_EP=0000:02:00.0 PCIE_ROOT=0000:00:01.1\n")
+            if "/remove" in command:
+                events.append(("ssh", command[command.index("devices/"):command.index("/remove")]))
+                return _FakeProc(stdout="REMOVED=x\n")
+            events.append(("ssh", "ready"))
+            return _FakeProc(stdout="READY_AFTER_SEC=4\n")
+
+        with mock.patch.object(ssh_runner, "_run_local_pmu", side_effect=fake_pmu), \
+             mock.patch.object(ssh_runner, "_plink", side_effect=fake_plink), \
+             mock.patch.object(ssh_runner.time, "sleep", side_effect=lambda s: events.append(("sleep", s))):
+            result = ssh_runner.run_host_action("power_cycle", "/dev/nvme0", tc_id="t", step_index=1)
+        return result, events
+
+    def test_relative_script_is_under_the_project_folder(self):
+        # config.get_pmu is patched in setUp; _REAL_GET_PMU is the real one.
+        with mock.patch.object(config, "_load_secrets", return_value={"pmu": {"enabled": True}}):
+            pmu = _REAL_GET_PMU()
+        self.assertEqual(Path(pmu["script"]), config.BASE_DIR / "pmu_4_1.py")
+        with mock.patch.object(config, "_load_secrets",
+                               return_value={"pmu": {"enabled": True, "run_on": "target", "script": "/opt/p.py"}}):
+            self.assertEqual(_REAL_GET_PMU()["script"], "/opt/p.py")  # a path on the target host, untouched
+        with mock.patch.object(config, "_load_secrets", return_value={"pmu": {"enabled": True, "run_on": "pc"}}):
+            self.assertIsNone(_REAL_GET_PMU())
+
+    def test_power_cycle_follows_the_fuzzer_por_order_with_the_board_driven_locally(self):
+        result, events = self._run({})
+        self.assertEqual(events, [("ssh", "locate"), ("pmu", "off"), ("ssh", "devices/0000:00:01.1"),
+                                  ("sleep", 3.0), ("pmu", "on"), ("sleep", 10.0), ("ssh", "ready")])
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIn("POWER_OFF_RC=0", result["stdout"])
+        log = config.SSH_COMMAND_LOG_PATH.read_text(encoding="utf-8")
+        self.assertIn('"host_action": "power_cycle"', log)
+        self.assertNotIn("pw-not-logged", log)
+
+    def test_a_failed_power_off_powers_back_on_and_is_a_pmu_error(self):
+        result, events = self._run({"off": 1})
+        self.assertEqual(events, [("ssh", "locate"), ("pmu", "off"), ("pmu", "on")])  # no remove, no wait
+        self.assertEqual(result["exit_code"], 96)
+
+    def test_a_failed_power_on_is_not_a_drive_that_never_came_back(self):
+        result, events = self._run({"on": 2})
+        self.assertNotIn(("ssh", "ready"), events)
+        self.assertEqual(result["exit_code"], 97)  # ERROR side, not 98 (FAIL: drive never answered)
+
+    def test_unknown_pcie_address_is_not_removed(self):
+        from tc_system.execution.host_actions import pcie_remove_command, pcie_remove_target
+        self.assertEqual(pcie_remove_target("endpoint", "PCIE_EP=0000:02:00.0 PCIE_ROOT=0000:00:01.1"), "0000:02:00.0")
+        self.assertIsNone(pcie_remove_target("root", "PCIE_EP= PCIE_ROOT=devices"))
+        self.assertIsNone(pcie_remove_target("none", "PCIE_EP=0000:02:00.0"))
+        with self.assertRaises(ValueError):
+            pcie_remove_command("0000:00:01.1; reboot")
+
+    def test_target_host_script_is_not_built_for_a_local_pmu(self):
+        from tc_system.execution.host_actions import host_action_command
+        with self.assertRaisesRegex(ValueError, "run_on=local"):
+            host_action_command("power_cycle", "/dev/nvme0", self.pmu)
+
+    def test_start_check_needs_the_script_the_ip_file_and_an_answer(self):
+        self.assertIn("pmu_4_1.py", ssh_runner.local_pmu_problem(self.pmu))
+        Path(self.pmu["script"]).write_text("# fake", encoding="utf-8")
+        self.assertIn("pmu_ip.json", ssh_runner.local_pmu_problem(self.pmu))
+        (Path(self.tmp.name) / "pmu_ip.json").write_text("{}", encoding="utf-8")
+        stage = {"stage": "pmu_current", "command": "py pmu_4_1.py 3 1"}
+        with mock.patch.object(ssh_runner, "_run_local_pmu", return_value=(0, "12.3", stage)) as run:
+            self.assertEqual(ssh_runner.local_pmu_problem(self.pmu), "")
+        self.assertEqual(run.call_args.args[1], "current")  # read-only measurement, never OFF/ON
+        with mock.patch.object(ssh_runner, "_run_local_pmu", return_value=(1, "connect timeout", stage)):
+            self.assertIn("connect timeout", ssh_runner.local_pmu_problem(self.pmu))
+
+    def test_the_real_board_is_never_called_from_tests(self):
+        with self.assertRaisesRegex(RuntimeError, "PMU"):
+            ssh_runner._run_local_pmu(self.pmu, "off")
+
+    def test_local_argv_runs_the_script_with_this_python(self):
+        import sys
+        from tc_system.execution.host_actions import local_pmu_argv
+        self.assertEqual(local_pmu_argv(self.pmu, "on")[0], sys.executable)
+        self.assertEqual(local_pmu_argv(self.pmu, "on")[2:], ["4", "1", "3300", "0", "12000", "0", "0"])
+        self.assertEqual(local_pmu_argv(dict(self.pmu, python="C:/py/python.exe"), "off")[0], "C:/py/python.exe")
+
+
+_REAL_GET_PMU = config.get_pmu
 
 
 if __name__ == "__main__":

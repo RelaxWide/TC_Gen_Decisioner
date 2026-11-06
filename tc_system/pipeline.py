@@ -23,9 +23,9 @@ from tc_system.execution.expectation_checker import (check_expectation, check_ex
                                                       status_line,
                                                       rejected_arguments, unsupported_opcode)
 from shared.llm_client import LLMCallError
-from tc_system.execution.host_actions import host_action_entries, usable_host_steps
+from tc_system.execution.host_actions import host_action_entries, pmu_runs_locally, usable_host_steps
 from tc_system.execution.ssh_runner import (DestructiveStepBlocked, device_responsive, passthru_cmd,
-                                            probe_device_capabilities)
+                                            local_pmu_problem, probe_device_capabilities)
 from tc_system.execution.tc_executor import SSHTCExecutor
 from tc_system.generation.variants import build_variant_tc, variant_targets
 from tc_system.generation.device_capabilities import (device_support as probed_support, firmware_activation_pending,
@@ -506,7 +506,7 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
         # failure (unreachable target, an nvme-cli version missing a
         # subcommand) must never block the run it only exists to speed up.
         probe = probe_device_capabilities(target["nvme_ctrl"], target["nvme_ns"],
-                                          (pmu or {}).get("script"))
+                                          None if not pmu or pmu_runs_locally(pmu) else pmu["script"])
         device_facts = summarize_device_capabilities(probe)
         # Measured, not assumed: NVM Read/Write/Compare buffers are checked
         # against NLB x this before anything reaches the wire.
@@ -550,6 +550,15 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
     # Host steps (reset, PMU power cycle) can be setup/verify steps of a chain.
     if pmu and probe is not None and "PMU_SCRIPT_MISSING" in (probe.get("pmu_script") or ""):
         pmu, pmu_off = None, f"대상 호스트에 {pmu['script']}(또는 python3)가 없음"
+    if pmu and pmu_runs_locally(pmu) and allow_destructive:
+        # The board is driven from this PC: files present and it answers a
+        # read-only current measurement, or the power cycle is not offered.
+        try:
+            problem = local_pmu_problem(pmu)
+        except Exception as exc:  # noqa: BLE001 - a check, never a reason to stop the run
+            problem = f"PMU 확인 중 오류: {exc}"
+        if problem:
+            pmu, pmu_off = None, problem
     # Said once at the start: which host steps this run offers, and why not
     # the power cycle (2026-11-06: off for the whole run, never mentioned).
     print("호스트 스텝: Controller Reset" + (", Power Cycle (PMU)" if pmu and allow_destructive else "")

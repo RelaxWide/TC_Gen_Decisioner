@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import config
 
@@ -300,13 +301,20 @@ def device_responsive(nvme_ctrl: str, timeout: int = 15) -> tuple[bool, str]:
 
 
 def run_host_action(action: str, nvme_ctrl: str, tc_id=None, attempt_id=None, step_index=None) -> dict:
-    """Controller reset / PMU power cycle on the target host (host_actions.py)."""
-    from tc_system.execution.host_actions import host_action_command
-    command, timeout = host_action_command(action, nvme_ctrl, config.get_pmu())
+    """Controller reset / PMU power cycle (host_actions.py): on the target host,
+    except the PMU board commands of a power cycle with pmu.run_on=local."""
+    from tc_system.execution.host_actions import host_action_command, pmu_runs_locally
+    pmu = config.get_pmu()
     target = config.get_ssh_target()
     log_record = {"timestamp": datetime.now(timezone.utc).isoformat(), "n_steps": 1, "stages": [],
-                  "tc_id": tc_id, "attempt_id": attempt_id, "step_index": step_index,
-                  "host_action": action, "step_commands": [command]}
+                  "tc_id": tc_id, "attempt_id": attempt_id, "step_index": step_index, "host_action": action}
+    if action == "power_cycle" and pmu_runs_locally(pmu):
+        try:
+            return _local_power_cycle(nvme_ctrl, pmu, target, log_record)
+        finally:
+            _append_ssh_log(log_record)
+    command, timeout = host_action_command(action, nvme_ctrl, pmu)
+    log_record["step_commands"] = [command]
     try:
         proc, stage = _timed_plink(target, command, f"host_{action}", stdin=target["password"] + "\n",
                                    timeout=timeout)
@@ -315,6 +323,97 @@ def run_host_action(action: str, nvme_ctrl: str, tc_id=None, attempt_id=None, st
                 "batch_stderr": proc.stderr or "", "timed_out": proc.returncode is None}
     finally:
         _append_ssh_log(log_record)
+
+
+def _run_local_pmu(pmu: dict, what: str, timeout: int = 30) -> tuple[int | None, str, dict]:
+    """One PMU board command from this PC (pmu.run_on=local), with the
+    script's folder as the working directory so it finds pmu_ip.json."""
+    _refuse_under_tests("real PMU board call")
+    from tc_system.execution.host_actions import local_pmu_argv
+    argv = local_pmu_argv(pmu, what)
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(argv, cwd=str(Path(pmu["script"]).parent), capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
+        rc, out = proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
+    except subprocess.TimeoutExpired:
+        rc, out = None, f"PMU 명령이 {timeout}초 안에 끝나지 않음"
+    except OSError as exc:
+        rc, out = None, f"PMU 스크립트 실행 실패: {exc}"
+    stage = {"stage": f"pmu_{what}", "command": " ".join(argv), "elapsed_sec": round(time.monotonic() - started, 2),
+             "exit_code": rc, "timed_out": rc is None}
+    return rc, out, stage
+
+
+def local_pmu_problem(pmu: dict) -> str:
+    """Start-of-run check for pmu.run_on=local: the files are there and the
+    board answers a read-only current measurement (`pmu_4_1.py 3 <dev>`, what
+    the fuzzer reads between commands). "" when usable, else why not."""
+    from tc_system.execution.host_actions import local_pmu_files_problem
+    problem = local_pmu_files_problem(pmu)
+    if problem:
+        return problem
+    rc, out, stage = _run_local_pmu(pmu, "current", timeout=20)
+    _append_ssh_log({"timestamp": datetime.now(timezone.utc).isoformat(), "pmu_check": True, "stages": [stage],
+                     "output": out[-500:]})
+    if rc != 0:
+        last = out.strip().splitlines()[-1] if out.strip() else "(출력 없음)"
+        return f"PMU 응답 확인(pmu_4_1.py {' '.join(stage['command'].split()[-2:])}) 실패: rc={rc}, {last}"
+    return ""
+
+
+def _local_power_cycle(nvme_ctrl: str, pmu: dict, target: dict, log_record: dict) -> dict:
+    """The fuzzer's POR with the PMU board driven from this PC: locate the PCIe
+    address (target) -> power OFF (PMU) -> PCIe remove (target) -> discharge
+    wait -> power ON (PMU) -> rescan + id-ctrl until it answers (target).
+    Exit codes as on the target-host path: 96 OFF failed (powered back on),
+    97 ON failed, 98 the drive never came back."""
+    from tc_system.execution import host_actions as ha
+    _, _, off_wait, rescan_delay, boot_wait = ha.pmu_timing(pmu)
+    password = target["password"] + "\n"
+    out, commands = [], []
+    log_record["step_commands"] = commands
+
+    def remote(body, stage_name, timeout):
+        command = f"sudo -S bash -c '{body}' 2>&1"
+        if "'" in body:
+            raise ValueError("host action script must not contain a single quote")
+        commands.append(command)
+        proc, stage = _timed_plink(target, command, stage_name, stdin=password, timeout=timeout)
+        log_record["stages"].append(stage)
+        out.append((proc.stdout or "").strip())
+        return proc
+
+    def pmu_cmd(what):
+        rc, text, stage = _run_local_pmu(pmu, what)
+        commands.append(stage["command"])
+        log_record["stages"].append(stage)
+        out.append(text)
+        return rc
+
+    def result(code, timed_out=False):
+        return {"exit_code": code, "stdout": "\n".join(o for o in out if o), "batch_stderr": "",
+                "timed_out": timed_out}
+
+    located = remote(ha.pcie_locate_script(nvme_ctrl), "host_power_cycle_locate", 30)
+    bdf = ha.pcie_remove_target(pmu.get("remove", "endpoint"), located.stdout or "")
+    off = pmu_cmd("off")
+    out.append(f"POWER_OFF_RC={off}")
+    if off != 0:
+        # No power loss happened: power back on in case it half worked, and
+        # stop with a PMU error so nothing after it is judged.
+        pmu_cmd("on")
+        return result(96)
+    if bdf:
+        remote(ha.pcie_remove_command(bdf), "host_power_cycle_remove", 30)
+    time.sleep(off_wait)
+    on = pmu_cmd("on")
+    out.append(f"POWER_ON_RC={on}")
+    if on != 0:
+        return result(97)
+    time.sleep(rescan_delay)
+    ready = remote(ha.wait_ready_script(nvme_ctrl, boot_wait), "host_power_cycle_ready", boot_wait + 30)
+    return result(ready.returncode, timed_out=ready.returncode is None)
 
 
 def capture_dmesg(tc_id=None, attempt_id=None) -> str:
