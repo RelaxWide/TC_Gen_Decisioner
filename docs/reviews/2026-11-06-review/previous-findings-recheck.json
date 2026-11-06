@@ -1,0 +1,60 @@
+{
+  "F01_interrupt_during_change": {
+    "expected_value": 360,
+    "actual_value": 360,
+    "calls": [
+      [
+        "setup",
+        "Get Features"
+      ],
+      [
+        "action",
+        "Set Features"
+      ],
+      [
+        "cleanup",
+        "Set Features"
+      ],
+      [
+        "setup",
+        "Get Features"
+      ]
+    ],
+    "reproduced": false
+  },
+  "F02_unrelated_support_measurement": {
+    "expected": "do not assert a violation of an unmeasured unsupported premise",
+    "actual_status": "UNVERIFIED",
+    "unmeasured": [
+      "LID 7Eh 미지원 여부가 측정되지 않음(Supported Log Pages로 확인 필요)"
+    ],
+    "reproduced": false
+  },
+  "F03_host_identifier_transition": {
+    "expected_hostid": "0000000000000000",
+    "actual_hostid": "0000000000000000",
+    "cleanup": "",
+    "tc_status": "UNVERIFIED",
+    "reproduced": false
+  },
+  "F04_failed_readback_review": {
+    "expected": "request review when a restore cannot be confirmed",
+    "actual_level": "recommend",
+    "actual_status": "PASS",
+    "reasons": [
+      {
+        "level": "recommend",
+        "code": "cleanup_unverified",
+        "text": "원복 스텝 2: 원복 확인 실패: 다시 읽기가 성공하지 않음 — INTERNAL",
+        "source": "code"
+      }
+    ],
+    "reproduced": false
+  },
+  "F05_skipped_only_latest_run": {
+    "expected_run_id": "20261105T020000Z",
+    "actual_run_id": "20261105T020000Z",
+    "actual_progress": "   TC 생성·실행  0  실행 20261105T020000Z    본동작(action) 전송  0  장비에 실제로 나간 대상 명령    본동작 전에 중단  0  사전조건/setup에서 멈춤 — 대상 명령은 안 나감    건너뜀(장비 전송 없음)  1  생성·인자·전송 전 차단    판정 분포      \"시도\"는 검증 완료가 아닙니다. 본동작이 장비에 나간 수와, 그 중 요구사항을 판정한 수는 아래 커버리지에서 따로 셉니다. ",
+    "reproduced": false
+  }
+}

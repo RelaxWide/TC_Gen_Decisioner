@@ -1,5 +1,11 @@
+import hashlib
 import shutil
+import subprocess
 import sys
+import queue
+import threading
+from concurrent.futures import Future
+from functools import lru_cache
 from copy import deepcopy
 from datetime import datetime, timezone
 
@@ -12,18 +18,23 @@ from shared.ids import stable_id
 from tc_system.coverage.coverage_state import compute_coverage, pick_next_targets
 from tc_system.coverage.spec_coverage_index import SpecCoverageIndexFile
 from tc_system.execution.expectation_checker import (check_expectation, check_execution, check_step_expectations,
+                                                      is_test_step,
                                                       device_hung, error_cause, evaluate_criteria, host_tool_crash,
                                                       status_line,
                                                       rejected_arguments, unsupported_opcode)
 from shared.llm_client import LLMCallError
+from tc_system.execution.host_actions import host_action_entries, usable_host_steps
 from tc_system.execution.ssh_runner import (DestructiveStepBlocked, device_responsive, passthru_cmd,
                                             probe_device_capabilities)
 from tc_system.execution.tc_executor import SSHTCExecutor
-from tc_system.generation.device_capabilities import in_use_lba_bytes, summarize_device_capabilities
+from tc_system.generation.variants import build_variant_tc, variant_targets
+from tc_system.generation.device_capabilities import (device_support as probed_support, host_versions,
+                                                     in_use_lba_bytes, namespace_size, summarize_device_capabilities)
 from tc_system.generation.scenario_generator import generate_scenario
 from tc_system.generation.tc_writer import build_tc, namespace_id_from_device_path, reauthor_steps
+from tc_system.review import apply_tc_verdict, code_review, review_tc
 from tc_system.store import tc_store
-from tc_system.verification import verify_tc
+from tc_system.verification import completion_status, verify_tc
 
 
 def _execute_attempt(tc, executor, attempts):
@@ -54,14 +65,54 @@ def _step_outcome(execution: dict, step_index: int) -> str:
     return status_line(str(result.get("stdout", "")))
 
 
+def _step_excerpts(tc: dict, execution: dict) -> list[str]:
+    """Each step's output with its own budget, the action and the steps the
+    checks read first, plus what code decoded from it. Measured: in 12 of 23
+    judge prompts the action's response was cut off because the setup Identify
+    dump came first and used the whole 8,000-character slice."""
+    from tc_system import spec_fields
+    from tc_system.review import step_structure
+    steps = tc.get("steps") or []
+    checked = {c.get("step") for g in ((tc.get("verification_contract") or {}).get("requirements") or [])
+               for c in g.get("checks") or [] if isinstance(c, dict)}
+    results = sorted(execution["step_results"],
+                     key=lambda r: (0 if r["step_index"] < len(steps) and steps[r["step_index"]].get("phase") == "action"
+                                    else 1 if r["step_index"] in checked else 2, r["step_index"]))
+    out = []
+    for r in results:
+        i = r["step_index"]
+        step = steps[i] if i < len(steps) else {}
+        budget = 2500 if step.get("phase") == "action" or i in checked else 700
+        code = spec_fields.status_code_in_output(r.get("stdout", ""))
+        head = (f"step {i} {step.get('name', '')} ({step.get('phase')}{', harness' if step.get('harness') else ''}): "
+                f"exit_code={r['exit_code']} completion={completion_status(r)}"
+                + (f" status_code=SCT{code[0]}/SC{code[1]:02X}h" if code else "")
+                + (f" NOT SENT: {r.get('blocked_reason') or r.get('cleanup_skipped')}"
+                   if r.get("blocked_reason") or r.get("cleanup_skipped") else ""))
+        text = str(r.get("stdout", ""))
+        body = text if len(text) <= budget else text[:budget] + f"\n...[{len(text) - budget} chars omitted]"
+        structure = step_structure(step) if step else None
+        decoded = []
+        if structure:
+            for group in ((tc.get("verification_contract") or {}).get("requirements") or []) + \
+                         ((tc.get("verification_contract") or {}).get("precondition_checks") or []):
+                for c in group.get("checks") or []:
+                    if isinstance(c, dict) and c.get("kind") == "data_field" and c.get("step") == i:
+                        interp = spec_fields.interpret_check(c, structure)
+                        if interp:
+                            decoded.append(f"  check reads {interp['label']}"
+                                           + (f" — PROBLEM: {interp['error']}" if interp["error"] else ""))
+        out.append(head + "\n" + body + ("\n" + "\n".join(decoded) if decoded else ""))
+    return out
+
+
 def _build_tc_exec_failure_context(tc: dict, execution: dict) -> dict:
     fc_id = stable_id("fc-tc_exec", tc["tc_id"], execution["executed_at"])
     excerpt = [f"TC {tc['tc_id']} ({tc['name']}): expectation={tc['expectation']['description']}"]
-    for r in execution["step_results"]:
-        excerpt.append(f"step {r['step_index']}: exit_code={r['exit_code']}\n{r['stdout']}")
     violated = [c for c in (tc["execution"] or {}).get("criteria_results", []) if c["result"] == "violated"]
     if violated:
         excerpt.append("violated fail criteria:\n" + "\n".join(f"- {c['criterion']}: {c['detail']}" for c in violated))
+    excerpt += _step_excerpts(tc, execution)
     dmesg_signals = classify_text(execution["dmesg_text"])
     # The judge grounds its spec lookup on signals["cmd_name"]/["opcode"]
     # before falling back to source_opcodes[0] — and for a chain that
@@ -86,6 +137,9 @@ def _build_tc_exec_failure_context(tc: dict, execution: dict) -> dict:
             "step_statuses": tc.get("step_statuses", []),
             "dmesg_signals": dmesg_signals,
             "dmesg_captured_scoped": execution.get("dmesg_captured_scoped", True),
+            # Contract problems found by code (wrong field read, status name vs
+            # code, self-compared length, unrestored state ...).
+            "harness_findings": [r["text"] for r in code_review(tc)],
             "test_definition": {"scenario": tc.get("scenario"), "steps": tc["steps"],
                                 "contract": tc.get("verification_contract"),
                                 "verification": tc.get("verification")},
@@ -169,7 +223,8 @@ def _preflight(tc: dict, allow_destructive: bool) -> None:
     commands and "실행 중...", then a second "[i/N] ... 건너뜀" header for the
     same index, while nothing had been sent (so no SSH log either)."""
     for i, step in enumerate(tc["steps"]):
-        passthru_cmd(step)  # the same field validation execute_tc_steps applies
+        if not step.get("host_action"):
+            passthru_cmd(step)  # the same field validation execute_tc_steps applies
         if not allow_destructive and (step.get("destructive") or step.get("firmware_state")):
             kind = "펌웨어 상태 변경" if step.get("firmware_state") else "데이터 파괴"
             raise DestructiveStepBlocked(
@@ -185,14 +240,135 @@ def _placeholder_reason(tc: dict) -> str:
             "(실험용으로 보내려면 --allow-placeholder-args, 그 결과는 커버리지 제외)")
 
 
-def _record_skip(skipped: list, section: dict, opcode_entry: dict, reason: str, kind: str) -> None:
+def _record_skip(skipped: list, section: dict, opcode_entry: dict, reason: str, kind: str, run_id=None) -> None:
     """A target that was tried but never reached the device. Persisted so the
-    next `pick_next_targets` counts it as an attempt and moves on."""
-    entry = {"section_id": section["section_id"], "opcode": opcode_entry["opcode"], "reason": reason}
+    next `pick_next_targets` counts it as an attempt and moves on. `run_id`
+    lets the report count this run's skips, not every skip ever."""
+    entry = {"section_id": section["section_id"], "opcode": opcode_entry["opcode"], "reason": reason,
+             "requirement_id": (section.get("target_requirement") or {}).get("requirement_id"), "run_id": run_id}
     skipped.append(entry)
     log = load_json(config.TARGET_SKIPS_PATH, default=[])
     log.append(dict(entry, kind=kind, at=datetime.now(timezone.utc).isoformat()))
     save_json_atomic(config.TARGET_SKIPS_PATH, log)
+
+
+@lru_cache(maxsize=1)
+def _code_fingerprint() -> dict:
+    """Which code produced a run: git commit when available, and always a
+    hash of the Python sources (the copied run folder had no git metadata)."""
+    info = {}
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=config.BASE_DIR, capture_output=True, text=True,
+                              timeout=5)
+        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=config.BASE_DIR, capture_output=True,
+                               text=True, timeout=5)
+        if head.returncode == 0:
+            info = {"git_commit": head.stdout.strip(), "git_dirty": bool(dirty.stdout.strip())}
+    except (OSError, subprocess.SubprocessError):
+        pass
+    digest = hashlib.sha256()
+    paths = sorted(config.BASE_DIR.glob("*.py"))
+    for package in ("tc_system", "shared", "log_judge", "report"):  # never the raw-log folders
+        paths += sorted((config.BASE_DIR / package).rglob("*.py"))
+    for path in paths:
+        if "__pycache__" in path.parts:
+            continue
+        digest.update(str(path.relative_to(config.BASE_DIR)).encode())
+        digest.update(path.read_bytes())
+    info["source_sha256"] = digest.hexdigest()[:16]
+    return info
+
+
+def _file_sha(path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    except OSError:
+        return None
+
+
+def _write_manifest(run_id, probe, options) -> dict:
+    from log_judge.judge import JUDGE_SYSTEM_PROMPT
+    from tc_system.generation.args_author import SYSTEM_PROMPT as ARGS_PROMPT
+    from tc_system.generation.scenario_generator import SCENARIO_SYSTEM_PROMPT
+    from tc_system.review import AUDIT_SYSTEM_PROMPT
+    prompts = {name: hashlib.sha256(text.encode()).hexdigest()[:16] for name, text in (
+        ("scenario", SCENARIO_SYSTEM_PROMPT), ("args", ARGS_PROMPT), ("judge", JUDGE_SYSTEM_PROMPT),
+        ("review_audit", AUDIT_SYSTEM_PROMPT))}
+    try:
+        rag_version = config.RAG_INDEX_CURRENT_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        rag_version = None
+    manifest = {"run_id": run_id, "started_at": datetime.now(timezone.utc).isoformat(),
+                "code": _code_fingerprint(), "coverage_index_sha256": _file_sha(config.active_coverage_index_path()),
+                "rag_index": rag_version, "prompts_sha256": prompts, "host": host_versions(probe) if probe else None,
+                "options": options}
+    save_json_atomic(config.RUN_MANIFESTS_DIR / f"{run_id}.json", manifest)
+    return manifest
+
+
+class _DaemonPool:
+    """Ahead-of-execution generation. Daemon threads: Ctrl+C ends the run at
+    once instead of waiting for in-flight LLM calls (ThreadPoolExecutor joins
+    its workers at interpreter exit). Results are only ever read in order by
+    the main loop; an unread one is simply dropped."""
+
+    def __init__(self, workers):
+        self._jobs = queue.Queue()
+        self._closed = False
+        for _ in range(workers):
+            threading.Thread(target=self._work, daemon=True).start()
+
+    def _work(self):
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            future, fn, args = job
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(fn(*args))
+            except BaseException as exc:  # handed to the main loop, raised there
+                future.set_exception(exc)
+
+    def submit(self, fn, *args):
+        future = Future()
+        if self._closed:
+            future.cancel()
+        else:
+            self._jobs.put((future, fn, args))
+        return future
+
+    def shutdown(self):
+        self._closed = True
+        while True:  # drop queued work; running calls finish on their own
+            try:
+                job = self._jobs.get_nowait()
+            except queue.Empty:
+                break
+            if job:
+                job[0].cancel()
+        for _ in range(64):
+            self._jobs.put(None)
+
+
+def _support_kwarg(support):
+    """Passed only when the probe produced one (older callers/test doubles
+    of generate_scenario take no such argument)."""
+    return {"device_support": support} if support else {}
+
+
+def _opcode_key(opcode_entry: dict):
+    if opcode_entry.get("host_action") or not opcode_entry.get("raw_opcode"):
+        return None
+    return opcode_entry["command_set"], opcode_entry["raw_opcode"].lower()
+
+
+def _action_unsupported_opcode(tc: dict) -> bool:
+    """The action itself came back INVALID_OPCODE (not a feature-level rejection)."""
+    results = {r["step_index"]: r for r in (tc.get("execution") or {}).get("step_results", [])}
+    return any(s.get("phase") == "action" and completion_status(results.get(i)) == "INVALID_OPCODE"
+               for i, s in enumerate(tc.get("steps") or []))
 
 
 # What one bad LLM reply can raise on its way through generation or judging.
@@ -201,12 +377,82 @@ def _record_skip(skipped: list, section: dict, opcode_entry: dict, reason: str, 
 # caught around judge_failure_context — the TC pipeline caught only
 # LLMCallError, so the same malformed reply that run_judge skips killed the
 # whole --count batch here.
-_LLM_REPLY_ERRORS = (LLMCallError, ValueError, KeyError, TypeError)
+_LLM_REPLY_ERRORS = (LLMCallError, ValueError, KeyError, TypeError, AttributeError)
+
+
+def _prepare_target(section, opcode_entry, ctx) -> dict:
+    """Everything up to the wire for one target: no device, no shared files,
+    so it runs ahead of execution in a worker thread. Returns {"skip": reason,
+    "kind": ...} or {"tc", "scenario", "resolved_steps", "variant", "section"}."""
+    section = dict(section, previous_requirements=[
+        {"requirement_id": r["requirement_id"], "quote": r["quote"], "description": r["description"]}
+        for old in ctx["existing"] for r in (old.get("verification") or {}).get("requirements", [])
+        if r.get("section_id") == section["section_id"] and r.get("status") in ("PASS", "FAIL")])
+    # Distinct per attempt: a stable (section, opcode) id would overwrite the
+    # previous record on a re-run, orphaning its FailureContext and verdict.
+    attempt_at = datetime.now(timezone.utc).isoformat()
+    # The requirement id too: several requirements of one clause and command
+    # are generated at the same moment by the prefetch threads, and the clock
+    # resolution on Windows can give them the same attempt_at.
+    target_req = section.get("target_requirement") or {}
+    tc_id = stable_id("tc", section["section_id"], opcode_entry["opcode"], target_req.get("requirement_id") or "",
+                      attempt_at)
+    variant = target_req if target_req.get("kind") == "variant" else None
+    host_steps = usable_host_steps(target_req, ctx["available_opcodes"], ctx["allow_destructive"])
+    if host_steps == []:
+        # The sentence is about state across a reset/power loss and this
+        # run has no way to cause one: no LLM call, a reason to fix it.
+        needed = ", ".join(target_req["host_actions"])
+        return {"section": section, "kind": "host_step_unavailable",
+                "skip": (f"리셋/전원 사이클 전후 상태를 요구하는 문장인데 이 실행에서 쓸 수 있는 호스트 스텝이 없음"
+                         f"(필요: {needed}) — 전원 사이클은 secrets.local.json의 pmu.enabled와 파괴적 명령 허용"
+                         f"(--no-destructive 없이)이 필요. 장비에 아무것도 보내지 않음")}
+    if host_steps:
+        section = dict(section, target_requirement=dict(target_req, host_steps=host_steps))
+    target = ctx["target"]
+    try:
+        if variant:
+            # Built by code: the swept value IS the test, no LLM involved.
+            tc = build_variant_tc(tc_id, variant, opcode_entry, target["nvme_ctrl"], target["nvme_ns"],
+                                  ctx["active_nsid"], ctx["lba_bytes"])
+            scenario = {"description": variant["description"]}
+            resolved_steps = [{"section": section, "opcode_entry": opcode_entry, "phase": "action",
+                               "role": variant["description"]}]
+        else:
+            scenario = generate_scenario(section, opcode_entry, ctx["available_opcodes"],
+                                         device_facts=ctx["device_facts"], **_support_kwarg(ctx["device_support"]))
+            resolved_steps = _resolve_steps_plan(ctx["index"], scenario["steps_plan"], ctx["available_opcodes"], section)
+            tc = build_tc(tc_id, resolved_steps, scenario, target["nvme_ctrl"], target["nvme_ns"], ctx["active_nsid"],
+                          device_facts=ctx["device_facts"], lba_bytes=ctx["lba_bytes"],
+                          device_support=ctx["device_support"])
+    except _LLM_REPLY_ERRORS as exc:
+        # A transient malformed/incomplete reply for this one target must
+        # not take down the rest of the batch (measured: one missing key
+        # in a scenario response used to crash the whole --count run,
+        # losing every target after it even though they were unrelated).
+        # Nothing was built or sent to the device, so this section is
+        # simply offered again next run.
+        return {"section": section, "kind": "generation_failed", "skip": str(exc) or type(exc).__name__}
+    # Gate on what actually makes the command meaningless — placeholder
+    # arguments hardcoded in tc_writer — not on whether the LLM is a stub.
+    # Measured on the target: cdw10=0 is a reserved value for most admin
+    # commands (INVALID_FIELD/exit 22) and NVM Read 0x02 exits 0 while
+    # transferring nothing, which would be recorded as a false PASS. A skip,
+    # not a batch stop: nothing was sent, the section is offered again.
+    if tc["uses_placeholder_args"] and not ctx["allow_placeholder_args"]:
+        return {"section": section, "kind": "placeholder_args", "skip": _placeholder_reason(tc)}
+    try:
+        _preflight(tc, ctx["allow_destructive"])
+    except (DestructiveStepBlocked, ValueError) as exc:
+        return {"section": section, "kind": "blocked_before_wire", "skip": str(exc) or type(exc).__name__}
+    return {"section": section, "tc": tc, "tc_id": tc_id, "scenario": scenario, "resolved_steps": resolved_steps,
+            "variant": variant}
 
 
 def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: bool = False,
                   allow_destructive: bool = False, on_start=None, on_progress=None, on_skip=None,
-                  reset_coverage: bool = False) -> dict:
+                  reset_coverage: bool = False, generation_workers: int | None = None,
+                  review_with_llm: bool | None = None) -> dict:
     """`on_start(index, total, tc)`, if given, fires right after a TC is built —
     scenario and Expectation are already filled in, but execution hasn't
     happened yet, so a caller can show what is about to be sent before it is.
@@ -251,6 +497,8 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
     # the target's own device path (not assumed) — the single source of truth
     # that author_args checks every authored nsid against.
     active_nsid = namespace_id_from_device_path(target["nvme_ns"])
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    probe, support = None, None
     try:
         # Best-effort and run exactly once per batch, not once per TC: a probe
         # failure (unreachable target, an nvme-cli version missing a
@@ -260,72 +508,102 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
         # Measured, not assumed: NVM Read/Write/Compare buffers are checked
         # against NLB x this before anything reaches the wire.
         lba_bytes = in_use_lba_bytes(probe)
+        nsze = namespace_size(probe)
+        # Which LIDs/FIDs this drive implements (Supported Log Pages, Get
+        # Features SEL=011b): rejections of unsupported ones are findings
+        # about the drive, and negative tests built on a false premise are
+        # refused before they are sent.
+        support = probed_support(probe)
+        save_json_atomic(config.DEVICE_INFO_PATH, {"nsze": nsze, "lba_bytes": lba_bytes,
+                                                   "supported_lids": sorted(k for k, v in support["lids"].items() if v),
+                                                   "fids": {f"{k:02X}": v for k, v in support["fids"].items()},
+                                                   "probed_at": datetime.now(timezone.utc).isoformat()})
     except Exception:
-        device_facts, lba_bytes = None, None
+        device_facts, lba_bytes, nsze = None, None, None
+    if support is not None and not support["lids"] and not support["fids"]:
+        support = None
+    workers = config.TC_GENERATION_WORKERS if generation_workers is None else generation_workers
+    review_llm = config.REVIEW_AUDIT_WITH_LLM if review_with_llm is None else review_with_llm
+    try:
+        _write_manifest(run_id, probe, {"count": count, "allow_destructive": allow_destructive,
+                                        "allow_placeholder_args": allow_placeholder_args,
+                                        "generation_workers": workers, "review_with_llm": review_llm})
+    except Exception:
+        pass  # a record of the run, never a precondition for it
+    # Code-generated variants (no LLM): values swept under a fixed spec oracle.
+    variants = variant_targets(index, nsze=nsze, lba_bytes=lba_bytes)
     executor = executor or SSHTCExecutor(allow_destructive=allow_destructive)
     # ADMIN/NVM combos are allowed in one chain, so the model is always shown
     # the whole table, not just the primary target's own command_set.
-    available_opcodes = index.list_opcodes()
+    # Host steps (reset, PMU power cycle) can be setup/verify steps of a chain.
+    available_opcodes = index.list_opcodes() + host_action_entries(config.get_pmu())
 
     existing = tc_store.load_all()
     targets = pick_next_targets(index, existing, sys.maxsize if count is None else count,
-                                skip_records=load_json(config.TARGET_SKIPS_PATH, default=[]))
+                                skip_records=load_json(config.TARGET_SKIPS_PATH, default=[]), variants=variants)
     total = len(targets)
 
     generated, executed, failed, host_crashes, unsupported, skipped = [], [], [], [], [], []
-    for i, (section, opcode_entry) in enumerate(targets, start=1):
-        attempts = []
-        section = dict(section, previous_requirements=[
-            {"requirement_id": r["requirement_id"], "quote": r["quote"], "description": r["description"]}
-            for old in existing for r in (old.get("verification") or {}).get("requirements", [])
-            if r.get("section_id") == section["section_id"] and r.get("status") in ("PASS", "FAIL")])
-        # Distinct per attempt: a stable (section, opcode) id would overwrite the
-        # previous record on a re-run, orphaning its FailureContext and verdict.
-        attempt_at = datetime.now(timezone.utc).isoformat()
-        tc_id = stable_id("tc", section["section_id"], opcode_entry["opcode"], attempt_at)
-        try:
-            scenario = generate_scenario(section, opcode_entry, available_opcodes, device_facts=device_facts)
-            resolved_steps = _resolve_steps_plan(index, scenario["steps_plan"], available_opcodes, section)
-            tc = build_tc(tc_id, resolved_steps, scenario, target["nvme_ctrl"], target["nvme_ns"], active_nsid,
-                           device_facts=device_facts, lba_bytes=lba_bytes)
-        except _LLM_REPLY_ERRORS as exc:
-            # A transient malformed/incomplete reply for this one target must
-            # not take down the rest of the batch (measured: one missing key
-            # in a scenario response used to crash the whole --count run,
-            # losing every target after it even though they were unrelated).
-            # Nothing was built or sent to the device, so this section is
-            # simply offered again next run.
-            reason = str(exc) or type(exc).__name__
-            _record_skip(skipped, section, opcode_entry, reason, "generation_failed")
-            if on_skip:
-                on_skip(i, total, section, opcode_entry, reason)
-            continue
+    ctx = {"existing": existing, "available_opcodes": available_opcodes, "allow_destructive": allow_destructive,
+           "allow_placeholder_args": allow_placeholder_args, "target": target, "active_nsid": active_nsid,
+           "lba_bytes": lba_bytes, "device_facts": device_facts, "device_support": support, "index": index}
+    unsupported_in_run = {}  # (command set, opcode) -> section id that showed it
+    pool = _DaemonPool(workers) if workers and workers > 1 else None
+    futures = {}
 
-        # Gate on what actually makes the command meaningless — placeholder
-        # arguments hardcoded in tc_writer — not on whether the LLM is a stub.
-        # Those are independent: a real LLM authoring prose scenarios does not
-        # by itself make cdw10=0 a valid CNS/LID/FID. This used to raise and
-        # halt the whole --count batch over one target (measured: one command
-        # the model couldn't argue real values for took nine unrelated targets
-        # down with it) — now it's a skip like the LLMCallError case above:
-        # nothing was sent to the device, so the section is offered again.
-        # Measured on the target: cdw10=0 is a reserved value for most admin
-        # commands (INVALID_FIELD/exit 22) and NVM Read 0x02 exits 0 while
-        # transferring nothing, which would be recorded as a false PASS.
-        if tc["uses_placeholder_args"] and not allow_placeholder_args:
-            reason = _placeholder_reason(tc)
-            _record_skip(skipped, section, opcode_entry, reason, "placeholder_args")
+    def _ensure(upto):
+        for j in range(len(futures), min(upto, len(targets))):
+            # A run of skipped targets of an unsupported command can outlast
+            # the prefetch window; their generation would never be read.
+            if pool and _opcode_key(targets[j][1]) not in unsupported_in_run:
+                futures[j] = pool.submit(_prepare_target, targets[j][0], targets[j][1], ctx)
+            else:
+                futures[j] = None
+
+    try:
+        return _run_targets(targets, total, ctx, pool, futures, _ensure, unsupported_in_run, workers, executor,
+                            index, variants, target, active_nsid, device_facts, support, lba_bytes,
+                            available_opcodes, allow_destructive, review_llm, run_id, on_start, on_progress, on_skip,
+                            generated, executed, failed, host_crashes, unsupported, skipped)
+    finally:
+        if pool:
+            pool.shutdown()
+
+
+def _run_targets(targets, total, ctx, pool, futures, _ensure, unsupported_in_run, workers, executor, index, variants,
+                 target, active_nsid, device_facts, support, lba_bytes, available_opcodes, allow_destructive,
+                 review_llm, run_id, on_start, on_progress, on_skip,
+                 generated, executed, failed, host_crashes, unsupported, skipped):
+    for i, (section, opcode_entry) in enumerate(targets, start=1):
+        attempts, verdict = [], None
+        key = _opcode_key(opcode_entry)
+        if key in unsupported_in_run:
+            # The drive already answered INVALID_OPCODE for this command in
+            # this run: another clause of it cannot learn more (measured: 41
+            # UNSUPPORTED TCs over 23 opcodes, 18 of them repeats).
+            ahead = futures.get(i - 1)
+            spent = ahead is not None and not ahead.cancelled() and (ahead.done() or ahead.running())
+            reason = (f"같은 실행에서 {opcode_entry['name']}({opcode_entry['raw_opcode']})가 이미 INVALID_OPCODE로 "
+                      f"미지원 확인됨({unsupported_in_run[key]}) — 전송 생략"
+                      + ("(미리 생성은 이미 진행돼 결과를 버림)" if spent else ", LLM 호출도 생략"))
+            _record_skip(skipped, section, opcode_entry, reason, "opcode_unsupported_in_run", run_id=run_id)
             if on_skip:
                 on_skip(i, total, section, opcode_entry, reason)
             continue
-        try:
-            _preflight(tc, allow_destructive)
-        except (DestructiveStepBlocked, ValueError) as exc:
-            reason = str(exc) or type(exc).__name__
-            _record_skip(skipped, section, opcode_entry, reason, "blocked_before_wire")
+        _ensure(i + max(workers or 1, 1))
+        future = futures.get(i - 1)
+        if future is not None and future.cancelled():
+            future = None
+        prepared = future.result() if future is not None else _prepare_target(section, opcode_entry, ctx)
+        section = prepared["section"]
+        if "skip" in prepared:
+            _record_skip(skipped, section, opcode_entry, prepared["skip"], prepared["kind"], run_id=run_id)
             if on_skip:
-                on_skip(i, total, section, opcode_entry, reason)
+                on_skip(i, total, section, opcode_entry, prepared["skip"])
             continue
+        tc, tc_id, scenario = prepared["tc"], prepared["tc_id"], prepared["scenario"]
+        resolved_steps, variant = prepared["resolved_steps"], prepared["variant"]
+        tc["run_id"] = run_id
 
         if on_start:
             on_start(i, total, tc)
@@ -340,7 +618,7 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
             # own correctness, so it must not take the rest of the batch with
             # it either.
             reason = str(exc) or type(exc).__name__
-            _record_skip(skipped, section, opcode_entry, reason, "blocked_before_wire")
+            _record_skip(skipped, section, opcode_entry, reason, "blocked_before_wire", run_id=run_id)
             if on_skip:
                 on_skip(i, total, section, opcode_entry, reason)
             continue
@@ -349,8 +627,12 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
 
         action_idx = next(j for j, rs in enumerate(resolved_steps) if rs["phase"] == "action")
         unsent = {r["step_index"]: r["blocked_reason"] for r in execution["step_results"] if r.get("blocked_reason")}
+        # Only the test's own steps: an unsent restore (cleanup_not_needed) or
+        # a failed snapshot is not what a retry or replan can fix, and picking
+        # it hid the real stop reason and the action's own rejection.
         broken_idx = next((j for j, st in enumerate(step_statuses)
-                           if st in ("ERROR", "UNSUPPORTED") and j not in unsent), None)
+                           if st in ("ERROR", "UNSUPPORTED") and j not in unsent
+                           and is_test_step(tc["steps"][j])), None)
         # Retrying at all after a destructive/firmware_state step already ran
         # risks re-sending that step purely to fix an unrelated later one —
         # SSH batches can't be partially replayed, so any retry resends
@@ -381,7 +663,10 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
                               "detail": ("앞 스텝에서 파괴적/펌웨어 커맨드가 이미 실행돼 재시도하지 않음"
                                          if precedes_destructive else "장비 행(타임아웃/커널 취소)이라 재시도하지 않음")})
 
-        if broken_idx is not None and not precedes_destructive and not timed_out:
+        if broken_idx is not None and variant:
+            retry_log.append({"kind": "none", "step_index": broken_idx, "step_name": tc["steps"][broken_idx].get("name"),
+                              "detail": "코드 변형 TC는 값 자체가 테스트라 인자를 바꿔 재시도하지 않음"})
+        elif broken_idx is not None and not precedes_destructive and not timed_out:
             if rejection is not None and rejection[0] == broken_idx:
                 # Fixable by different field values. Rebuilds the rejected
                 # step plus everything after it (not just the one step) —
@@ -395,7 +680,7 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
                 try:
                     retry_steps = reauthor_steps(tc, resolved_steps,
                                                   {"step_index": broken_idx, "reason": rejection[1]}, active_nsid,
-                                                  device_facts=device_facts)
+                                                  device_facts=device_facts, device_support=support)
                 except _LLM_REPLY_ERRORS as exc:
                     retry_steps = None
                     entry["detail"] = f"인자 재생성 LLM 호출 실패로 재시도하지 않음: {exc}"
@@ -409,6 +694,13 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
                 # paired with the *previous* execution's results, and with the
                 # criteria/status checks below reading the new steps' cdw10/
                 # field_value_verified against that old output.
+                if retry_steps is not None and not any(s.get("args_source") == "placeholder" for s in retry_steps) \
+                        and not _changed_args(tc["steps"], retry_steps):
+                    # Measured: 11 of 34 retries resent the identical command
+                    # and got the identical rejection.
+                    entry["changes"] = ["바뀐 인자 없음"]
+                    entry["detail"] = "재생성한 인자가 거부된 인자와 같아 다시 보내지 않음"
+                    retry_steps = None
                 if retry_steps is not None and not any(s.get("args_source") == "placeholder" for s in retry_steps):
                     # `tc["retried"]` is purely a display aid for
                     # run_tc_pipeline.py — without it, the "실행할 명령" block
@@ -440,20 +732,28 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
                 # different field values: ask for one, and only commit to it
                 # if it comes back usable (not placeholder-gated itself).
                 broken_name = resolved_steps[broken_idx]["opcode_entry"]["name"]
-                replan_reason = f"{broken_name} is UNSUPPORTED (INVALID_OPCODE) on this drive"
+                broken_result = next((r for r in execution["step_results"] if r["step_index"] == broken_idx), None)
+                if completion_status(broken_result) == "INVALID_OPCODE":
+                    replan_reason = f"{broken_name} is UNSUPPORTED (INVALID_OPCODE) on this drive"
+                else:
+                    replan_reason = (f"{broken_name} with cdw10={tc['steps'][broken_idx].get('cdw10')} is rejected because "
+                                     "this drive does not support that feature/log page (probed at the start of the "
+                                     "run); do not depend on it")
                 entry = {"kind": "replanned", "step_index": broken_idx, "step_name": broken_name,
                          "trigger": replan_reason}
                 retry_log.append(entry)
                 try:
                     replanned_scenario = generate_scenario(
                         section, opcode_entry, available_opcodes,
-                        feedback=f"step {broken_idx} ({broken_name}) is UNSUPPORTED (INVALID_OPCODE) on this drive",
-                        device_facts=device_facts)
+                        feedback=f"step {broken_idx}: {replan_reason}",
+                        device_facts=device_facts, **_support_kwarg(support))
                     replanned_steps = _resolve_steps_plan(index, replanned_scenario["steps_plan"],
                                                            available_opcodes, section)
                     replanned_tc = build_tc(tc_id, replanned_steps, replanned_scenario,
                                              target["nvme_ctrl"], target["nvme_ns"], active_nsid,
-                                             device_facts=device_facts, lba_bytes=lba_bytes)
+                                             device_facts=device_facts, lba_bytes=lba_bytes,
+                                             device_support=support)
+                    replanned_tc["run_id"] = run_id
                 except _LLM_REPLY_ERRORS:
                     # The replan is "nice to have, falls back to what's
                     # already been measured" — same as a replan that itself
@@ -482,7 +782,7 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
                         # away a real execution and also skipped the post-TC
                         # health check below for a chain that had already run.
                         replanned_execution = None
-                    if replanned_execution is not None:
+                    if replanned_execution is not None and replanned_tc is not None:
                         # See the comment on "retried" above — same display
                         # aid, attached to replanned_tc (the one that becomes
                         # the final `tc`) since this path replaces the object
@@ -556,6 +856,9 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
             tc_store.upsert(tc)  # the stored TC points at its saved FailureContext before judging
             try:
                 verdict = judge_failure_context(fc)
+                # Same path as a later run_judge: holds an unfounded defect
+                # verdict and links it to this TC.
+                verdict = apply_tc_verdict(tc, verdict)
             except _LLM_REPLY_ERRORS:
                 # The device-side FAIL/ERROR is real regardless of whether
                 # judging succeeds — an LLM hiccup here must not crash the
@@ -576,19 +879,33 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
                 tc["failure_context_id"] = fc["failure_context_id"]
             failed.append(tc)
 
+        try:
+            tc["review"] = review_tc(tc, verdict=verdict if tc.get("verdict_id") else None, use_llm=review_llm)
+        except Exception as exc:  # the review annotates a result, it never decides one
+            tc["review"] = {"level": "must", "label": "꼭 확인", "scope": None, "audit_llm_response_id": None,
+                            "reasons": [{"level": "must", "code": "review_error", "source": "code",
+                                         "text": f"검토 사유 계산 실패: {exc}"}]}
+        if _action_unsupported_opcode(tc) and _opcode_key(opcode_entry):
+            unsupported_in_run.setdefault(_opcode_key(opcode_entry), section["section_id"])
+            # Prefetched generation for the same command that has not started
+            # yet is dropped before it spends LLM calls.
+            for j, ahead in futures.items():
+                if ahead is not None and j >= i and _opcode_key(targets[j][1]) == _opcode_key(opcode_entry):
+                    ahead.cancel()
         tc["updated_at"] = datetime.now(timezone.utc).isoformat()
         tc_store.upsert(tc)
         # Recomputed per TC, not just after the loop: a crash or device hang
         # mid-run would otherwise leave coverage_state.json describing a store
         # that has already moved on.
-        coverage = compute_coverage(index, tc_store.load_all(), load_json(config.TARGET_SKIPS_PATH, default=[]))
+        coverage = compute_coverage(index, tc_store.load_all(), load_json(config.TARGET_SKIPS_PATH, default=[]),
+                                    variants)
         save_json_atomic(config.COVERAGE_STATE_PATH, coverage)
 
         if on_progress:
             on_progress(i, total, tc)
 
         risky_steps = any(s.get("destructive") or s.get("firmware_state") or s.get("lockout_risk")
-                          for s in tc["steps"])
+                          or s.get("host_action") for s in tc["steps"])
         # A timeout gets the same check: the batch was killed because the
         # device stopped answering, and without this every remaining target
         # would spend its own full timeout (SECONDS_PER_STEP x steps) finding
@@ -615,9 +932,14 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
                         on_skip(j, total, remaining_section, remaining_opcode, skip_reason)
                 break
 
-    coverage = compute_coverage(index, tc_store.load_all(), load_json(config.TARGET_SKIPS_PATH, default=[]))
+    coverage = compute_coverage(index, tc_store.load_all(), load_json(config.TARGET_SKIPS_PATH, default=[]),
+                                variants)
     save_json_atomic(config.COVERAGE_STATE_PATH, coverage)
 
-    return {"generated": len(generated), "executed": len(executed), "failed": len(failed),
+    review_counts = {}
+    for tc in executed:
+        level = (tc.get("review") or {}).get("level", "info")
+        review_counts[level] = review_counts.get(level, 0) + 1
+    return {"generated": len(generated), "executed": len(executed), "failed": len(failed), "review": review_counts,
             "our_bugs": len(host_crashes), "unsupported": len(unsupported), "skipped": len(skipped),
             "coverage": coverage["summary"]}

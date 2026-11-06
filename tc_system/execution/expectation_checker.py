@@ -28,9 +28,22 @@ HOST_CRASH_MARKERS = ("malloc(", "corrupted", "Segmentation fault", "double free
                        "free(): invalid", "stack smashing", "core dumped")
 
 
+def is_test_step(step: dict) -> bool:
+    """False for the harness's own snapshot/restore steps and cleanup steps:
+    they put the drive back and say nothing about the requirement."""
+    return not step.get("harness") and step.get("phase") != "cleanup"
+
+
+def _test_results(tc_record: dict, execution_result: dict):
+    steps = tc_record.get("steps", [])
+    return [r for r in execution_result.get("step_results", [])
+            if r["step_index"] >= len(steps) or is_test_step(steps[r["step_index"]])]
+
+
 def _nonzero_exit(tc_record: dict, execution_result: dict) -> tuple[bool, str]:
     steps = tc_record.get("steps", [])
-    offenders = [r for r in execution_result.get("step_results", []) if r["exit_code"] != 0
+    offenders = [r for r in _test_results(tc_record, execution_result) if r["exit_code"] != 0
+                 and r.get("started", True)
                  and not (r["step_index"] < len(steps) and matches_expected(steps[r["step_index"]], r))]
     if offenders:
         codes = ", ".join(f"step{r['step_index']}={r['exit_code']}" for r in offenders)
@@ -65,7 +78,7 @@ def _timed_out(tc_record: dict, execution_result: dict) -> tuple[bool, str]:
 
 
 def _controller_error_status(tc_record: dict, execution_result: dict) -> tuple[bool, str]:
-    for r in execution_result.get("step_results", []):
+    for r in _test_results(tc_record, execution_result):
         steps = tc_record.get("steps", [])
         if r["step_index"] < len(steps) and matches_expected(steps[r["step_index"]], r):
             continue
@@ -190,13 +203,29 @@ def rejected_arguments(execution_result: dict, tc_record: dict | None = None) ->
     steps = (tc_record or {}).get("steps", [])
     for r in execution_result.get("step_results", []):
         if r["step_index"] < len(steps) and (matches_expected(steps[r["step_index"]], r)
-                                             or expected_status(steps[r["step_index"]]) != "SUCCESS"):
+                                             or expected_status(steps[r["step_index"]]) != "SUCCESS"
+                                             or not is_test_step(steps[r["step_index"]])
+                                             or feature_unsupported(steps[r["step_index"]], r)):
             continue
         out = str(r.get("stdout", ""))
         for match in _INVALID_STATUS_RE.finditer(out):
             if match.group(0) != "INVALID_OPCODE":
                 return r["step_index"], out.strip().splitlines()[0]
     return None
+
+
+def feature_unsupported(step: dict, result: dict | None) -> bool:
+    """The drive rejected a FID/LID that the start-of-run probe found it does
+    not support: a fact about the drive, not our arguments (measured: Get
+    Features FID 11h/12h/13h/16h... were "our argument errors", and a retry
+    that only changed the NSID was sent each time)."""
+    if step.get("selector_support") is not False or not result:
+        return False
+    actual = completion_status(result)
+    raw = str(step.get("opcode", "")).lower()
+    if step.get("mode") != "admin-passthru":
+        return False
+    return (raw in ("0x09", "0x0a") and actual == "INVALID_FIELD") or (raw == "0x02" and actual == "INVALID_LOG_PAGE")
 
 
 def field_value_unsupported(tc_record: dict, execution_result: dict):
@@ -264,6 +293,14 @@ def check_step_expectations(tc_record: dict, execution_result: dict) -> list[str
         r = results.get(i)
         if not r or not r.get("started", True):
             status = "ERROR"
+        elif step.get("host_action"):
+            # Exit 98: the controller never answered again after the reset or
+            # power cycle - a device finding. Anything else failing is the
+            # host/PMU side.
+            code = r.get("exit_code")
+            status = ("PASS" if matches_expected(step, r)
+                      else "FAIL" if code == 98 or (code is None and execution_result.get("timed_out"))
+                      else "ERROR")
         else:
             out, code = str(r.get("stdout", "")), r.get("exit_code")
             actual = completion_status(r)
@@ -277,7 +314,7 @@ def check_step_expectations(tc_record: dict, execution_result: dict) -> list[str
                 status = "FAIL"
             elif matches_expected(step, r):
                 status = "FAIL" if step.get("direction", "none") != "none" and not step.get("data_len") else "PASS"
-            elif actual == "INVALID_OPCODE":
+            elif actual == "INVALID_OPCODE" or (expected_status(step) == "SUCCESS" and feature_unsupported(step, r)):
                 status = "UNSUPPORTED"
             elif actual and expected_status(step) != "SUCCESS":
                 # A negative test observed the wrong completion. Accepting the
@@ -312,7 +349,9 @@ def check_execution(tc_record: dict, execution_result: dict) -> str:
     if device_hung(execution_result):
         return "FAIL"
     blocked = {r["step_index"] for r in execution_result.get("step_results", []) if r.get("blocked_reason")}
-    considered = {i: s for i, s in enumerate(statuses) if i not in blocked}
+    steps = tc_record.get("steps", [])
+    considered = {i: s for i, s in enumerate(statuses)
+                  if i not in blocked and (i >= len(steps) or is_test_step(steps[i]))}
     action_indices = {i for i, step in enumerate(tc_record.get("steps", [])) if step.get("phase") == "action"}
     if not action_indices:
         action_indices = set(range(len(statuses)))
@@ -324,6 +363,12 @@ def check_execution(tc_record: dict, execution_result: dict) -> str:
     setup_error = any(considered.get(i) == "ERROR" for i in range(first_action))
     if not setup_error and any(considered.get(i) == "FAIL" for i in action_indices):
         return "FAIL"
+    # A setup step the drive refused means the state the action needed was
+    # never built: nothing about the action was observed. Measured: Create
+    # I/O CQ (setup) -> QID_INVALID made Delete CQ and FID 09h "FAIL" though
+    # neither action ran.
+    if any(considered.get(i) == "FAIL" for i in range(first_action)):
+        return "ERROR"
     values = set(considered.values())
     if "UNSUPPORTED" in values:
         return "UNVERIFIED"  # Missing setup/verify capability, not an unsupported action.
@@ -338,6 +383,18 @@ def check_execution(tc_record: dict, execution_result: dict) -> str:
 
 def check_expectation(tc_record: dict, execution_result: dict) -> str:
     status = check_execution(tc_record, execution_result)
+    if status == "FAIL" and not device_hung(execution_result):
+        # "If the controller does not support X, abort with Invalid Field":
+        # the drive answered SUCCESS, i.e. it supports X - the rule does not
+        # apply (measured: LID 09h and CNS 10h, both stored as FAIL).
+        verification = verify_tc(tc_record, execution_result)
+        # A raw unexpected completion is a violation of the cited rule only if
+        # the rule applies: its premise refuted by the drive, or never measured,
+        # leaves it unjudged (review R07: an unmeasured "Discovery controller"
+        # premise still produced FAIL and a firmware-defect verdict).
+        if verification["status"] != "FAIL" and any(
+                "전제가 장비 응답으로 반증" in issue or "사전조건 미측정" in issue for issue in verification["issues"]):
+            return "UNVERIFIED"
     if status != "PASS":
         return status
     # Successful command delivery is necessary, never sufficient, for PASS.
@@ -363,9 +420,17 @@ def error_cause(tc_record: dict, execution_result: dict) -> dict | None:
     """
     steps = tc_record.get("steps", [])
     results = {r["step_index"]: r for r in execution_result.get("step_results", [])}
-    for i, status in enumerate(check_step_expectations(tc_record, execution_result)):
+    statuses = check_step_expectations(tc_record, execution_result)
+    action = min((i for i, s in enumerate(steps) if s.get("phase") == "action"), default=len(steps))
+    for i, status in enumerate(statuses):
         r = results.get(i)
-        if status != "ERROR" or (r and r.get("blocked_reason")):
+        if status == "FAIL" and i < action and is_test_step(steps[i]) and not (r and r.get("blocked_reason")):
+            return {"step_index": i, "step": steps[i].get("name") or steps[i].get("opcode"),
+                    "phase": steps[i].get("phase"), "kind": "사전 상태",
+                    "detail": (f"setup 스텝이 기대 완료 상태 {expected_status(steps[i])} 대신 "
+                               f"{completion_status(r) or status_line(str((r or {}).get('stdout', '')))}로 끝나 action이 "
+                               "필요로 하는 상태를 만들지 못함 — action은 관측되지 않음(장비 문제일 수도 있으니 확인)")}
+        if status != "ERROR" or (r and r.get("blocked_reason")) or not is_test_step(steps[i]):
             continue
         step = steps[i]
         out, code = str((r or {}).get("stdout", "")), (r or {}).get("exit_code")
@@ -414,6 +479,16 @@ def describe_outcome(tc: dict, verification: dict | None = None) -> dict:
         cause = "; ".join(f"{c.get('criterion')}: {c.get('detail')}" for c in violated[:3]) or None
         return {"verdict": "장비 결함 후보 — 스펙과 다른 동작이나 행이 관측됨", "cause": cause,
                 "next": "LLM 판정(verdict)과 원시 응답을 엔지니어가 확인"}
+    steps = tc.get("steps") or []
+    refused = next((f"스텝 {r['step_index']} {steps[r['step_index']].get('name')} cdw10="
+                    f"{steps[r['step_index']].get('cdw10')} → {completion_status(r)}"
+                    for r in execution.get("step_results", [])
+                    if r["step_index"] < len(steps) and feature_unsupported(steps[r["step_index"]], r)), None)
+    if status == "UNSUPPORTED" and refused and not any(
+            completion_status(r) == "INVALID_OPCODE" for r in execution.get("step_results", [])):
+        # The command exists; the FID/LID the probe found unsupported was refused.
+        return {"verdict": "드라이브가 이 기능(FID/LID)을 지원하지 않음 — 커맨드 자체는 구현됨",
+                "cause": refused, "next": "실행 시작 조회(지원 FID/LID)와 일치. 선택 기능이면 정상"}
     if status == "UNSUPPORTED":
         expected = [f"스텝 {i} {s.get('name')}: 기대 {expected_status(s)}"
                     for i, s in enumerate(tc.get("steps") or [])

@@ -1,0 +1,13 @@
+{
+  "tc_count": 191,
+  "transitions": {
+    "PASS->PASS": 28,
+    "UNVERIFIED->UNVERIFIED": 61,
+    "UNSUPPORTED->UNSUPPORTED": 41,
+    "ERROR->ERROR": 41,
+    "FAIL->UNVERIFIED": 10,
+    "FAIL->FAIL": 2,
+    "FAIL->ERROR": 2,
+    "PASS->UNVERIFIED": 6
+  }
+}

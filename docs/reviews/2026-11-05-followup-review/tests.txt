@@ -1,0 +1,16 @@
+/mnt/d/D_Download/ClaudeCode_Project/tests/test_harness_rules.py:67: ResourceWarning: unclosed file <_io.TextIOWrapper name='/mnt/d/D_Download/ClaudeCode_Project/rag/index/v20260922_172200/chunks.jsonl' mode='r' encoding='utf-8'>
+  cls.text = "\n".join(json.loads(l).get("content", "") for l in SPEC_CHUNKS.open(encoding="utf-8"))
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+----------------------------------------------------------------------
+Ran 504 tests in 23.012s
+
+OK
+
+[2026-11-05 18:36:49.284] [1/10] header
+[2026-11-05 18:36:49.287] line one
+[2026-11-05 18:36:49.287] line two (short)
+[2026-11-05 18:36:49.287] line three
+[2026-11-05 18:36:49.289] first line
+[2026-11-05 18:36:49.289] second line
+[2026-11-05 18:36:49.291] 한글 테스트 라인
+[2026-11-05 18:36:49.291] plain ascii line

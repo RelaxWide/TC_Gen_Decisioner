@@ -1,6 +1,7 @@
 import json
 
 from shared.spec_evidence import format_evidence
+from tc_system.spec_fields import FEATURE_CODECS, field_catalog_text
 from tc_system.verification import validate_plan_contract, CAPABILITIES
 from shared.llm_client import generate_llm_response
 from shared.rag_client import generate_rag_response
@@ -10,14 +11,16 @@ SCENARIO_SCHEMA = {
     "preconditions": "array of strings — device/namespace state required before the command runs",
     "steps_plan": (
         'array of objects {"opcode_name": <a real command name from available_commands>, '
-        '"role": <what this step checks>, "phase": "setup" | "action" | "verify", '
+        '"role": <what this step checks; name its FID/LID/CNS, e.g. "FID 13h">, '
+        '"phase": "setup" | "action" | "verify" | "cleanup", '
         '"expected_status": "SUCCESS" or the expected error as nvme-cli prints it '
         '(e.g. INVALID_OPCODE for Invalid Command Opcode, INVALID_FIELD, INVALID_NS, INVALID_LOG_PAGE), '
         '"field_constraints": [{"field": "cdw10", "mask": "0x000007FF", "value": "0x0000037D"}], '
         '"payload_hex": null or a short hex byte pattern (e.g. "A55A") repeated to fill a write buffer}. '
         'Exactly one step must have phase="action" and its opcode_name must equal the target '
         'command given above (opcode=... command_set=...). setup steps must come before the '
-        'action step, verify steps must come after it. If the clause needs several preconditions '
+        'action step, verify steps after it, cleanup steps last (they restore state and run even if the '
+        'chain stops; never check them). If the clause needs several preconditions '
         'or a multi-step state transition, use as many setup steps as genuinely needed — do not '
         'force the count down. A single-entry plan (just the action step) is correct and common; '
         'only add setup/verify steps when the clause text actually calls for them.'
@@ -31,8 +34,15 @@ SCENARIO_SCHEMA = {
         'Each requirement needs executable checks. A check has "kind" and zero-based "step". '
         'Allowed kinds: completion (compare with step.expected_status); '
         'result_bits (CQE DW0: mask, value, operator eq/ne/le/ge); '
-        'data_length (bytes); data_field (little-endian offset, width 1..8, mask, value, operator); '
+        'data_field: for Identify Controller/Namespace and the Supported Log Pages, Commands Supported '
+        'and Effects and FID Supported and Effects logs use a NAMED field, {"kind": "data_field", "step": i, '
+        '"field": "OACS.NMS", "value": 1} or {"field": "ONCS", "mask": .., "value": .., "operator": ..} or '
+        '{"field": "LSUPP", "index": "16h", "value": 1}; other data uses little-endian offset, width 1..8, '
+        'mask, value, operator; '
+        'data_all (every returned byte equals "value", e.g. 0 for an all-zero read); '
         'data_equal (other_step); data_matches_write (other_step, compare with that write payload). '
+        'There is no length check: the buffer length is what we requested, not an observation. '
+        'A check that holds for every possible value (e.g. le mask, ge 0) is rejected. '
         'Masks and values are integers or 0x hex strings. No Python, expressions or regex checks.'
     ),
     "precondition_checks": 'array of {"description": exact preconditions entry, "checks": [check objects]}; '
@@ -72,13 +82,28 @@ SCENARIO_SYSTEM_PROMPT = (
     "Declare expected_status for EVERY step, including intentionally expected errors in negative tests. "
     "preconditions are claims to MEASURE before action, not assumptions inferred from device_facts. "
     "Measure one with a setup step before the action and a check on that step, e.g. Identify CNS 01h "
-    "(Identify Controller, 4096 bytes) with data_field on: CNTRLTYPE byte 111 (1h I/O, 2h Discovery, "
-    "3h Administrative controller), OAES bytes 95:92, CTRATT 99:96, OACS 257:256, FRMW 260, LPA 261, "
-    "SANICAP 331:328, NN 519:516, ONCS 521:520. A precondition no earlier step observes is recorded as "
+    "(Identify Controller) with a NAMED data_field check (\"field\": \"OACS.FWDS\", \"value\": 1). The harness "
+    "turns field names into offsets/masks from the spec tables below - never compute offsets for these "
+    "structures yourself (offset@width are bytes from the start; CNTRLTYPE 1h I/O, 2h Discovery, 3h "
+    "Administrative controller). Support of a log page or feature is measured the same way (LSUPP/FSUPP "
+    "entries), and a negative test that relies on something being unsupported must measure that. "
+    "A precondition no earlier step observes is recorded as "
     "unmeasured, and then no requirement of this TC can PASS or FAIL - measure it to get a verdict. "
     "DEVICE LIMITS: sequential nvme-cli passthru only; no concurrent outstanding command/CID control, "
-    "event injection, resets, timing measurements or dynamic runtime parameters. Abort/AER tests are "
-    "not executable here. Write payloads are zero bytes unless payload_hex is explicitly provided; "
+    "event injection, timing measurements or dynamic runtime parameters. Abort/AER tests are "
+    "not executable here. I/O queues belong to the OS driver: Create/Delete I/O SQ/CQ only as negative "
+    "tests with QID 0 or QID >= 8000h. The Host Memory Buffer (FID 0Dh) belongs to the driver: never Set it. "
+    "I/O commands always use the active namespace id (the kernel drops any other). "
+    "Operations that can finish before the next command (Device Self-test, Sanitize, Format) must accept "
+    "both in progress and completed: compare the newest result entry with one read before the action. "
+    "The harness itself saves and restores the features a Set Features step changes and rewrites LBAs a "
+    "Write Uncorrectable marks; you need not add those cleanup steps. It can restore only FIDs "
+    + ", ".join(f"{f:02X}h" for f in sorted(FEATURE_CODECS)) + ": a Set Features expected to SUCCEED on any other "
+    "FID is refused (test a rejection instead), and Namespace Write Protection states 2/3 (until power cycle, "
+    "permanent) are never sent. Keep the NSID and SV bit of a Set Features as the scenario fixes them. Host steps 'Controller Reset' and, when listed in available_commands, "
+    "'Power Cycle (PMU)' (a sudden power loss and power-on) can be setup/verify steps - never the "
+    "action - to test state across a reset or power loss (a saved feature, written data); they take "
+    "no fields and only a completion check (SUCCESS = the controller answered again). Write payloads are zero bytes unless payload_hex is explicitly provided; "
     "never claim a structured management payload was sent unless you encode it. Data comparisons "
     "use captured hex bytes, not the model's explanation. data_equal/data_matches_write compare the "
     "same data only: for NVM Read/Write/Compare the compared step's SLBA/NLB (field_constraints) must "
@@ -89,7 +114,10 @@ SCENARIO_SYSTEM_PROMPT = (
     "A condition the requirement depends on belongs in preconditions with a check before the action, "
     "not in out_of_scope. Never simplify away the original requirement "
     "just to make a command return success. Previously verified requirement quotes are provided to "
-    "help select a different requirement; testing one does not cover an entire clause."
+    "help select a different requirement; testing one does not cover an entire clause. A configuration "
+    "round trip (Set then Get the same value) shows only that the value is stored; do not claim it proves "
+    "the behavior the feature controls (interrupts, events, atomicity, power).\n\nFIELD TABLES (name@offset+width"
+    "[bit=number]):\n" + field_catalog_text()
 
 )
 
@@ -100,6 +128,58 @@ def _as_list(value) -> list[str]:
     if isinstance(value, str):
         return [value] if value.strip() else []
     return [str(v) for v in value]
+
+
+def _target_block(target: dict) -> str:
+    lines = ["TARGET_REQUIREMENT (this TC exists to test exactly this sentence; a requirement checked on the "
+             "action must quote it, or a part of it, from the evidence):",
+             f"  section={target['section_id']} kind={target['kind']}", f"  \"{target['text']}\""]
+    if target.get("kind") == "abort" and target.get("expected_status"):
+        lines.append(f"  This is an abort rule: build a chain that creates its condition, and give the action "
+                     f"expected_status={target['expected_status']}.")
+    if target.get("host_steps"):
+        options = " or ".join(repr(n) for n in target["host_steps"])
+        lines.append(f"  This sentence is about state across a reset/power cycle: the chain MUST perform it with a "
+                     f"{options} step placed after the state is established (setup or verify, never the action), "
+                     f"and the requirement quoting this sentence must check a step that runs AFTER that host step "
+                     f"(e.g. set/record the state -> host step -> read it back and compare).")
+    return "\n".join(lines)
+
+
+TARGET_WINDOW_CHARS = 3000
+
+
+def _with_target_block(chunks: list[dict], target: dict) -> list[dict]:
+    """The target sentence must be quotable. When the evidence budget left it
+    out, add the lines around it (not its whole block, which can be 100K+
+    characters) and shrink the rest by as much, so the prompt keeps its size."""
+    from shared.spec_evidence import SCENARIO_EVIDENCE_CHARS, clause_catalog, limit_evidence
+    from shared.ids import stable_id
+    from tc_system.verification import quote_in
+    if any(quote_in(target["text"], c.get("text", "")) for c in chunks):
+        return chunks
+    block = clause_catalog().get(target["section_id"])
+    if not block:
+        return chunks
+    lines = block["text"].split("\n")
+    # The sentence was split out of one line of this block.
+    at = next((i for i, line in enumerate(lines) if quote_in(target["text"], line)), None)
+    if at is None:
+        return chunks
+    window = [lines[at]]
+    for offset in range(1, len(lines)):  # grow around the sentence while it fits
+        grew = False
+        for j in (at - offset, at + offset):
+            if 0 <= j < len(lines) and sum(map(len, window)) + len(lines[j]) < TARGET_WINDOW_CHARS:
+                window = [lines[j]] + window if j < at else window + [lines[j]]
+                grew = True
+        if not grew:
+            break
+    text = f"## {block['section_id'].split(':', 1)[1]} {block['title']} (excerpt)\n" + "\n".join(window)
+    extra = {"section_id": target["section_id"], "title": block["title"], "text": text, "role": "target_requirement",
+             "chunk_id": block["chunk_ids"][0], "evidence_id": stable_id("spec", target["section_id"], text),
+             "truncated": True}
+    return limit_evidence(chunks, SCENARIO_EVIDENCE_CHARS - len(text)) + [extra]
 
 
 def _scope_notes(structured):
@@ -129,6 +209,8 @@ def _validate_steps_plan(plan, opcode_entry: dict, available_opcodes: list[dict]
         after = [i for i in target_indices if action_indices and i > action_indices[0]]
         new_action = after[0] if after else target_indices[-1]
         for i, step in enumerate(plan):
+            if step.get("phase") == "cleanup" and i > new_action:
+                continue  # a restore stays a restore (runs in finally, never judged)
             step["phase"] = "setup" if i < new_action else "action" if i == new_action else "verify"
         action_indices = [new_action]
     if len(action_indices) != 1:
@@ -143,8 +225,10 @@ def _validate_steps_plan(plan, opcode_entry: dict, available_opcodes: list[dict]
         if name not in by_name:
             raise ValueError(f"step {i} names {name!r}, which is not in available_commands")
         phase = step.get("phase")
-        if phase not in ("setup", "action", "verify"):
+        if phase not in ("setup", "action", "verify", "cleanup"):
             raise ValueError(f"step {i} has invalid phase {phase!r}")
+        if phase == "cleanup" and any(s.get("phase") != "cleanup" for s in plan[i + 1:]):
+            raise ValueError(f"cleanup step {i} must come after every other step")
         if phase == "setup" and i > action_index:
             raise ValueError(f"setup step {i} comes after the action step")
         if phase == "verify" and i < action_index:
@@ -163,7 +247,8 @@ def _validate_steps_plan(plan, opcode_entry: dict, available_opcodes: list[dict]
 
 
 def generate_scenario(section: dict, opcode_entry: dict, available_opcodes: list[dict],
-                       feedback: str | None = None, device_facts: str | None = None) -> dict:
+                       feedback: str | None = None, device_facts: str | None = None,
+                       device_support: dict | None = None) -> dict:
     """`available_opcodes` is the full opcode table (every command_set — ADMIN/NVM combos are
     allowed), used both to list real command names in the prompt and to validate the model's
     `steps_plan` choices against. `feedback`, when given, describes why a previous attempt's plan
@@ -182,6 +267,9 @@ def generate_scenario(section: dict, opcode_entry: dict, available_opcodes: list
     )
     if not rag["chunks"]:
         raise ValueError(f"exact spec evidence unavailable for {section['section_id']}")
+    target = section.get("target_requirement")
+    if target:
+        rag = dict(rag, chunks=_with_target_block(rag["chunks"], target))
     available_names = sorted({o["name"] for o in available_opcodes})
     prompt = (
         f"spec_doc={section['spec_doc']} section={section['section_id']} title={section['title']} "
@@ -191,6 +279,8 @@ def generate_scenario(section: dict, opcode_entry: dict, available_opcodes: list
         f"previously_verified_requirements={json.dumps(section.get('previous_requirements', []), ensure_ascii=False)}\n"
         f"spec_context=\n" + format_evidence(rag["chunks"])
     )
+    if target:
+        prompt += "\n\n" + _target_block(target)
     if device_facts:
         prompt += f"\n\ndevice_facts=\n{device_facts}"
     if feedback:
@@ -204,9 +294,10 @@ def generate_scenario(section: dict, opcode_entry: dict, available_opcodes: list
         structured = llm["structured"]
         try:
             steps_plan = _validate_steps_plan(structured.get("steps_plan"), opcode_entry, available_opcodes)
-            validate_plan_contract(structured, rag["chunks"], section["section_id"], available_opcodes)
+            validate_plan_contract(structured, rag["chunks"], section["section_id"], available_opcodes,
+                                   target_requirement=target, device_support=device_support)
             break
-        except (ValueError, TypeError, KeyError) as exc:
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
             if attempt:
                 raise ValueError(f"scenario contract invalid: {exc}") from exc
             plan = structured.get("steps_plan")
@@ -225,6 +316,8 @@ def generate_scenario(section: dict, opcode_entry: dict, available_opcodes: list
         "precondition_checks": structured.get("precondition_checks", []),
         "out_of_scope": _scope_notes(structured),
         "unmeasured_preconditions": structured.get("unmeasured_preconditions", []),
+        "check_repairs": structured.get("check_repairs", []),
+        "target_requirement": target,
         "spec_evidence": rag["chunks"],
         "rag_response_id": rag["response_id"],
         "llm_response_id": llm["response_id"],

@@ -19,8 +19,10 @@ import re
 import json
 
 from shared.spec_evidence import format_evidence
-from tc_system.command_fields import verify_selectors, validate_transfer
-from tc_system.verification import apply_fixed_fields, validate_fixed_fields, integer, payload_for_step
+from tc_system import spec_fields
+from tc_system.command_fields import SELECTORS, derive_transfer, verify_selectors, validate_transfer
+from tc_system.verification import (apply_fixed_fields, canonical_status, validate_fixed_fields, integer,
+                                    payload_for_step)
 
 from shared.llm_client import LLMCallError, generate_llm_response
 from shared.rag_client import generate_rag_response
@@ -74,11 +76,11 @@ SYSTEM_PROMPT = (
     "Choose the specified variant, even when it deliberately expects rejection. Avoid reserved or "
     "vendor-specific field values. If the command requires a data buffer, give its correct "
     "length in bytes; if it transfers no data, use data_len 0 and direction \"none\".\n\n"
-    "CRITICAL: when a CDW field encodes a transfer length as a NUMBER OF DWORDS "
-    "(Get Log Page NUMDL/NUMDU, and similar), data_len must equal that dword count times 4, "
-    "using the field's own zero-based convention. A mismatch makes the controller return more "
-    "data than the buffer holds, which corrupts the host tool's heap instead of producing a "
-    "test result. Keep the requested length small (a single 512-byte or 4096-byte transfer).\n\n"
+    "TRANSFER LENGTH: choose data_len (keep it small: one 512-byte or 4096-byte transfer). The "
+    "harness then computes the fields the spec ties to it: Get Log Page NUMDL/NUMDU, Directive "
+    "Send/Receive and Firmware Image Download NUMD (CDW10) from data_len; Identify data_len=4096; "
+    "NVM Read/Write/Compare data_len = (NLB+1) x LBA size from your NLB; direction from the opcode "
+    "bits whenever a buffer moves. Still give consistent values; the changes are shown in the log.\n\n"
     "NSID: decide the command's Namespace Identifier field from the spec text's own description "
     "of this exact command, not from habit. There are exactly three legal choices, and the "
     "prompt tells you which real namespace is attached as active_nsid: use 0h if the command is "
@@ -150,45 +152,87 @@ def _author_once(prompt: str, opcode_entry: dict, active_nsid: int,
     direction = str(structured["direction"]).strip().lower()
     if direction not in ("read", "write", "none"):
         raise ArgsAuthoringError(f"invalid direction: {structured['direction']!r}")
+    try:
+        nsid = integer(structured["nsid"])
+    except (TypeError, ValueError) as exc:
+        raise ArgsAuthoringError(f"invalid nsid: {structured['nsid']!r}") from exc
+    try:
+        data_len = integer(structured["data_len"])
+    except (TypeError, ValueError) as exc:
+        raise ArgsAuthoringError(f"invalid data_len: {structured['data_len']!r}") from exc
+    shared_facts = structured.get("shared_facts") or {}
+    if not isinstance(shared_facts, dict):
+        raise ArgsAuthoringError(f"shared_facts must be an object: {shared_facts!r}")
+
+    fields = {f"cdw{i}": _normalize_hex(structured.get(f"cdw{i}", "0x0"), f"cdw{i}")
+              for i in range(10, 16)}
+    fields.update(nsid=nsid, data_len=data_len, direction=direction)
+    constraints = (test_intent or {}).get("field_constraints", [])
+    lba_bytes = (test_intent or {}).get("lba_bytes")
+    try:
+        overrides = apply_fixed_fields(fields, constraints)
+        # The clause's own selector (LID/FID/CNS/...) is known from the index:
+        # written, not checked (measured: "clause requires LID=0x15, got 0xF"
+        # skipped targets after the retry repeated the slip).
+        overrides += _apply_clause_selectors(fields, opcode_entry, required_field_values)
+        # Length fields and direction are fixed by the spec: computed, not
+        # checked (replayed log: 24 of 24 rejections today were this kind).
+        derived = derive_transfer(fields, opcode_entry, lba_bytes=lba_bytes, constraints=constraints)
+    except ValueError as exc:
+        raise ArgsAuthoringError(str(exc)) from exc
+    nsid, data_len, direction = fields["nsid"], integer(fields["data_len"]), fields["direction"]
+    fields["data_len"] = data_len
+
     # Measured on real hardware: a TC authored direction="write" for opcode
     # 0x2A, whose own bits 1:0 encode controller-to-host ("read"). nvme-cli
-    # warned ("write flag set but write direction bit is not set in the
-    # opcode") and sent it anyway — the command never completed, burning the
-    # full SSH batch timeout (~125s) for a request that was malformed before
-    # it left this host. Rejecting the mismatch here fails in milliseconds
-    # instead, before anything reaches the device.
+    # warned and sent it anyway — the command never completed, burning the
+    # full SSH batch timeout (~125s). derive_transfer now sets the direction
+    # from those bits whenever a buffer moves; this stays as the backstop.
     # direction="none" is exempt: many read-capable commands (e.g. Get
-    # Features returning its value in CDW0) legitimately transfer no buffer
-    # at all despite the opcode's bits nominally allowing one, and that
-    # zero-length choice was measured accepted (PASS) on real hardware.
+    # Features returning its value in CDW0) legitimately transfer no buffer.
     expected = _opcode_data_transfer(opcode_entry["raw_opcode"])
     if direction != "none" and expected is not None and direction != expected:
         raise ArgsAuthoringError(
             f"direction={direction!r} conflicts with opcode {opcode_entry['raw_opcode']}'s own "
             f"encoded transfer direction (bits 1:0 require {expected!r})")
-    try:
-        nsid = integer(structured["nsid"])
-    except (TypeError, ValueError) as exc:
-        raise ArgsAuthoringError(f"invalid nsid: {structured['nsid']!r}") from exc
     # Hardcoding nsid=0 for every admin command (as this once did) broke any
     # namespace-scoped CNS/LID — measured on real hardware, Identify with
     # CNS=0 ("Identify Namespace") returns INVALID_NS against nsid=0 no matter
-    # how many times cdw10 is retried, because nsid isn't a field author_args
-    # used to control at all. But accepting whatever nsid the model invents
-    # is just as wrong: this harness has exactly one real target, so only its
-    # own namespace, the controller-wide 0h, or the explicit FFFFFFFFh
-    # broadcast are legitimate — anything else would hit a *different*
-    # drive-reported error (likely INVALID_NS again) for an unrelated reason.
+    # how many times cdw10 is retried. But accepting whatever nsid the model
+    # invents is just as wrong: this harness has exactly one real target, so
+    # only its own namespace, the controller-wide 0h, or the explicit
+    # FFFFFFFFh broadcast are legitimate.
+    expected_status = canonical_status((test_intent or {}).get("expected_status") or "SUCCESS")
+    if opcode_entry["command_set"] != "ADMIN" and nsid != active_nsid:
+        # Sent through the namespace node, where the kernel refuses any other
+        # nsid before the controller sees it (measured: "nsid (0) in cmd does
+        # not match nsid (1) of namespace", three TCs that observed nothing).
+        raise ArgsAuthoringError(
+            f"nsid={nsid}: I/O commands go to this target's namespace device and the Linux kernel rejects any "
+            f"nsid other than {active_nsid} before the controller sees it; use nsid={active_nsid}")
     allowed_nsids = {0, active_nsid, 0xFFFFFFFF}
-    if nsid not in allowed_nsids:
+    if nsid not in allowed_nsids and not (expected_status == "INVALID_NS" and 0 < nsid < 0xFFFFFFFF):
+        hint = (" (0xFFFFFF is 24 bits: the all-namespaces NSID is FFFFFFFFh, 32 bits)"
+                if nsid == 0xFFFFFF else "")
         raise ArgsAuthoringError(
             f"nsid={nsid} is not one of the values this target supports: "
             f"0 (not namespace-specific), {active_nsid} (this target's active namespace), "
-            "or 4294967295/0xFFFFFFFF (all namespaces)")
-    try:
-        data_len = integer(structured["data_len"])
-    except (TypeError, ValueError) as exc:
-        raise ArgsAuthoringError(f"invalid data_len: {structured['data_len']!r}") from exc
+            f"or 4294967295/0xFFFFFFFF (all namespaces){hint}. Another NSID is allowed only in an admin "
+            "command whose expected status is INVALID_NS")
+    hazard = spec_fields.queue_command_hazard(opcode_entry["command_set"], int(opcode_entry["raw_opcode"], 16),
+                                              fields["cdw10"], expected_status)
+    if hazard:
+        raise ArgsAuthoringError(hazard)
+    if opcode_entry["command_set"] == "ADMIN" and int(opcode_entry["raw_opcode"], 16) == 0x09:
+        fid = integer(fields["cdw10"]) & 0xFF
+        if fid in spec_fields.HOST_OWNED_SET_FEATURES:
+            raise ArgsAuthoringError(f"Set Features FID {fid:02X}h: {spec_fields.HOST_OWNED_SET_FEATURES[fid]}")
+        irreversible = spec_fields.irreversible_feature_value(fid, integer(fields["cdw11"]))
+        if irreversible:
+            raise ArgsAuthoringError(irreversible)
+        if fid not in spec_fields.FEATURE_CODECS and expected_status == "SUCCESS":
+            raise ArgsAuthoringError(f"Set Features FID {fid:02X}h expected to succeed: the harness cannot restore "
+                                     "this feature's original value, so it is not changed")
     if not 0 <= data_len <= MAX_DATA_LEN:
         raise ArgsAuthoringError(f"data_len out of range: {data_len}")
     # A declared direction with no buffer is the vacuous-success shape — a
@@ -202,34 +246,40 @@ def _author_once(prompt: str, opcode_entry: dict, active_nsid: int,
             "a command that moves no data cannot confirm the clause")
     if direction == "none" and data_len:
         raise ArgsAuthoringError(f"data_len={data_len} but direction is none")
-
-    shared_facts = structured.get("shared_facts") or {}
-    if not isinstance(shared_facts, dict):
-        raise ArgsAuthoringError(f"shared_facts must be an object: {shared_facts!r}")
-
-    fields = {f"cdw{i}": _normalize_hex(structured.get(f"cdw{i}", "0x0"), f"cdw{i}")
-              for i in range(10, 16)}
-    fields.update(nsid=nsid, data_len=data_len, direction=direction)
     try:
-        overrides = apply_fixed_fields(fields, (test_intent or {}).get("field_constraints", []))
-        if fields["nsid"] not in allowed_nsids:
-            raise ValueError(f"fixed nsid={fields['nsid']} is not one of {sorted(allowed_nsids)}")
-        if not 0 <= fields["data_len"] <= MAX_DATA_LEN:
-            raise ValueError(f"fixed data_len out of range: {fields['data_len']}")
         field_value_verified = verify_selectors(fields, opcode_entry, required_field_values)
-        validate_fixed_fields(fields, (test_intent or {}).get("field_constraints", []))
-        validate_transfer(fields, opcode_entry, lba_bytes=(test_intent or {}).get("lba_bytes"))
+        validate_fixed_fields(fields, constraints)
+        validate_transfer(fields, opcode_entry, lba_bytes=lba_bytes)
         payload_hex = (test_intent or {}).get("payload_hex")
         if payload_hex is not None and direction == "write":
             # Caught here, inside the one-retry loop, instead of later in
             # tc_writer where it skipped the whole target with no second try.
-            payload_for_step({"direction": direction, "data_len": fields["data_len"], "payload_hex": payload_hex})
+            payload_for_step({"direction": direction, "data_len": data_len, "payload_hex": payload_hex})
     except ValueError as exc:
         raise ArgsAuthoringError(str(exc)) from exc
     return dict(fields, shared_facts=dict(shared_facts),
                 field_breakdown=str(structured["field_breakdown"]),
                 field_value_verified=field_value_verified, llm_response_id=llm["response_id"],
-                constraint_overrides=overrides)
+                constraint_overrides=overrides, derived_fields=derived)
+
+
+def _apply_clause_selectors(fields, opcode_entry, required_field_values):
+    changes = []
+    if opcode_entry.get("host_action") or not required_field_values:
+        return changes
+    for entry in required_field_values:
+        layout = SELECTORS.get((opcode_entry["command_set"], int(opcode_entry["raw_opcode"], 16),
+                                entry["field_name"]))
+        if layout is None:
+            continue
+        register, shift, mask = layout
+        current = integer(fields[register])
+        merged = (current & ~(mask << shift)) | ((int(entry["hex_value"], 16) & mask) << shift)
+        if merged != current:
+            changes.append(f"{register} {fields[register]} -> 0x{merged:08X} (조항 선택자 "
+                           f"{entry['field_name']}={entry['hex_value']})")
+            fields[register] = f"0x{merged:08X}"
+    return changes
 
 
 def author_args(section: dict, opcode_entry: dict, active_nsid: int,

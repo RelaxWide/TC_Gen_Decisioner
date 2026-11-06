@@ -43,8 +43,11 @@ def prepared(structured):
         if not isinstance(step, dict):
             continue
         step.setdefault("expected_status", "SUCCESS")
-        step.setdefault("field_constraints", [{"field": f"cdw{i}", "mask": "0xFFFFFFFF", "value": 0}
-                                               for i in (10, 11, 12)])
+        # Set Features on Power Management (02h): a feature the harness can
+        # restore (a successful Set of an unknown FID is refused).
+        step.setdefault("field_constraints", [{"field": f"cdw{i}", "mask": "0xFFFFFFFF",
+                                               "value": 2 if i == 10 and step.get("opcode_name") == "Set Features"
+                                               else 0} for i in (10, 11, 12)])
     action = next((i for i, p in enumerate(plan) if isinstance(p, dict) and p.get("phase") == "action"), 0)
     structured.setdefault("requirements", [{"description": "Read completion", "evidence_id": "spec-fixture",
                                               "quote": EVIDENCE["text"],

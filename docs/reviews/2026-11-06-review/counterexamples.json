@@ -1,0 +1,62 @@
+{
+  "N01_error_after_change": {
+    "expected_final_value": 360,
+    "actual_final_value": 300,
+    "commands": [
+      [
+        "setup",
+        "Get Features"
+      ],
+      [
+        "action",
+        "Set Features"
+      ]
+    ],
+    "cleanup": {
+      "step_index": 2,
+      "started": false,
+      "exit_code": null,
+      "stdout": "",
+      "cleanup_not_needed": "값을 바꾸는 스텝이 보내지지 않았거나 장비가 거부해 바뀐 것이 없음"
+    },
+    "reproduced": true
+  },
+  "N02_measured_fid_marked_unmeasured": {
+    "expected_status": "FAIL",
+    "actual_status": "UNVERIFIED",
+    "precondition": "satisfied",
+    "requirement_check": "violated",
+    "unmeasured": [
+      "FID 7Fh 지원 여부가 측정되지 않음 — INVALID_FIELD가 FID 때문인지 다른 필드 때문인지 구분할 수 없음"
+    ],
+    "reproduced": true
+  },
+  "N03_unsupported_polarity_reversed": {
+    "expected_support_bit": 0,
+    "actual_support_bit": 1,
+    "repairs": [
+      {
+        "where": "precondition_checks[0]",
+        "step": 0,
+        "description": "FID 7Fh is unsupported",
+        "problem": "설명은 비트가 1인 조건인데 검사식 (eq 0x0, mask 0x1)은 0을 확인함",
+        "before": {
+          "offset": 508,
+          "width": 4,
+          "mask": "0x1",
+          "value": "0x0",
+          "operator": null
+        },
+        "after": {
+          "offset": 508,
+          "width": 1,
+          "mask": "0x1",
+          "value": "0x1",
+          "operator": "eq"
+        },
+        "reads": "FID Supported and Effects (LID 12h) 0x7F FSUPP"
+      }
+    ],
+    "reproduced": true
+  }
+}

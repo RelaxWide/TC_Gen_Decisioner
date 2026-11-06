@@ -74,6 +74,12 @@ def _print_start(index, total, tc):
     # front, which says nothing about what's actually being tested.
     print(f"\n[{index}/{total}] {tc['name']}{flag_str}")
     _dual_label("  ", "시나리오", scenario.get("description"))
+    target_req = (tc.get("verification_contract") or {}).get("target_requirement") or {}
+    if target_req:
+        kind = {"abort": "거부 규칙", "variant": f"코드 변형({target_req.get('family')})"}.get(
+            target_req.get("kind"), "요구사항")
+        expect = f" → 기대 {target_req['expected_status']}" if target_req.get("expected_status") else ""
+        _dual_label("  ", f"타겟 {kind} [{target_req.get('section_id')}]", target_req.get("text", "") + expect)
 
     if len(steps) > 1:
         chain_summary = tc.get("chain_summary")
@@ -92,6 +98,11 @@ def _print_start(index, total, tc):
             _dual_line(f"{base} — {_one_line(role, width=70)}", f"{base} — {role}")
         else:
             print(base)
+        if step.get("host_action"):
+            label = {"controller_reset": "컨트롤러 리셋(nvme reset)",
+                     "power_cycle": "PMU 전원 사이클(전원 OFF → 재인식)"}.get(step["host_action"], step["host_action"])
+            print(f"        호스트 동작: {label} — 대상 호스트에서 실행")
+            continue
         try:
             cmd = passthru_cmd(step)
         except ValueError as exc:
@@ -100,7 +111,13 @@ def _print_start(index, total, tc):
         print(f"        기대 완료 상태: {expected_status(step)}")
         if step.get("constraint_overrides"):
             _dual_label("        ", "시나리오 고정값 적용", ", ".join(step["constraint_overrides"]))
+        if step.get("derived_fields"):
+            _dual_label("        ", "하네스 계산값 적용", ", ".join(step["derived_fields"]))
 
+    # Checks the harness rewrote to the field their description names.
+    for repair in (tc.get("verification_contract") or {}).get("check_repairs") or []:
+        _dual_label("  ", f"검사식 보정(스텝 {repair['step']})",
+                    f"'{repair.get('description', '')}' — {repair['problem']} → {repair['reads']}로 읽음")
     _dual_label("  ", "Expectation", expectation.get("description"))
     fail_criteria = expectation.get("fail_criteria") or []
     if fail_criteria:
@@ -185,6 +202,17 @@ def _print_result(index, total, tc):
             _dual_label("     ", "검증하려던 요구사항", req["description"])
     for note in (tc.get("scenario") or {}).get("out_of_scope", []):
         _dual_label("     ", "검증 범위 밖", note)
+    review = tc.get("review") or {}
+    if review.get("level") in ("must", "recommend"):
+        flag = "⚑ 꼭 확인" if review["level"] == "must" else "⚑ 확인 권장"
+        print(f"     {flag}" + (f" (PASS 범위: {review['scope']})" if review.get("scope") else ""))
+        for reason in review.get("reasons", []):
+            if reason["level"] != "info":
+                source = " · LLM 감사" if reason.get("source") == "llm" else ""
+                _dual_label("       ", f"[{'꼭' if reason['level'] == 'must' else '권장'}{source}]", reason["text"])
+    for i, r in enumerate((tc.get("execution") or {}).get("step_results", [])):
+        if r.get("cleanup_skipped"):
+            _dual_label("     ", f"원복 생략(스텝 {r['step_index']})", r["cleanup_skipped"])
 
     # Printed for either FAIL or ERROR — both get judged (pipeline.py routes
     # anything not already caught as a host crash/rejection to judge_failure_context
@@ -291,6 +319,10 @@ def _run(args) -> int:
         _write_tc_report()
         return 130
 
+    review = result.get("review") or {}
+    if review:
+        print(f"\n검토 요청: 꼭 확인 {review.get('must', 0)} / 확인 권장 {review.get('recommend', 0)} / "
+              f"참고 {review.get('info', 0)} — 리포트 맨 위 '꼭 봐야 할 결과'에 사유와 함께 정리됨")
     print(f"\ngenerated={result['generated']} executed={result['executed']} "
           f"failed={result['failed']} our_bugs={result.get('our_bugs', 0)} unsupported={result.get('unsupported', 0)} "
           f"skipped={result.get('skipped', 0)}")
@@ -298,6 +330,11 @@ def _run(args) -> int:
     print(f"요구사항 검증: {cov.get('requirements_evaluated', 0)}/{cov.get('requirements_total', 0)} 생성 요구사항"
           f" (PASS={cov.get('requirements_passed', 0)}, FAIL={cov.get('requirements_failed', 0)}, "
           f"미검증={cov.get('requirements_unverified', 0)}) — 전체 스펙 검증률 아님")
+    if cov.get("requirements_passed_by_scope"):
+        print("  PASS가 관측한 것: " + ", ".join(f"{k} {v}" for k, v in cov["requirements_passed_by_scope"].items()))
+    print(f"요구사항 타겟: {cov.get('requirements_tried', 0)}/{cov.get('requirement_targets', 0)} 시도"
+          f" (판정 {cov.get('requirements_judged', 0)}) / 코드 변형: {cov.get('variants_tried', 0)}/"
+          f"{cov.get('variant_targets', 0)} 시도 (판정 {cov.get('variants_judged', 0)})")
     print(f"테스트 대상 조항: {cov.get('targets_tried', 0)}/{cov.get('testable_targets', 0)} 시도"
           f" / 전체스펙 {cov['section_pct']}% ({cov['section_covered']}/{cov['section_total']}), "
           f"opcode {cov['opcode_pct']}% ({cov['opcode_covered']}/{cov['opcode_total']})")

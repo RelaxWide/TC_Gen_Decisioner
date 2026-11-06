@@ -43,6 +43,8 @@ INDEX_JSON = {
 
 def _authored(opcode_entry, prior_steps=None, rejected=None, shared_facts=None):
     return {"cdw10": "0x00000000", "cdw11": "0x00000000", "cdw12": "0x00000000", "data_len": 512,
+            # A retry that changes nothing is not resent, so the stub changes a field on retry.
+            "cdw13": "0x00000001" if rejected else "0x00000000",
             "direction": "read" if opcode_entry["name"] == "Read" else "write", "nsid": 1,
             "shared_facts": shared_facts or {}, "field_breakdown": "stub"}
 
@@ -148,6 +150,14 @@ class PipelineTestCase(unittest.TestCase):
             mock.patch.object(config, "TC_STORE_PATH", tmp_path / "tc_store.json"),
             mock.patch.object(config, "COVERAGE_STATE_PATH", tmp_path / "coverage_state.json"),
             mock.patch.object(config, "TARGET_SKIPS_PATH", tmp_path / "target_skips.json"),
+            # run_pipeline saves the probed NSZE/LBA size; never into the real data/
+            mock.patch.object(config, "DEVICE_INFO_PATH", tmp_path / "device_info.json"),
+            mock.patch.object(config, "RUN_MANIFESTS_DIR", tmp_path / "run_manifests"),
+            # Deterministic order, and no real LLM call from the review audit.
+            mock.patch.object(config, "TC_GENERATION_WORKERS", 1),
+            mock.patch.object(config, "REVIEW_AUDIT_WITH_LLM", False),
+            # the real secrets.local.json may enable a PMU; tests choose it explicitly
+            mock.patch.object(config, "get_pmu", return_value=None),
             mock.patch.object(config, "FAILURE_CONTEXTS_DIR", tmp_path / "failure_contexts"),
             mock.patch.object(config, "VERDICTS_DIR", tmp_path / "verdicts"),
             mock.patch.object(config, "get_ssh_target", lambda: {
@@ -241,6 +251,43 @@ class TestCleanRun(PipelineTestCase):
         result = self._run(executor)
         self.assertEqual(len(executor.calls), 1)
         self.assertEqual(result["failed"], 0)
+
+
+class TestOneRunLearnsOnce(PipelineTestCase):
+    """2026-11-05 run: 41 UNSUPPORTED TCs over 23 opcodes - every clause of an
+    unimplemented command was generated and sent again."""
+
+    def test_a_command_found_unsupported_is_not_regenerated_for_its_sibling_clauses(self):
+        sibling = dict(SECTION_READ, section_id="nvm:1.1.9", clause="1.1.9", title="Read — another clause")
+        index = dict(INDEX_JSON, sections=[SECTION_READ, sibling, SECTION_WRITE])
+        Path(config.active_coverage_index_path()).write_text(json.dumps(index), encoding="utf-8")
+        executor = _FakeExecutor([[_ok(0), _unsupported(1)], [_ok(0), _ok(1)]])
+        with mock.patch.object(pipeline, "generate_scenario", side_effect=_two_step_scenario) as gen:
+            result = pipeline.run_pipeline(count=3, executor=executor, allow_destructive=True)
+        self.assertEqual(len(executor.calls), 2)
+        self.assertEqual(gen.call_count, 2)  # the second Read clause made no LLM call
+        skips = json.loads(Path(config.TARGET_SKIPS_PATH).read_text(encoding="utf-8"))
+        self.assertEqual([s["kind"] for s in skips], ["opcode_unsupported_in_run"])
+        self.assertEqual(result["unsupported"], 1)
+
+    def test_generation_ahead_of_execution_keeps_the_order_of_results(self):
+        index = dict(INDEX_JSON, sections=[SECTION_READ, SECTION_WRITE])
+        Path(config.active_coverage_index_path()).write_text(json.dumps(index), encoding="utf-8")
+        executor = _FakeExecutor([[_ok(0), _ok(1)], [_ok(0), _ok(1)]])
+        started = []
+        result = pipeline.run_pipeline(count=2, executor=executor, allow_destructive=True, generation_workers=3,
+                                       on_start=lambda i, total, tc: started.append(i))
+        self.assertEqual(started, [1, 2])
+        self.assertEqual(result["executed"], 2)
+
+    def test_every_tc_carries_its_run_and_a_review_and_the_run_has_a_manifest(self):
+        self._run(_FakeExecutor([[_ok(0), _ok(1)]]))
+        stored = json.loads(Path(config.TC_STORE_PATH).read_text(encoding="utf-8"))
+        self.assertTrue(stored[0]["run_id"])
+        self.assertIn(stored[0]["review"]["level"], ("must", "recommend", "info"))
+        manifest = json.loads((config.RUN_MANIFESTS_DIR / f"{stored[0]['run_id']}.json").read_text(encoding="utf-8"))
+        self.assertIn("source_sha256", manifest["code"])
+        self.assertEqual(set(manifest["prompts_sha256"]), {"scenario", "args", "judge", "review_audit"})
 
 
 class TestRejectionCascade(PipelineTestCase):
@@ -1064,6 +1111,141 @@ class TestAnExecutedTcIsStoredBeforeJudging(PipelineTestCase):
         self.assertEqual(stored[0]["status"], "FAIL")
         fc_path = config.FAILURE_CONTEXTS_DIR / "tc_exec" / f"{stored[0]['failure_context_id']}.json"
         self.assertTrue(fc_path.exists())  # re-judgeable with run_judge --source tc_exec
+
+
+
+class TestHostStepsInThePipeline(PipelineTestCase):
+    def _scenario_with(self, host_name):
+        def scenario(section, opcode_entry, available_opcodes, feedback=None, device_facts=None):
+            self.offered = [o["name"] for o in available_opcodes]
+            plan = [{"opcode_name": host_name, "role": "reset first", "phase": "setup"},
+                    {"opcode_name": opcode_entry["name"], "role": "primary", "phase": "action"}]
+            return {"description": "d", "preconditions": [], "fail_criteria": [], "steps_plan": plan,
+                    "chain_summary": "", "rag_response_id": "r", "llm_response_id": "l"}
+        return scenario
+
+    def test_controller_reset_is_offered_and_never_covers_a_clause(self):
+        executor = _FakeExecutor([[_ok(0), _ok(1)]])
+        with mock.patch.object(pipeline, "generate_scenario", side_effect=self._scenario_with("Controller Reset")):
+            pipeline.run_pipeline(count=1, executor=executor, allow_destructive=True)
+        self.assertIn("Controller Reset", self.offered)
+        self.assertNotIn("Power Cycle (PMU)", self.offered)  # no PMU configured
+        tc = tc_store.load_all()[0]
+        self.assertEqual(tc["steps"][0]["host_action"], "controller_reset")
+        self.assertIsNone(tc["step_section_ids"][0])
+        self.assertNotIn(None, tc["source_section_ids"])
+
+    def test_a_power_cycle_is_blocked_by_no_destructive_before_anything_is_sent(self):
+        pmu = {"enabled": True, "script": "/opt/pmu_4_1.py"}
+        executor, skips = _FakeExecutor([]), []
+        with mock.patch.object(config, "get_pmu", return_value=pmu), \
+             mock.patch.object(pipeline, "generate_scenario", side_effect=self._scenario_with("Power Cycle (PMU)")):
+            pipeline.run_pipeline(count=1, executor=executor, allow_destructive=False,
+                                  on_skip=lambda i, n, s, o, reason: skips.append(reason))
+        self.assertIn("Power Cycle (PMU)", self.offered)
+        self.assertEqual(executor.calls, [])
+        self.assertIn("Power Cycle (PMU)", skips[0])
+
+
+
+class TestRequirementTargetsInThePipeline(PipelineTestCase):
+    def test_the_target_requirement_reaches_the_contract_and_skips_carry_it(self):
+        from tc_system.coverage import coverage_state
+        req = {"requirement_id": "sreq-x", "section_id": "nvm:1.1", "kind": "shall",
+               "expected_status": None, "text": "The controller shall return the data."}
+        real = coverage_state.requirement_targets
+        def with_requirement(index):
+            return [(s, o, req if s["section_id"] == "nvm:1.1" else r) for s, o, r in real(index)]
+        seen = []
+
+        def scenario(section, opcode_entry, available_opcodes, feedback=None, device_facts=None):
+            seen.append(section.get("target_requirement"))
+            return dict(_two_step_scenario(section, opcode_entry, available_opcodes),
+                        target_requirement=section.get("target_requirement"))
+
+        executor = _FakeExecutor([[_ok(0), _ok(1)], [_ok(0), _ok(1)]])
+        with mock.patch.object(coverage_state, "requirement_targets", side_effect=with_requirement), \
+             mock.patch.object(pipeline, "generate_scenario", side_effect=scenario):
+            pipeline.run_pipeline(count=None, executor=executor, allow_destructive=True)
+        self.assertIn(req, seen)
+        stored = [tc for tc in tc_store.load_all()
+                  if (tc["verification_contract"].get("target_requirement") or {}).get("requirement_id") == "sreq-x"]
+        self.assertEqual(len(stored), 1)
+
+    def test_a_skipped_requirement_target_is_recorded_with_its_id(self):
+        from tc_system.coverage import coverage_state
+        req = {"requirement_id": "sreq-y", "section_id": "nvm:1.1", "kind": "shall",
+               "expected_status": None, "text": "The controller shall return the data."}
+        real = coverage_state.requirement_targets
+        with mock.patch.object(coverage_state, "requirement_targets",
+                               side_effect=lambda index: [(s, o, req) for s, o, _ in real(index)][:1]), \
+             mock.patch.object(pipeline, "generate_scenario", side_effect=LLMCallError("bad reply")):
+            pipeline.run_pipeline(count=1, executor=_FakeExecutor([]), allow_destructive=True)
+        log = json.loads(config.TARGET_SKIPS_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(log[0]["requirement_id"], "sreq-y")
+
+
+
+class TestVariantsInThePipeline(PipelineTestCase):
+    VARIANT = {"requirement_id": "var-read-last", "kind": "variant", "family": "lba_boundary", "command": "Read",
+               "label": "last_lba", "fields": {"cdw10": "0x00000FFF", "cdw11": "0x00000000", "cdw12": "0x00000000",
+                                                "data_len": 512, "direction": "read"},
+               "expected_status": "SUCCESS", "section_id": "nvm:1.1",
+               "text": "A namespace of size n consists of LBA 0 through LBA (n - 1).",
+               "evidence": {"evidence_id": "e", "section_id": "nvm:4.1.5.1", "chunk_id": "c",
+                            "text": "A namespace of size n consists of LBA 0 through LBA (n - 1)."},
+               "description": "Read last LBA"}
+
+    def _run_variant(self, responses):
+        from tc_system.coverage import coverage_state
+        executor = _FakeExecutor(responses)
+        with mock.patch.object(pipeline, "variant_targets", return_value=[self.VARIANT]), \
+             mock.patch.object(coverage_state, "requirement_targets", return_value=[]), \
+             mock.patch.object(pipeline, "generate_scenario", side_effect=AssertionError("no LLM for a variant")):
+            pipeline.run_pipeline(count=None, executor=executor, allow_destructive=True)
+        return executor, tc_store.load_all()
+
+    def test_a_variant_runs_without_any_llm_call(self):
+        executor, stored = self._run_variant([[_ok(0)]])
+        self.assertEqual(len(executor.calls), 1)
+        self.assertEqual(stored[0]["variant_id"], "var-read-last")
+        self.assertEqual(stored[0]["steps"][0]["cdw10"], "0x00000FFF")
+
+    def test_a_rejected_variant_is_not_reauthored(self):
+        executor, stored = self._run_variant([[_rejected(0)]])
+        self.assertEqual(len(executor.calls), 1)
+        self.assertIn("코드 변형", stored[0]["retry_log"][0]["detail"])
+
+
+
+class TestHostEventTargetsInThePipeline(PipelineTestCase):
+    def _run(self, host_actions):
+        from tc_system.coverage import coverage_state
+        req = {"requirement_id": "sreq-h", "section_id": "nvm:1.1", "kind": "shall", "expected_status": None,
+               "text": "The data shall be retained across power cycles.", "host_actions": host_actions}
+        real = coverage_state.requirement_targets
+        seen = []
+
+        def scenario(section, opcode_entry, available_opcodes, feedback=None, device_facts=None):
+            seen.append(section["target_requirement"])
+            raise LLMCallError("stop here")
+
+        with mock.patch.object(coverage_state, "requirement_targets",
+                               side_effect=lambda index: [(s, o, req) for s, o, _ in real(index)][:1]), \
+             mock.patch.object(pipeline.config, "get_pmu", return_value=None), \
+             mock.patch.object(pipeline, "generate_scenario", side_effect=scenario):
+            pipeline.run_pipeline(count=1, executor=_FakeExecutor([]), allow_destructive=True)
+        return seen, json.loads(config.TARGET_SKIPS_PATH.read_text(encoding="utf-8"))
+
+    def test_a_power_cycle_target_without_a_pmu_is_skipped_without_an_llm_call(self):
+        seen, log = self._run(["power_cycle"])
+        self.assertEqual(seen, [])
+        self.assertEqual(log[0]["kind"], "host_step_unavailable")
+        self.assertIn("pmu.enabled", log[0]["reason"])
+
+    def test_a_reset_target_is_told_which_host_step_it_can_use(self):
+        seen, _ = self._run(["controller_reset", "power_cycle"])
+        self.assertEqual(seen[0]["host_steps"], ["Controller Reset"])
 
 
 if __name__ == "__main__":

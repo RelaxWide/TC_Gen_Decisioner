@@ -1,8 +1,10 @@
 import unittest
 
+from unittest import mock
+
 import config
 from tc_system.coverage.coverage_state import _needs_unverifiable_value
-from tc_system.verification import UNEXECUTABLE_COMMANDS
+from tc_system.verification import UNEXECUTABLE_COMMANDS, verify_tc
 from tc_system.coverage.coverage_state import (UNRESOLVED_ATTEMPT_LIMIT, compute_coverage,
                                               pick_next_targets)
 from tc_system.coverage.spec_coverage_index import SpecCoverageIndexFile
@@ -215,9 +217,11 @@ class TestTargetRotation(unittest.TestCase):
         order = self._order(records)
         self.assertLess(order.index(answered["section_id"]), order.index(stuck["section_id"]))
 
-    def test_one_opcode_per_clause_per_batch(self):
-        order = self._order([])
-        self.assertEqual(len(order), len(set(order)))
+    def test_every_requirement_once_per_full_batch(self):
+        picked = pick_next_targets(self.index, [], count=10**9)
+        keys = [(s["section_id"], (s.get("target_requirement") or {}).get("requirement_id")) for s, _ in picked]
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertGreater(len(picked), 1000)  # requirements, not the 232 clauses
 
     def test_skipped_targets_count_as_attempts(self):
         first = self._order([])[0]
@@ -292,6 +296,147 @@ class TestTargetRotation(unittest.TestCase):
         self.assertEqual(summary["requirements_evaluated"], 0)
         self.assertEqual(row["verified_requirements"], summary["requirements_evaluated"])
         self.assertEqual(row["statuses"], {"FAIL": 1})
+
+
+
+class TestRequirementTargets(unittest.TestCase):
+    """Targets are the spec's "shall" sentences (and its abort rules), not clauses."""
+
+    @classmethod
+    def setUpClass(cls):
+        from tc_system.coverage.coverage_state import requirement_targets
+        cls.index = SpecCoverageIndexFile(config.active_coverage_index_path())
+        cls.targets = requirement_targets(cls.index)
+
+    def test_counts(self):
+        reqs = [r for *_, r in self.targets if r]
+        self.assertGreater(len(reqs), 1200)
+        self.assertGreater(sum(r["kind"] == "abort" for r in reqs), 200)
+        clause_only = [s["section_id"] for s, _, r in self.targets if r is None]
+        self.assertTrue(clause_only)  # a clause without a "shall" is still a target
+
+    def test_an_abort_rule_carries_its_status_as_nvme_cli_spells_it(self):
+        # "shall ... abort ... Invalid Field in Command" (IOS bit cleared, offset given).
+        rule = next(r for s, _, r in self.targets if r and s["section_id"] == "base:5.2.12"
+                    and "IOS bit is cleared" in r["text"])
+        self.assertEqual((rule["kind"], rule["expected_status"]), ("abort", "INVALID_FIELD"))
+
+    def test_a_status_followed_by_more_text_is_still_an_abort_rule(self):
+        # "...shall abort the command with a status code of Invalid Log Page with the exception ..."
+        rule = next(r for s, _, r in self.targets if r and "Log Page Identifier that is not supported" in r["text"])
+        self.assertEqual((rule["kind"], rule["expected_status"]), ("abort", "INVALID_LOG_PAGE"))
+
+    def test_a_judged_requirement_goes_behind_the_unjudged_ones(self):
+        first_section, first_opcode = pick_next_targets(self.index, [], 1)[0]
+        req = first_section["target_requirement"]
+        judged_tc = {"tc_id": "j", "status": "PASS", "uses_placeholder_args": False,
+                     "steps": [{"phase": "action"}], "step_section_ids": [first_section["section_id"]],
+                     "step_opcodes": [first_opcode["opcode"]], "source_section_ids": [first_section["section_id"]],
+                     "verification_contract": {"target_requirement": req}}
+        with mock.patch("tc_system.coverage.coverage_state.judged_target_requirements",
+                        return_value={req["requirement_id"]}):
+            picked = pick_next_targets(self.index, [judged_tc], 1000)
+        ids = [(s.get("target_requirement") or {}).get("requirement_id") for s, _ in picked]
+        self.assertNotIn(req["requirement_id"], ids)  # behind the ~1300 unanswered ones
+
+    def test_the_breakdown_counts_requirements_per_command(self):
+        from tc_system.coverage.coverage_state import target_breakdown
+        result = target_breakdown(self.index, [], [])
+        self.assertEqual(result["requirement_targets"], sum(1 for *_, r in self.targets if r))
+        row = next(r for r in result["commands"] if r["name"] == "Get Log Page")
+        self.assertGreater(row["requirements"], 100)
+        self.assertEqual((row["requirements_tried"], row["requirements_judged"]), (0, 0))
+
+
+
+class TestCodeVariants(unittest.TestCase):
+    """Variants: no LLM, a value swept under a rule quoted from the spec."""
+
+    @classmethod
+    def setUpClass(cls):
+        from tc_system.generation.variants import variant_targets
+        cls.index = SpecCoverageIndexFile(config.active_coverage_index_path())
+        cls.ops = {o["name"]: o for o in cls.index.list_opcodes()}
+        cls.with_device = variant_targets(cls.index, nsze=0x1000, lba_bytes=512)
+        cls.without_device = variant_targets(cls.index)
+
+    def _tc(self, variant):
+        from tc_system.generation.variants import build_variant_tc
+        return build_variant_tc("t", variant, self.ops[variant["command"]], "/dev/nvme0", "/dev/nvme0n1", 1, 512)
+
+    def test_families_and_counts(self):
+        import collections
+        families = collections.Counter(v["family"] for v in self.with_device)
+        self.assertEqual(families["reserved_fid"], 2 * 140)  # Get + Set Features
+        self.assertEqual(families["reserved_lid"], 86)
+        self.assertEqual(families["lba_boundary"], 23)
+        self.assertNotIn("lba_boundary", {v["family"] for v in self.without_device})  # needs NSZE
+
+    def test_every_variant_passes_the_wire_checks(self):
+        from tc_system.execution.ssh_runner import passthru_cmd
+        for variant in self.with_device:
+            with self.subTest(variant=variant["requirement_id"]):
+                passthru_cmd(self._tc(variant)["steps"][0])
+
+    def test_a_drive_accepting_a_reserved_lid_fails_the_cited_rule(self):
+        variant = next(v for v in self.with_device if v["family"] == "reserved_lid")
+        tc = self._tc(variant)
+        ok = {"step_results": [{"step_index": 0, "exit_code": 0, "started": True,
+                                "stdout": "Admin Command Get Log Page is Success and result: 0x0\n0000: 00 00 00 00"}]}
+        rejected = {"step_results": [{"step_index": 0, "exit_code": 22, "started": True,
+                                      "stdout": "NVMe status: INVALID_LOG_PAGE: The log page indicated is invalid(0x109)"}]}
+        self.assertEqual(verify_tc(tc, ok)["status"], "FAIL")
+        self.assertEqual(verify_tc(tc, rejected)["status"], "PASS")
+
+    def test_the_last_lba_is_readable_and_one_past_it_is_out_of_range(self):
+        last = next(v for v in self.with_device if v["command"] == "Read" and v["label"] == "last_lba")
+        past = next(v for v in self.with_device if v["command"] == "Read" and v["label"] == "one_past_end")
+        self.assertEqual((last["fields"]["cdw10"], last["expected_status"]), ("0x00000FFF", "SUCCESS"))
+        self.assertEqual((past["fields"]["cdw10"], past["expected_status"]), ("0x00001000", "LBA_RANGE"))
+        read_ok = {"step_results": [{"step_index": 0, "exit_code": 0, "started": True,
+                                     "stdout": "IO Command Read is Success and result: 0x0"}]}
+        self.assertEqual(verify_tc(self._tc(last), read_ok)["status"], "PASS")
+
+    def test_variants_rotate_in_with_the_llm_targets(self):
+        picked = pick_next_targets(self.index, [], 120, variants=self.without_device)
+        kinds = [(s.get("target_requirement") or {}).get("kind") for s, _ in picked]
+        self.assertIn("variant", kinds)
+        self.assertIn("shall", kinds)
+
+    def test_the_breakdown_counts_variants(self):
+        from tc_system.coverage.coverage_state import target_breakdown
+        result = target_breakdown(self.index, [], [], self.with_device)
+        self.assertEqual(result["variant_targets"], len(self.with_device))
+        row = next(r for r in result["commands"] if r["name"] == "Get Log Page")
+        self.assertEqual(row["variants"], 86)
+
+
+
+class TestHostEventRequirements(unittest.TestCase):
+    """Sentences about state across a reset/power loss need a host step."""
+
+    def test_only_state_across_an_event_needs_a_host_step(self):
+        from tc_system.execution.host_actions import required_host_actions
+        both = ["controller_reset", "power_cycle"]
+        self.assertEqual(required_host_actions(
+            "The information in this log page shall be retained across power cycles and resets."), both)
+        self.assertEqual(required_host_actions(
+            "The firmware image shall be activated at the next Controller Level Reset."), both)
+        self.assertEqual(required_host_actions("The value shall be preserved after a power cycle."), ["power_cycle"])
+        for text in ("If a Set Features command is submitted for this Feature and the Power Loss Signaling Mode "
+                     "field specifies a Power Loss Signaling mode that is not supported, the controller shall abort",
+                     "This Feature shall be saveable (refer to section 4.4).",
+                     "any successful sanitize operation shall modify this Feature by resetting both the saved value",
+                     "This value shall be updated once per power-on hour when the controller is not in a sleep state."):
+            with self.subTest(text=text[:50]):
+                self.assertEqual(required_host_actions(text), [])
+
+    def test_the_spec_targets_that_need_one(self):
+        from tc_system.coverage.coverage_state import requirement_targets
+        index = SpecCoverageIndexFile(config.active_coverage_index_path())
+        needing = [r for *_, r in requirement_targets(index) if r and r["host_actions"]]
+        self.assertEqual(len(needing), 14)
+        self.assertTrue(all("controller_reset" in r["host_actions"] for r in needing))  # none is power-only today
 
 
 if __name__ == "__main__":

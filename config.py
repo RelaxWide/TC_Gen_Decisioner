@@ -14,6 +14,18 @@ COVERAGE_STATE_PATH = DATA_DIR / "coverage_state.json"
 # Targets skipped before anything reached the device (generation/argument
 # failure, destructive gate). Counted as attempts so target selection rotates.
 TARGET_SKIPS_PATH = DATA_DIR / "target_skips.json"
+# NSZE / LBA size measured at the last run: the LBA-boundary variants and the
+# report's variant totals depend on them.
+DEVICE_INFO_PATH = DATA_DIR / "device_info.json"
+# One file per run: code/spec/prompt hashes, host tool versions, drive model and
+# firmware - what a result has to be read against.
+RUN_MANIFESTS_DIR = DATA_DIR / "run_manifests"
+# Scenario/argument generation for upcoming targets runs this many at a time
+# while the device executes the current one (LLM time was 93% of a 294-minute
+# --all run, SSH 11 minutes). Execution itself stays strictly sequential.
+TC_GENERATION_WORKERS = 3
+# The same LLM, in an auditor role, adds review reasons to PASS/FAIL TCs.
+REVIEW_AUDIT_WITH_LLM = True
 INGEST_STATE_QST_PATH = DATA_DIR / "ingest_state_qst.json"
 INGEST_STATE_PULSEFZ_PATH = DATA_DIR / "ingest_state_pulsefz.json"
 
@@ -58,6 +70,16 @@ def _load_secrets():
     return json.loads(SECRETS_PATH.read_text(encoding="utf-8"))
 
 
+def get_pmu():
+    """PMU board settings (secrets.local.json "pmu") when enabled, else None.
+    Without it the Power Cycle host step is not offered at all."""
+    try:
+        pmu = _load_secrets().get("pmu") or {}
+    except Exception:  # noqa: BLE001 - no secrets file: no PMU
+        return None
+    return pmu if pmu.get("enabled") and pmu.get("script") else None
+
+
 def get_ssh_target():
     secrets = _load_secrets()
     return {
@@ -78,5 +100,6 @@ for _dir in (
     SPECS_DIR,
     REPORT_OUTPUT_DIR,
     LOGS_DIR,
+    RUN_MANIFESTS_DIR,
 ):
     _dir.mkdir(parents=True, exist_ok=True)

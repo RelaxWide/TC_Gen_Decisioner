@@ -62,7 +62,27 @@ def _validate_step(step: dict) -> None:
             raise ValueError(f"invalid step {field}: {value!r}")
     if step.get("direction", "none") not in ("none", "read", "write"):
         raise ValueError(f"invalid step direction: {step.get('direction')!r}")
-    from tc_system.verification import payload_for_step, validate_fixed_fields
+    from tc_system.verification import integer, payload_for_step, validate_fixed_fields
+    from tc_system import spec_fields
+    # The kernel refuses an I/O command whose nsid differs from the namespace
+    # node it is sent to ("nsid (0) in cmd does not match nsid (1) of
+    # namespace", measured): it never reaches the controller.
+    node = re.search(r"n(\d+)$", step["device"])
+    if step["mode"] == "io-passthru" and node and step["nsid"] != int(node.group(1)):
+        raise ValueError(f"I/O command nsid={step['nsid']} sent to {step['device']} (nsid {node.group(1)}): the "
+                         "kernel rejects it before it reaches the controller")
+    if step["mode"] == "admin-passthru":
+        raw = int(step["opcode"], 16)
+        hazard = spec_fields.queue_command_hazard("ADMIN", raw, step["cdw10"], step.get("expected_status"))
+        if hazard:
+            raise ValueError(hazard)
+        if raw == 0x09:
+            irreversible = spec_fields.irreversible_feature_value(integer(step["cdw10"]) & 0xFF, integer(step["cdw11"]))
+            if irreversible:
+                raise ValueError(irreversible)
+        if raw == 0x09 and integer(step["cdw10"]) & 0xFF in spec_fields.HOST_OWNED_SET_FEATURES:
+            raise ValueError(f"Set Features FID {integer(step['cdw10']) & 0xFF:02X}h: "
+                             f"{spec_fields.HOST_OWNED_SET_FEATURES[integer(step['cdw10']) & 0xFF]}")
     payload_for_step(step)
     validate_fixed_fields(step, step.get("field_constraints", []))
     if step.get("args_source") == "authored":
@@ -211,10 +231,26 @@ def probe_device_capabilities(nvme_ctrl: str, nvme_ns: str) -> dict[str, str]:
     target = config.get_ssh_target()
     log_record = {"timestamp": datetime.now(timezone.utc).isoformat(), "probe": True, "stages": []}
     outputs = {}
+    from tc_system.generation.device_capabilities import PROBED_FIDS
+    # A namespace-specific feature can reject NSID 0 with INVALID_FIELD:
+    # retried with the namespace, unsupported only if both are rejected.
+    nsid = re.search(r"n(\d+)$", nvme_ns)
+    retry = (f"if [ $rc -ne 0 ]; then echo NSID_RETRY; sudo nvme get-feature {nvme_ctrl} -f 0x$f -s 3 "
+             f"-n {nsid.group(1)} 2>&1; rc=$?; fi; ") if nsid else ""
+    fid_loop = ("for f in " + " ".join(f"{f:02X}" for f in PROBED_FIDS) + "; do echo \"FID=$f\"; "
+                f"sudo nvme get-feature {nvme_ctrl} -f 0x$f -s 3 2>&1; rc=$?; " + retry
+                + "echo \"RC=$rc\"; done")
     for key, cmd in (
         ("id_ctrl", f"sudo nvme id-ctrl {nvme_ctrl}"),
         ("id_ns", f"sudo nvme id-ns {nvme_ns}"),
         ("effects_log", f"sudo nvme effects-log {nvme_ctrl}"),
+        # Which LIDs/FIDs this drive implements: an unsupported one is then a
+        # fact about the drive, not "our argument error" (2026-11-05 run: ~30
+        # ERRORs were Get Features/Get Log Page of features the drive lacks).
+        ("supported_logs", f"sudo nvme get-log {nvme_ctrl} --log-id=0 --log-len=1024 2>&1"),
+        ("fid_support", fid_loop),
+        # Recorded in the run manifest: results depend on the host tool too.
+        ("host_versions", "nvme version 2>&1; uname -r"),
     ):
         proc, stage = _timed_plink(target, cmd, f"probe_{key}", timeout=30)
         log_record["stages"].append(stage)
@@ -257,6 +293,24 @@ def device_responsive(nvme_ctrl: str, timeout: int = 15) -> tuple[bool, str]:
     return True, ""
 
 
+def run_host_action(action: str, nvme_ctrl: str, tc_id=None, attempt_id=None, step_index=None) -> dict:
+    """Controller reset / PMU power cycle on the target host (host_actions.py)."""
+    from tc_system.execution.host_actions import host_action_command
+    command, timeout = host_action_command(action, nvme_ctrl, config.get_pmu())
+    target = config.get_ssh_target()
+    log_record = {"timestamp": datetime.now(timezone.utc).isoformat(), "n_steps": 1, "stages": [],
+                  "tc_id": tc_id, "attempt_id": attempt_id, "step_index": step_index,
+                  "host_action": action, "step_commands": [command]}
+    try:
+        proc, stage = _timed_plink(target, command, f"host_{action}", stdin=target["password"] + "\n",
+                                   timeout=timeout)
+        log_record["stages"].append(stage)
+        return {"exit_code": proc.returncode, "stdout": (proc.stdout or "").strip(),
+                "batch_stderr": proc.stderr or "", "timed_out": proc.returncode is None}
+    finally:
+        _append_ssh_log(log_record)
+
+
 def capture_dmesg(tc_id=None, attempt_id=None) -> str:
     """One `dmesg -T` dump, logged like a batch stage. The step-by-step
     contract executor calls this once after its last step instead of once per
@@ -269,6 +323,21 @@ def capture_dmesg(tc_id=None, attempt_id=None) -> str:
                                          stdin=target["password"] + "\n")
         log_record["stages"].append(stage)
         return dump_proc.stdout
+    finally:
+        _append_ssh_log(log_record)
+
+
+def clear_dmesg(tc_id=None, attempt_id=None) -> bool:
+    """`dmesg -c` before a TC's first action of any kind (host or NVMe), so
+    the dump afterwards is scoped to this TC. Returns whether it worked."""
+    target = config.get_ssh_target()
+    log_record = {"timestamp": datetime.now(timezone.utc).isoformat(), "n_steps": 0, "stages": [],
+                  "tc_id": tc_id, "attempt_id": attempt_id}
+    try:
+        proc, stage = _timed_plink(target, "sudo -S dmesg -c > /dev/null", "dmesg_clear",
+                                   stdin=target["password"] + "\n")
+        log_record["stages"].append(stage)
+        return proc.returncode == 0
     finally:
         _append_ssh_log(log_record)
 

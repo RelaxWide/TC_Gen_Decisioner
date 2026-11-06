@@ -1,4 +1,5 @@
 import json
+import math
 import re
 from datetime import datetime, timezone
 
@@ -56,7 +57,13 @@ JUDGE_SYSTEM_PROMPT = (
     "A command completing successfully does not prove the scenario was executed. An unverified "
     "precondition, missing data or a host timeout does not by itself prove either a firmware or "
     "environment fault. Do not invent a comparison that the harness did not perform. Coverage "
-    "IDs with a/n suffixes are internal identifiers; only steps[].opcode is the wire opcode.\n\n"
+    "IDs with a/n suffixes are internal identifiers; only steps[].opcode is the wire opcode. "
+    "signals.harness_findings are contract problems found by code (a check reading a different field "
+    "than its description, an expected status that is the same code under another name, a length "
+    "that only compares our own request, a premise never measured): while any of them explains the "
+    "failure, do not classify it firmware_defect. Lines 'check reads ...' were decoded by code from the "
+    "spec tables and are authoritative about which field a check reads; status_code is SCT/SC without "
+    "the More/DNR flag bits. A harness step only saves/restores state.\n\n"
     "Write rationale and every guidance entry in Korean (한국어). classification itself "
     "must stay exactly one of the three literal English enum values given in the schema "
     "— do not translate it."
@@ -136,11 +143,14 @@ def _as_classification(value) -> str:
     text = re.sub(r"[^a-z]+", "_", str(value).strip().lower()).strip("_")
     if text in CLASSIFICATIONS:
         return text
-    if "firmware" in text or "defect" in text:
-        return "firmware_defect"
-    if "env" in text or "test" in text or "harness" in text:
-        return "test_env_issue"
-    return "needs_engineer_review"
+    # Only known spellings of the enum. Word matching turned "not a firmware
+    # defect" into firmware_defect (review R06).
+    known = {"firmware": "firmware_defect", "firmware_bug": "firmware_defect", "defect": "firmware_defect",
+             "device_defect": "firmware_defect", "test_issue": "test_env_issue", "env_issue": "test_env_issue",
+             "test_environment_issue": "test_env_issue", "environment_issue": "test_env_issue",
+             "harness_issue": "test_env_issue", "needs_review": "needs_engineer_review",
+             "engineer_review": "needs_engineer_review"}
+    return known.get(text, "needs_engineer_review")
 
 
 def _as_guidance(value) -> list[str]:
@@ -167,6 +177,8 @@ def _as_confidence(value) -> float:
         number = float(value)
     except (TypeError, ValueError):
         return 0.0
+    if not math.isfinite(number):
+        return 0.0  # NaN/inf used to become 1.0 and pass the low-confidence downgrade (review R06)
     if number > 1:
         number = number / 100 if number <= 100 else 1.0
     return max(0.0, min(1.0, number))

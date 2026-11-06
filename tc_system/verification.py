@@ -10,13 +10,19 @@ import unicodedata
 
 from shared.ids import stable_id
 from shared.spec_evidence import plain_text
+from tc_system import spec_fields
 
 VERSION = 2
-CHECK_KINDS = {"completion", "result_bits", "data_length", "data_field",
+# data_length stays known only so stored records evaluate to "unevaluated":
+# it compared the buffer length WE requested with a number, observing nothing
+# about the device (2026-11-05 run: 68/64, 4100/4096 and 260/256 - three
+# false FAILs from a 0-based NUMD slip in our own request).
+CHECK_KINDS = {"completion", "result_bits", "data_length", "data_field", "data_all",
                "data_equal", "data_matches_write"}
+SELF_REFERENCE_KINDS = {"data_length"}
 FIELDS = {"nsid", "data_len", *(f"cdw{i}" for i in range(10, 16))}
 CAPABILITIES = {"sequential", "zero_payload", "hex_payload", "completion_status",
-                "cqe_bits", "data_bytes"}
+                "cqe_bits", "data_bytes", "controller_reset", "power_cycle"}
 # Need concurrent outstanding commands / asynchronous events, which a sequential
 # nvme-cli passthru executor cannot produce. Scenario validation rejects them,
 # and target selection does not offer them at all.
@@ -105,15 +111,104 @@ def integer(value):
 def required_selector_masks(opcode_entry):
     """Request fields that define WHICH test a command performs (FID/SEL, LID,
     CNS, directive type/operation, commit action/slot, LBA range)."""
+    if opcode_entry.get("host_action"):
+        return {}
     raw = int(opcode_entry["raw_opcode"], 16)
     if opcode_entry["command_set"] == "ADMIN":
         return {0x0A: {"cdw10": 0x7FF}, 0x09: {"cdw10": 0xFF},
                 0x02: {"cdw10": 0xFF}, 0x06: {"cdw10": 0xFF},
                 0x19: {"cdw11": 0xFFFF}, 0x1A: {"cdw11": 0xFFFF},
-                0x10: {"cdw10": 0x3F}}.get(raw, {})
+                0x10: {"cdw10": 0x3F},
+                # Queue commands: the QID decides whether it is safe at all.
+                0x00: {"cdw10": 0xFFFF}, 0x01: {"cdw10": 0xFFFF},
+                0x04: {"cdw10": 0xFFFF}, 0x05: {"cdw10": 0xFFFF}}.get(raw, {})
     if opcode_entry["command_set"] == "NVM" and raw in {1, 2, 5}:
         return {"cdw10": 0xFFFFFFFF, "cdw11": 0xFFFFFFFF, "cdw12": 0xFFFF}
     return {}
+
+
+# A step's role text naming its selector ("PLM Config FID 13h"). Measured: a
+# setup step described as reading FID 13h was sent with CDW10=0x20D (HMB FID
+# 0Dh, SEL 2) and its INVALID_FIELD "proved" a precondition about FID 13h.
+_SELECTOR_TEXT = {
+    (0x09, 0x0A): (r"(?:\bFID|Feature Identifier)", "FID"),
+    (0x02,): (r"(?:\bLID|Log Page Identifier|Log Identifier)", "LID"),
+    (0x06,): (r"\bCNS", "CNS"),
+}
+
+
+# A step that reads a support table names the id it looks up, not its own
+# selector ("Supported Log Pages(LID 00h)에서 LID 7Eh 지원 여부").
+_TABLE_TEXT_RE = re.compile(r"Supported Log Pages|Supported and Effects|지원 로그", re.I)
+
+
+def selector_in_text(opcode_entry, text):
+    """(label, value) when `text` names exactly one FID/LID/CNS value for this command."""
+    if opcode_entry.get("command_set") != "ADMIN" or opcode_entry.get("host_action"):
+        return None
+    if _TABLE_TEXT_RE.search(str(text or "")):
+        return None
+    raw = int(opcode_entry["raw_opcode"], 16)
+    for opcodes, (word, label) in _SELECTOR_TEXT.items():
+        if raw in opcodes:
+            values = {int(v, 16) for v in re.findall(word + r"\s*(?:=|:)?\s*(?:0x)?([0-9A-Fa-f]{1,2})h?(?![0-9A-Za-z])",
+                                                        str(text or ""))}
+            return (label, values.pop()) if len(values) == 1 else None
+    return None
+
+
+def pinned_value(constraints, field, mask):
+    """The value `constraints` fix for every bit of `mask` in `field`, else None."""
+    fixed, value = 0, 0
+    for c in constraints or []:
+        if c.get("field") == field:
+            fixed |= integer(c["mask"])
+            value = (value & ~integer(c["mask"])) | integer(c["value"])
+    return value & mask if fixed & mask == mask else None
+
+
+def normative_strength(quote):
+    text = plain_text(quote or "")
+    if re.search(r"\bshall\b|\bmust\b", text, re.I):
+        return "SHALL"
+    if re.search(r"\bshould\b", text, re.I):
+        return "SHOULD"
+    if re.search(r"\bmay\b", text, re.I):
+        return "MAY"
+    return "descriptive"
+
+
+_UNSUPPORTED_PREMISE_RE = re.compile(r"not (?:be )?support|unsupported|does not implement|not implemented|"
+                                     r"is not available|reserved", re.I)
+
+
+def _bit_polarity(text):
+    """"set"/"clear" when a description clearly states which, else None."""
+    text = str(text or "")
+    # Negated forms first, and removed before looking for the positive ones:
+    # "supported\b" also matched the end of "unsupported" (review N03 - a
+    # correct FSUPP=0 check was rewritten to FSUPP=1).
+    negated = re.compile(r"\bun-?supported\b|\bnot\s+(?:be\s+)?supported\b|\b(?:does|do|is)\s*n[o']t\s+support"
+                         r"|미지원\w*|지원하지\s*않\w*|지원되지\s*않\w*|지원 안\s*\w*", re.I)
+    clear = re.search(r"=\s*0\b|0으로|0이어|0이면|0이고|'0'|가 0\b|cleared", text) or negated.search(text)
+    rest = negated.sub(" ", text)
+    is_set = re.search(r"=\s*1\b|1로 설정|1이어|1이고|'1'|가 1\b|지원해야|지원한다|지원함|지원하는|지원됨"
+                       r"|\bsupported\b|\bsupports\b", rest, re.I)
+    if bool(clear) == bool(is_set):
+        return None
+    return "clear" if clear else "set"
+
+
+def _check_tests_bit(check):
+    mask, value = integer(check.get("mask")), integer(check.get("value"))
+    if mask & (mask - 1):
+        return None
+    op = check.get("operator", "eq")
+    if op not in ("eq", "ne"):
+        return None
+    if (op == "eq") == (value == mask):
+        return "set"
+    return "clear"
 
 
 def add_scope_notes(structured, new_notes):
@@ -126,6 +221,9 @@ def add_scope_notes(structured, new_notes):
 def completion_status(result):
     if not result or not result.get("started", True):
         return None
+    if result.get("host_action"):
+        # Fixed host script: exit 0 = done and the controller answered again.
+        return "SUCCESS" if result.get("exit_code") == 0 else None
     out = str(result.get("stdout", ""))
     if HOST_ERROR_RE.search(out) or KERNEL_ABORT_RE.search(out):
         return None
@@ -140,42 +238,45 @@ def completion_status(result):
 
 # nvme-cli prints its own short tokens ("NVMe status: INVALID_OPCODE: ...",
 # confirmed in stored real output), while the spec - and so the model - names
-# the same status "Invalid Command Opcode". A scenario that correctly expected
-# the drive to reject an unsupported command but wrote INVALID_COMMAND_OPCODE
-# never matched, and its intended result was reported as "미지원 응답".
-STATUS_ALIASES = {
-    "SUCCESSFUL_COMPLETION": "SUCCESS",
-    "INVALID_COMMAND_OPCODE": "INVALID_OPCODE",
-    "INVALID_FIELD_IN_COMMAND": "INVALID_FIELD",
-    "INVALID_NAMESPACE_OR_FORMAT": "INVALID_NS", "INVALID_NAMESPACE": "INVALID_NS",
-    "COMMAND_ID_CONFLICT": "CMDID_CONFLICT",
-    "DATA_TRANSFER_ERROR": "DATA_XFER_ERROR",
-    "COMMANDS_ABORTED_DUE_TO_POWER_LOSS_NOTIFICATION": "POWER_LOSS",
-    "INTERNAL_ERROR": "INTERNAL",
-    "COMMAND_ABORT_REQUESTED": "ABORT_REQ",
-    "COMMAND_SEQUENCE_ERROR": "CMD_SEQ_ERROR",
-    "LBA_OUT_OF_RANGE": "LBA_RANGE",
-    "CAPACITY_EXCEEDED": "CAP_EXCEEDED",
-    "NAMESPACE_NOT_READY": "NS_NOT_READY",
-    "INVALID_LOG_PAGE_IDENTIFIER": "INVALID_LOG_PAGE",
-    "INVALID_FIRMWARE_SLOT": "FIRMWARE_SLOT",
-    "INVALID_FIRMWARE_IMAGE": "FIRMWARE_IMAGE",
-    "FEATURE_IDENTIFIER_NOT_SAVEABLE": "FEATURE_NOT_SAVEABLE",
-    "FEATURE_NOT_NAMESPACE_SPECIFIC": "FEATURE_NOT_PER_NS",
-}
+# the same status "Invalid Command Opcode". Names are mapped to nvme-cli's
+# token, and when both sides have a numeric code (spec_fields.STATUS_CODES and
+# the "(0x2285)" nvme-cli prints) the codes decide: measured, COMPARE_FAILURE,
+# UNRECOVERED_READ_ERROR and INVALID_QUEUE_IDENTIFIER never matched
+# COMPARE_FAILED/READ_ERROR/QID_INVALID and four correct rejections were FAILs.
+STATUS_ALIASES = spec_fields.STATUS_NAMES
+
+
 def canonical_status(name):
     """A spec-style status name -> the token nvme-cli prints."""
-    token = re.sub(r"[^A-Z0-9]+", "_", str(name or "").upper()).strip("_")
-    return STATUS_ALIASES.get(token, token)
+    return spec_fields.normalize_status_name(name)
+
+
+def status_matches(expected, result):
+    """The step completed with `expected`: by token, else by (SCT, SC)."""
+    actual = completion_status(result)
+    if actual is None:
+        return False
+    want = canonical_status(expected)
+    if actual == want:
+        return True
+    code = spec_fields.status_code_in_output((result or {}).get("stdout", ""))
+    want_code = spec_fields.status_code_of_name(want)
+    return code is not None and want_code is not None and code == want_code
 
 
 def expected_status(step):
     return canonical_status(step.get("expected_status") or "SUCCESS")
 
 
+def accepted_statuses(step):
+    """The expected status plus any the spec allows instead (a variant's
+    in-range Read of a never-written LBA may complete with Deallocated or
+    Unwritten Logical Block when DULBE is enabled)."""
+    return [expected_status(step)] + [canonical_status(s) for s in step.get("also_accept") or []]
+
+
 def matches_expected(step, result):
-    actual = completion_status(result)
-    return actual is not None and actual == expected_status(step)
+    return any(status_matches(status, result) for status in accepted_statuses(step))
 
 
 def decode_payload(result):
@@ -220,19 +321,36 @@ def payload_bytes(raw):
 
 
 def payload_for_step(step):
-    """Bytes a write step sends. `payload_hex` is a pattern repeated to fill
-    data_len (a 4 KiB block need not be spelled out in the prompt); without
-    it the buffer is zero-filled."""
+    """Bytes a write step sends. `payload_hex` that divides data_len is a
+    pattern repeated to fill it (a 4 KiB block need not be spelled out in the
+    prompt). One that does not is a structure: its bytes, then zeros for the
+    rest (reserved fields are zero) - repeating a structure would write garbage
+    into fields it never meant to set (measured: 8 targets skipped because a
+    43-byte management structure did not divide 4096). Without payload_hex
+    the buffer is zero-filled."""
     if step.get("direction") != "write":
         return b""
     raw = step.get("payload_hex")
     if raw is None:
         return bytes(step["data_len"])
     pattern = payload_bytes(raw)
-    if not pattern or step["data_len"] % len(pattern):
-        raise ValueError(f"payload_hex pattern of {len(pattern)} bytes does not evenly fill "
-                         f"data_len={step['data_len']}")
-    return pattern * (step["data_len"] // len(pattern))
+    length = step["data_len"]
+    if not pattern:
+        raise ValueError("payload_hex is empty")
+    if len(pattern) > length:
+        raise ValueError(f"payload_hex has {len(pattern)} bytes but data_len={length}")
+    if length % len(pattern):
+        return pattern + bytes(length - len(pattern))
+    return pattern * (length // len(pattern))
+
+
+def payload_layout(step):
+    """"repeat" or "structure" - how payload_for_step fills the buffer."""
+    raw = step.get("payload_hex")
+    if raw is None or step.get("direction") != "write":
+        return None
+    pattern = payload_bytes(raw)
+    return "repeat" if pattern and step["data_len"] % len(pattern) == 0 else "structure"
 
 
 # NVM Read/Write/Compare: the LBA range a data comparison is about.
@@ -286,6 +404,23 @@ def _compared_slice(data, other, window):
     return other[offset * block:(offset + blocks) * block]
 
 
+def _byte_summary(data):
+    import hashlib
+    head = data[:16].hex()
+    return f"len={len(data)} sha256={hashlib.sha256(data).hexdigest()[:16]} head={head}"
+
+
+def _comparison_detail(data, other):
+    if data == other:
+        return f"{len(data)}바이트 일치"
+    if len(data) != len(other):
+        return f"길이 다름: {len(data)} vs {len(other)}"
+    k = next(i for i, (a, b) in enumerate(zip(data, other)) if a != b)
+    lo = k - k % 16
+    return (f"byte {k}에서 처음 다름 (0x{data[k]:02X} vs 0x{other[k]:02X}); "
+            f"offset {lo}: {data[lo:lo + 16].hex()} vs {other[lo:lo + 16].hex()}")
+
+
 def validate_check(check, n_steps):
     if not isinstance(check, dict) or check.get("kind") not in CHECK_KINDS:
         raise ValueError("unsupported verification check")
@@ -293,27 +428,67 @@ def validate_check(check, n_steps):
     if not 0 <= i < n_steps:
         raise ValueError("check refers to a missing step")
     kind = check["kind"]
+    if kind in SELF_REFERENCE_KINDS:
+        raise ValueError("data_length compares the buffer length we requested, which observes nothing about "
+                         "the device; check the returned structure's fields with data_field instead")
     if kind in {"data_equal", "data_matches_write"}:
         other = integer(check.get("other_step"))
         if not 0 <= other < i:
             raise ValueError("comparison source must be an earlier step")
+    if kind == "data_all" and not 0 <= integer(check.get("value", 0)) <= 0xFF:
+        raise ValueError("data_all value is one byte (0..0xFF)")
     if kind in {"result_bits", "data_field"}:
         mask, value = integer(check.get("mask")), integer(check.get("value"))
         if mask <= 0 or value < 0 or value & ~mask:
             raise ValueError("invalid comparison mask/value")
-        if check.get("operator", "eq") not in {"eq", "ne", "le", "ge"}:
+        operator = check.get("operator", "eq")
+        if operator not in {"eq", "ne", "le", "ge"}:
             raise ValueError("unsupported comparison operator")
+        # The masked value lies in 0..mask: these hold for every device.
+        # Measured: "(AFI & 0x70) <= 0x70" was a requirement PASS.
+        if (operator == "le" and value >= mask) or (operator == "ge" and value == 0):
+            raise ValueError(f"check is always true ((x & {hex(mask)}) {operator} {hex(value)}): it cannot fail, "
+                             "so it proves nothing - compare against the value the requirement demands")
         if kind == "data_field":
             width, offset = integer(check.get("width")), integer(check.get("offset"))
             if not 1 <= width <= 8 or not 0 <= offset < (1 << 20) or mask >= 1 << (8 * width):
                 raise ValueError("invalid payload field range")
         elif mask > 0xFFFFFFFF:
             raise ValueError("CQE Dword 0 is 32 bits")
-    if kind == "data_length" and not 0 < integer(check.get("bytes")) <= (1 << 20):
-        raise ValueError("invalid expected payload length")
 
 
-def validate_plan_contract(structured, evidence, section_id, available_opcodes):
+def _validate_shape(structured):
+    """The nested shape, before anything reads it. A precondition the code
+    cannot read used to disappear (review R08b: {"condition": ...} dropped,
+    the TC passed) or crash a later step (R08a: a string where a check group
+    belongs raised AttributeError and stopped the batch)."""
+    preconditions = structured.get("preconditions", [])
+    if preconditions is None:
+        preconditions = structured["preconditions"] = []
+    if not isinstance(preconditions, list):
+        raise ValueError("preconditions must be an array of strings")
+    for n, p in enumerate(preconditions):
+        if not isinstance(p, str) or not p.strip():
+            raise ValueError(f"preconditions[{n}] must be a non-empty string (one measurable condition), got {p!r}")
+    for key in ("precondition_checks", "requirements"):
+        groups = structured.get(key, [])
+        if groups is None:
+            groups = structured[key] = []
+        if not isinstance(groups, list):
+            raise ValueError(f"{key} must be an array of objects")
+        for n, group in enumerate(groups):
+            if not isinstance(group, dict):
+                raise ValueError(f"{key}[{n}] must be an object with description and checks, got {group!r}")
+            if not isinstance(group.get("description"), str) or not group["description"].strip():
+                raise ValueError(f"{key}[{n}].description must be a non-empty string")
+            checks = group.get("checks")
+            if not isinstance(checks, list) or not all(isinstance(c, dict) for c in checks):
+                raise ValueError(f"{key}[{n}].checks must be an array of check objects")
+
+
+def validate_plan_contract(structured, evidence, section_id, available_opcodes, target_requirement=None,
+                           device_support=None):
+    _validate_shape(structured)
     steps = structured["steps_plan"]
     capabilities = structured.get("required_capabilities") or []
     capabilities = [capabilities] if isinstance(capabilities, str) else capabilities
@@ -365,7 +540,11 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
             if not 0 < mask <= 0xFFFFFFFF or value < 0 or value & ~mask:
                 raise ValueError("invalid command constraint mask/value")
             masks[c["field"]] = masks.get(c["field"], 0) | mask
-        required = required_selector_masks(by_name[step["opcode_name"]])
+        op = by_name[step["opcode_name"]]
+        _check_step_selectors(k, step, op, constraints)
+        for c in constraints:  # including what the role just pinned
+            masks[c["field"]] = masks.get(c["field"], 0) | integer(c["mask"])
+        required = required_selector_masks(op)
         # The action's selectors ARE the test, so the scenario must state them.
         # A setup/verify step that leaves them open gets them frozen from its
         # first authoring instead (tc_writer.freeze_selectors), so a retry still
@@ -375,6 +554,7 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
                              f"its selector/address fields {{field: mask}} = "
                              + ", ".join(f"{f}: {hex(m)}" for f, m in required.items()))
     _validate_comparisons(structured, steps, by_name)
+    structures = _resolve_structure_checks(structured, steps, by_name)
     evidence_by_id = {e["evidence_id"]: e for e in evidence if e.get("evidence_id")}
     requirements = structured.get("requirements")
     if not isinstance(requirements, list) or not requirements:
@@ -402,8 +582,12 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
             raise ValueError(f"requirements[{n}] has no executable checks")
         for check in checks:
             validate_check(check, len(steps))
+            if steps[integer(check["step"])]["phase"] == "cleanup":
+                raise ValueError(f"requirements[{n}] checks cleanup step {check['step']}: cleanup steps restore "
+                                 "state and run even after a failure; they are not observations")
         req["requirement_id"] = stable_id("req", section_id, block["evidence_id"], quote)
         req["section_id"] = section_id
+        req["strength"] = normative_strength(quote)
     # A "requirement" whose checks all observe steps before the action is a
     # precondition (e.g. "Identify reports the log page as supported"): it is
     # measured before the command under test and gates it. Moved there instead
@@ -425,6 +609,9 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
             structured["preconditions"].append(req["description"])
             conditions.append({"description": req["description"], "checks": req["checks"],
                                "moved_from_requirement": True})
+    if target_requirement:
+        _bind_target_requirement(structured, steps, action, target_requirement)
+    support_notes = _support_premises(structured, steps, action, by_name, structures, device_support)
     covered_conditions = structured.get("precondition_checks", [])
     preconditions = structured.get("preconditions", [])
     if not isinstance(covered_conditions, list) or not isinstance(preconditions, list):
@@ -450,6 +637,7 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
             unmeasured.append(condition["description"])
     measured = {c["description"] for c in kept}
     unmeasured += [p for p in preconditions if isinstance(p, str) and p not in measured and p not in unmeasured]
+    unmeasured += [n for n in support_notes if n not in unmeasured]
     structured["precondition_checks"] = kept
     structured["preconditions"] = [c["description"] for c in kept]
     # Executed, but never a verdict: verify_tc keeps every requirement
@@ -465,7 +653,322 @@ def validate_plan_contract(structured, evidence, section_id, available_opcodes):
         structured["out_of_scope"] = notes
 
 
+def _bind_target_requirement(structured, steps, action, target):
+    """The TC exists to test one extracted "shall" sentence: a requirement
+    checked on the action must quote it (or a part of it), and an abort rule
+    fixes the action's expected completion to the status it names."""
+    text = target["text"]
+    matched = [r for r in structured["requirements"]
+               if quote_in(r.get("quote", ""), text) or quote_in(text, r.get("quote", ""))]
+    if not matched:
+        raise ValueError(f"TARGET_REQUIREMENT is not tested: one requirement checked on the action must quote "
+                         f"it (or a part of it): {text[:160]!r}")
+    for req in matched:
+        req["target_requirement_id"] = target["requirement_id"]
+    _require_host_event(steps, matched, target)
+    if target.get("kind") == "abort" and target.get("expected_status"):
+        want = canonical_status(target["expected_status"])
+        if canonical_status(steps[action].get("expected_status")) != want:
+            raise ValueError(f"TARGET_REQUIREMENT is an abort rule: steps_plan[{action}] (the action) must provoke "
+                             f"its condition and expect {want}")
+
+
+# Commands that only report: they cannot establish the state a "retained
+# across a reset" sentence is about.
+READ_ONLY_COMMANDS = {"Identify", "Get Features", "Get Log Page", "Read", "Compare", "Verify", "Get LBA Status",
+                      "Reservation Report", "Security Receive", "Directive Receive", "NVMe-MI Receive",
+                      "Migration Receive", "Track Receive", "I/O Management Receive"}
+
+
+def _require_host_event(steps, matched, target):
+    """A sentence about state across a reset or a power loss is tested only if
+    the chain performs that event and the requirement observes a step after
+    it. Without this the model could "test" "retained across power cycles"
+    with a single Get Log Page (nothing forced it to use the host step)."""
+    from tc_system.execution.host_actions import HOST_ACTIONS
+    names = target.get("host_steps")
+    if names is None:
+        names = [n for n, a in HOST_ACTIONS.items() if a in (target.get("host_actions") or [])]
+    if not names:
+        return
+    hosts = [i for i, s in enumerate(steps) if s["opcode_name"] in names]
+    observed = {integer(c["step"]) for r in matched for c in r.get("checks") or []
+                if isinstance(c, dict) and c.get("step") is not None}
+    usable = [h for h in hosts if any(o > h for o in observed)]
+    for h in usable:
+        # "Retained across" needs the state set or recorded BEFORE the event,
+        # and nothing after it that could set it again before the check
+        # (review: Reset -> Set -> Get passed as retention).
+        if not any(s["opcode_name"] not in names for s in steps[:h]):
+            raise ValueError(f"TARGET_REQUIREMENT is about state across a reset/power cycle: the state must be set or "
+                             f"recorded by a step BEFORE the host step at {h}")
+        last = max(o for o in observed if o > h)
+        changers = sorted({s["opcode_name"] for s in steps[h + 1:last] if s["opcode_name"] not in READ_ONLY_COMMANDS
+                           and s["opcode_name"] not in names})
+        if changers:
+            raise ValueError(f"TARGET_REQUIREMENT is about state across a reset/power cycle: {', '.join(changers)} "
+                             f"runs between the host step at {h} and the check at {last}, so the check could see a "
+                             "state set after the event, not one retained across it")
+    if not usable:
+        options = " or ".join(repr(n) for n in names)
+        raise ValueError(f"TARGET_REQUIREMENT is about state across a reset/power cycle: steps_plan must perform it "
+                         f"with a {options} step (setup or verify, after the state is established), and the "
+                         f"requirement quoting it must check a step that runs after that host step "
+                         f"(host steps now at {hosts or 'none'}, its checks read steps {sorted(observed)})")
+
+
+def _check_step_selectors(k, step, op, constraints):
+    """Rules on a plan step's fixed fields that do not need the model's reply."""
+    if op.get("host_action"):
+        return
+    raw = int(op["raw_opcode"], 16)
+    # The role names the selector: pin it when open, reject a contradiction.
+    named = selector_in_text(op, step.get("role"))
+    if named:
+        label, value = named
+        pinned = pinned_value(constraints, "cdw10", 0xFF)
+        if pinned is None:
+            constraints.append({"field": "cdw10", "mask": "0x000000FF", "value": hex(value),
+                                "from_role": True})
+        elif pinned != value:
+            raise ValueError(f"steps_plan[{k}] {step['opcode_name']}: role says {label} {value:02X}h but "
+                             f"field_constraints fix {label} {pinned:02X}h (cdw10[7:0]) - make them the same")
+    if op["command_set"] == "ADMIN" and raw in spec_fields.QUEUE_COMMANDS:
+        qid = pinned_value(constraints, "cdw10", 0xFFFF)
+        hazard = spec_fields.queue_command_hazard("ADMIN", raw, qid if qid is not None else 1,
+                                                  step.get("expected_status"))
+        if hazard:
+            raise ValueError(f"steps_plan[{k}] {step['opcode_name']}: {hazard}"
+                             + ("" if qid is not None else " (fix the QID in cdw10[15:0])"))
+    if op["command_set"] == "ADMIN" and raw == 0x09:
+        fid = pinned_value(constraints, "cdw10", 0xFF)
+        if fid in spec_fields.HOST_OWNED_SET_FEATURES:
+            raise ValueError(f"steps_plan[{k}] Set Features FID {fid:02X}h: "
+                             f"{spec_fields.HOST_OWNED_SET_FEATURES[fid]} - changing it is not a device test")
+        codec = spec_fields.FEATURE_CODECS.get(fid) if fid is not None else None
+        for mask, values in (codec or {}).get("irreversible", {}).items():
+            value = pinned_value(constraints, "cdw11", mask)
+            if value in values:
+                raise ValueError(f"steps_plan[{k}] Set Features FID {fid:02X}h value {value}: this state cannot be "
+                                 "undone by Set Features (power cycle or permanent) - not sent by this harness")
+        if fid is not None and codec is None and canonical_status(step.get("expected_status")) == "SUCCESS":
+            raise ValueError(f"steps_plan[{k}] Set Features FID {fid:02X}h expected to succeed: the harness does not "
+                             "know how to put this feature's original value back, so it does not change it; test a "
+                             "rejection, or a feature it can restore")
+
+
+_IDENTIFY_ROLE = ((re.compile(r"Identify Controller|컨트롤러 식별"), 0x01),
+                  (re.compile(r"Identify Namespace(?! (?:List|Granularity|Identification|ID Descriptor))"), 0x00))
+
+
+def _plan_fields(plan_step):
+    fields = {}
+    for c in plan_step.get("field_constraints") or []:
+        mask = integer(c["mask"])
+        if mask:
+            fields[c["field"]] = (integer(fields.get(c["field"], 0)) & ~mask) | integer(c["value"])
+    return fields
+
+
+def _resolve_structure_checks(structured, steps, by_name):
+    """Named field checks become offsets; raw offsets on a known structure
+    must read the field their description names. Returns {step: structure}."""
+    groups = [(f"requirements[{n}]", r) for n, r in enumerate(structured.get("requirements") or [])
+              if isinstance(r, dict)]
+    groups += [(f"precondition_checks[{n}]", p) for n, p in enumerate(structured.get("precondition_checks") or [])
+               if isinstance(p, dict)]
+    structures = {}
+    for where, group in groups:
+        checks = group.get("checks")
+        if not isinstance(checks, list):
+            continue
+        kept = []
+        for check in checks:
+            if isinstance(check, dict) and check.get("kind") in SELF_REFERENCE_KINDS:
+                add_scope_notes(structured, [f"{where}: 요청 길이 자기비교(data_length)는 장비를 관측하지 않아 제외함"])
+                continue
+            kept.append(check)
+        if checks and not kept:
+            raise ValueError(f"{where} only had a data_length check, which compares the length we requested and "
+                             "observes nothing; check the returned data with data_field/data_all instead")
+        group["checks"] = kept
+        for m, check in enumerate(kept):
+            if not isinstance(check, dict) or check.get("kind") != "data_field":
+                continue
+            k = integer(check.get("step"))
+            if not 0 <= k < len(steps):
+                continue  # validate_check reports it
+            plan_step, op = steps[k], by_name[steps[k]["opcode_name"]]
+            structure = structures.get(k)
+            if structure is None:
+                fields = _plan_fields(plan_step)
+                raw = None if op.get("host_action") else int(op["raw_opcode"], 16)
+                if op.get("command_set") == "ADMIN" and raw == 0x06 and "cdw10" not in fields:
+                    cns = next((v for rx, v in _IDENTIFY_ROLE if rx.search(str(plan_step.get("role") or ""))), None)
+                    if cns is not None:
+                        plan_step.setdefault("field_constraints", []).append(
+                            {"field": "cdw10", "mask": "0x000000FF", "value": hex(cns), "from_role": True})
+                        fields["cdw10"] = cns
+                structure = spec_fields.structure_of(op, fields)
+                if structure is None and check.get("field") and op.get("command_set") == "ADMIN" \
+                        and raw in (0x02, 0x06):
+                    raise ValueError(f"{where}.checks[{m}] reads field {check['field']!r} from step {k} "
+                                     f"({plan_step['opcode_name']}), whose CNS/LID is not fixed: fix it in that "
+                                     "step's field_constraints (cdw10[7:0])")
+                if structure:
+                    structures[k] = structure
+            named = bool(check.get("field"))
+            if check.get("field"):
+                if structure is None:
+                    raise ValueError(f"{where}.checks[{m}]: named fields are known for Identify Controller/"
+                                     "Namespace and the Supported Log Pages / Commands Supported and Effects / "
+                                     "FID Supported and Effects logs only; use offset/width/mask for other data")
+                kept[m] = check = spec_fields.resolve_named_check(check, structure)
+            if structure is None:
+                continue
+            siblings = {i["field"] for c in kept if c is not check and isinstance(c, dict)
+                        and c.get("kind") == "data_field" and c.get("step") == check.get("step")
+                        for i in [spec_fields.interpret_check(c, structure)] if i and i.get("field")}
+            problem = spec_fields.check_matches_description(check, structure, group.get("description"), siblings)
+            if problem is None:
+                polarity, tests = _bit_polarity(group.get("description")), None
+                try:
+                    tests = _check_tests_bit(check)
+                except (ValueError, TypeError):
+                    pass
+                if polarity and tests and polarity != tests:
+                    problem = (f"설명은 비트가 {'1' if polarity == 'set' else '0'}인 조건인데 검사식 "
+                               f"({check.get('operator', 'eq')} {check.get('value')}, mask {check.get('mask')})은 "
+                               f"{'1' if tests == 'set' else '0'}을 확인함")
+                    if named:
+                        # The model named the field and wrote its value; the
+                        # description is read by a heuristic. Neither wins.
+                        raise ValueError(f"{where}.checks[{m}]: the description {group.get('description')!r} "
+                                         f"says the bit is {'1' if polarity == 'set' else '0'} but the check "
+                                         f"{check.get('field')} value={check.get('value')} tests "
+                                         f"{'1' if tests == 'set' else '0'}; make them agree")
+            if problem:
+                # The description says which field it means: write that field
+                # (the harness encodes, the model names) instead of skipping the
+                # target. Measured: 106 of 215 Identify checks in one run read a
+                # different field than their description - nearly all a
+                # mis-encoding of a clearly named field.
+                repaired = _repair_check(check, structure, group.get("description"), siblings)
+                if repaired is None:
+                    title = (spec_fields.STRUCTURES.get(structure) or spec_fields.ENTRY_LOGS.get(structure))[0]
+                    raise ValueError(f"{where}.checks[{m}] on step {k} ({title}): {problem}. Prefer a named check, "
+                                     f"e.g. {{\"kind\": \"data_field\", \"step\": {k}, \"field\": \"OACS.NMS\", "
+                                     "\"value\": 1}")
+                kept[m] = repaired
+                structured.setdefault("check_repairs", []).append(
+                    {"where": where, "step": k, "description": group.get("description"), "problem": problem,
+                     "before": {x: check.get(x) for x in ("offset", "width", "mask", "value", "operator")},
+                     "after": {x: repaired.get(x) for x in ("offset", "width", "mask", "value", "operator")},
+                     "reads": spec_fields.interpret_check(repaired, structure)["label"]})
+    return structures
+
+
+def _repair_check(check, structure, description, siblings=()):
+    """The check rewritten to the one field/bit the description names, or
+    None when the description does not single one out."""
+    polarity = _bit_polarity(description)
+    try:
+        tested = _check_tests_bit(check)
+    except (ValueError, TypeError):
+        tested = None
+    want_set = (polarity or tested or "set") == "set"
+    if structure in spec_fields.ENTRY_LOGS:
+        ids = spec_fields.wanted_ids(structure, description)
+        if len(ids) != 1:
+            return None
+        title, bit_name, bit, _ = spec_fields.ENTRY_LOGS[structure]
+        base = 1024 if structure == "cse" and integer(check.get("offset", 0)) >= 1024 else 0
+        return dict(check, offset=base + ids.pop() * 4, width=1, mask=hex(1 << bit),
+                    value=hex((1 << bit) if want_set else 0), operator="eq", repaired=True)
+    target = spec_fields.described_target(structure, description, siblings)
+    if target is None:
+        return None
+    name, bit_name = target
+    field = spec_fields.STRUCTURES[structure][1][name]
+    out = dict(check, offset=field["offset"], width=field["width"], operator=check.get("operator", "eq"), repaired=True)
+    if bit_name:
+        bits = field["bits"][bit_name]["bits"]
+        if isinstance(bits, tuple):
+            return None  # a multi-bit value: its expected number cannot be inferred
+        out.update(mask=hex(1 << bits), value=hex((1 << bits) if want_set else 0), operator="eq")
+        return out
+    if field["bits"]:
+        return None  # a bit field without the bit named: which bit is meant is unknown
+    full = (1 << (8 * field["width"])) - 1
+    mask, value = integer(check.get("mask", full)), integer(check.get("value", 0))
+    if mask > full or value & ~mask:
+        mask = full
+    if value & ~mask:
+        return None
+    out.update(mask=hex(mask), value=hex(value))
+    return out
+
+
+def _support_premises(structured, steps, action, by_name, structures, device_support):
+    """Negative tests that rely on something being unsupported. Returns notes
+    for unmeasured_preconditions; raises when the drive is known to contradict
+    the premise. Measured: "LID 09h is unsupported" and "CNS 10h is
+    unsupported" were assumed, the drive answered SUCCESS, and both became FAILs."""
+    notes = []
+    if not device_support:
+        return notes
+    step, op = steps[action], by_name[steps[action]["opcode_name"]]
+    if op.get("host_action") or op.get("command_set") != "ADMIN":
+        return notes
+    raw, expected = int(op["raw_opcode"], 16), canonical_status(step.get("expected_status"))
+    selector = pinned_value(step.get("field_constraints"), "cdw10", 0xFF)
+    if selector is None:
+        return notes
+    quotes = " ".join(str(r.get("quote", "")) for r in structured.get("requirements") or [] if isinstance(r, dict))
+    if raw == 0x02 and expected == "INVALID_LOG_PAGE":
+        known = (device_support.get("lids") or {}).get(selector)
+        if known is True:
+            raise ValueError(f"this drive reports LID {selector:02X}h as supported (Supported Log Pages, probed at "
+                             "the start of the run): a test expecting INVALID_LOG_PAGE for it has a false premise; "
+                             "use a reserved or unsupported LID, or test the supported log")
+        measured = _premise_measured(structured, structures, ("supported_logs", selector))
+        if known is None and not measured:
+            notes.append(f"LID {selector:02X}h 미지원 여부가 측정되지 않음(Supported Log Pages로 확인 필요)")
+    if raw in (0x09, 0x0A) and expected == "INVALID_FIELD":
+        known = (device_support.get("fids") or {}).get(selector)
+        about_support = bool(_UNSUPPORTED_PREMISE_RE.search(quotes))
+        if known is False and not about_support:
+            raise ValueError(f"this drive does not support FID {selector:02X}h (probed at the start of the run), so "
+                             "INVALID_FIELD would come from the FID itself and cannot show that the field this "
+                             "requirement is about was checked; use a supported FID")
+        if known is True and about_support and "reserved" not in quotes.lower():
+            raise ValueError(f"this drive supports FID {selector:02X}h (probed): a requirement about an unsupported "
+                             "feature cannot be tested with it")
+        # No probe result is not the same as unmeasured: this TC may read the
+        # FID's own FSUPP=0 before the action (review N02).
+        if known is None and not _premise_measured(structured, structures, ("fid_effects", selector)):
+            notes.append(f"FID {selector:02X}h 지원 여부가 측정되지 않음 — INVALID_FIELD가 FID 때문인지 다른 필드 때문인지 "
+                         "구분할 수 없음")
+    return notes
+
+
+def _premise_measured(structured, structures, entry):
+    """A precondition check reads `entry`'s own support bit and requires it clear."""
+    for p in structured.get("precondition_checks") or []:
+        for c in (p.get("checks") or []) if isinstance(p, dict) else []:
+            if not isinstance(c, dict) or c.get("kind") != "data_field":
+                continue
+            try:
+                if _check_says_unsupported(c, structures.get(integer(c["step"])), entry):
+                    return True
+            except (KeyError, TypeError, ValueError):
+                continue
+    return False
+
+
 def _planned_range(plan_step, op):
+    if op.get("host_action"):
+        return None
     raw = int(op["raw_opcode"], 16)
     if op["command_set"] != "NVM" or raw not in NVM_DATA_OPCODES:
         return None
@@ -487,6 +990,8 @@ def _validate_comparisons(structured, steps, by_name):
         if not (0 <= j < i < len(steps)):
             continue  # validate_check reports the bad index itself
         op_i, op_j = by_name[steps[i]["opcode_name"]], by_name[steps[j]["opcode_name"]]
+        if op_i.get("host_action") or op_j.get("host_action"):
+            raise ValueError(f"step {i} vs step {j}: a host step (reset/power cycle) has no data to compare")
         if check["kind"] == "data_matches_write":
             if int(op_j["raw_opcode"], 16) & 0b11 != 0b01:
                 raise ValueError(f"data_matches_write: step {j} ({op_j['name']}) does not write data")
@@ -544,6 +1049,11 @@ def evaluate_check(check, steps, results):
             observed, expected = completion_status(result), expected_status(step)
             if observed is None:
                 raise ValueError("no trustworthy controller completion")
+            same = any(status_matches(s, result) for s in accepted_statuses(step))
+            ok = same if check.get("operator", "eq") == "eq" else not same
+            return {"check": check, "result": "satisfied" if ok else "violated", "observed": observed,
+                    "expected": expected, "detail": f"{observed!r} {check.get('operator', 'eq')} {expected!r}"
+                    + (" (같은 상태 코드)" if same and observed != expected else "")}
         else:
             if completion_status(result) != "SUCCESS":
                 raise ValueError("successful completion required for data/CQE checks")
@@ -556,8 +1066,20 @@ def evaluate_check(check, steps, results):
                 data = decode_payload(result)
                 if data is None:
                     raise ValueError("response bytes were not captured")
-                if kind == "data_length":
-                    observed, expected = len(data), integer(check["bytes"])
+                if kind == "data_all":
+                    # "every byte" is about the whole buffer: a short capture
+                    # (one zero byte for a 512-byte read) proves nothing.
+                    if step.get("data_len") and len(data) != integer(step["data_len"]):
+                        raise ValueError(f"captured {len(data)} of {step['data_len']} bytes; data_all needs the "
+                                         "whole buffer")
+                    want = integer(check.get("value", 0))
+                    bad = next((k for k, b in enumerate(data) if b != want), None)
+                    ok = bad is None if check.get("operator", "eq") == "eq" else bad is not None
+                    detail = (f"{len(data)}바이트 전부 0x{want:02X}" if bad is None else
+                              f"byte {bad} = 0x{data[bad]:02X} (기대 0x{want:02X}), 전체 {len(data)}바이트")
+                    return {"check": check, "result": "satisfied" if ok else "violated",
+                            "observed": None if bad is None else f"byte {bad}=0x{data[bad]:02X}",
+                            "expected": f"all 0x{want:02X}", "detail": detail}
                 elif kind == "data_field":
                     offset, width = integer(check["offset"]), integer(check["width"])
                     if len(data) < offset + width:
@@ -567,14 +1089,28 @@ def evaluate_check(check, steps, results):
                     j = integer(check["other_step"])
                     if not matches_expected(steps[j], results.get(j)):
                         raise ValueError("comparison source did not complete as expected")
+                    if step.get("data_len") and len(data) != integer(step["data_len"]):
+                        raise ValueError(f"step {i}: captured {len(data)} of {step['data_len']} bytes")
                     other = (payload_for_step(steps[j]) if kind == "data_matches_write"
                              else decode_payload(results.get(j)))
+                    if kind == "data_equal" and other is not None and steps[j].get("data_len") \
+                            and len(other) != integer(steps[j]["data_len"]):
+                        raise ValueError(f"step {j}: captured {len(other)} of {steps[j]['data_len']} bytes")
                     if other is None or (kind == "data_matches_write" and steps[j].get("direction") != "write"):
                         raise ValueError("comparison source bytes unavailable")
                     if kind == "data_matches_write" and not any(other):
                         raise ValueError("a zero-filled write cannot be told apart from unwritten LBAs")
                     other = _compared_slice(data, other, comparison_window(step, steps[j]))
-                    observed, expected = data.hex(), other.hex()
+                    # Equality on the full bytes; only a summary is stored. The
+                    # full hex was copied into verification, criteria_results
+                    # and the judge prompt (measured: a 95,847-character prompt).
+                    op = check.get("operator", "eq")
+                    same = data == other
+                    ok = same if op == "eq" else not same
+                    observed, expected = _byte_summary(data), _byte_summary(other)
+                    return {"check": check, "result": "satisfied" if ok else "violated",
+                            "observed": observed, "expected": expected,
+                            "detail": _comparison_detail(data, other)}
             if kind in {"result_bits", "data_field"}:
                 observed &= integer(check["mask"])
                 expected = integer(check["value"])
@@ -586,6 +1122,102 @@ def evaluate_check(check, steps, results):
     except (ValueError, KeyError, TypeError, IndexError) as exc:
         return {"check": check, "result": "unevaluated", "observed": observed,
                 "expected": expected, "detail": str(exc)}
+
+
+def _support_entry_of(step):
+    """(support table, id) a negative test's premise is about: the LID of a
+    Get Log Page, the FID of a Get/Set Features, the opcode itself for an
+    expected INVALID_OPCODE. None when no support table covers it."""
+    try:
+        raw = integer(step["opcode"])
+        selector = integer(step.get("cdw10", "0x0")) & 0xFF
+    except (KeyError, TypeError, ValueError):
+        return None
+    if expected_status(step) == "INVALID_OPCODE":
+        return "cse", raw + (1024 // 4 if step.get("mode") == "io-passthru" else 0)
+    if step.get("mode") != "admin-passthru":
+        return None
+    if raw == 0x02:
+        return "supported_logs", selector
+    if raw in (0x09, 0x0A):
+        return "fid_effects", selector
+    return None
+
+
+def _check_says_unsupported(check, structure, entry):
+    """True when this data_field check reads exactly the support bit of
+    `entry` and holds only if that bit is clear."""
+    table, ident = entry
+    if structure != table:
+        return False
+    interp = spec_fields.interpret_check(check, structure)
+    if not interp or not interp.get("support_bit") or interp.get("index") is None:
+        return False
+    base = 1024 if structure == "cse" and integer(check["offset"]) >= 1024 else 0
+    index = interp["index"] + base // 4
+    if index != ident:
+        return False
+    try:
+        tests = _check_tests_bit(check)
+    except (ValueError, TypeError):
+        return False
+    return tests == "clear"
+
+
+def _structure_of_step(step):
+    try:
+        fields = {k: step.get(k, "0x0") for k in ("cdw10", "cdw11", "cdw12", "cdw13")}
+        return spec_fields.structure_of({"command_set": "ADMIN" if step.get("mode") == "admin-passthru" else "NVM",
+                                         "raw_opcode": step["opcode"]}, fields)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _support_measured(steps, conditions, action_step):
+    """A precondition check held that reads THIS test's own entry in a
+    support table and requires it unsupported. A held check on another LID
+    (review F02: LID 00h supported was taken as proof LID 7Eh is not) proves
+    nothing about this premise."""
+    entry = _support_entry_of(action_step)
+    if entry is None:
+        return False
+    for condition in conditions:
+        for outcome in condition.get("results") or []:
+            check = outcome.get("check") or {}
+            if outcome.get("result") != "satisfied" or check.get("kind") != "data_field":
+                continue
+            try:
+                structure = _structure_of_step(steps[integer(check["step"])])
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            if _check_says_unsupported(check, structure, entry):
+                return True
+    return False
+
+
+def _premise_refuted(req, checks, steps, results, conditions=()):
+    """A requirement about unsupported/reserved values ("If a controller does
+    not support the specified CNS value, then ... abort with Invalid Field")
+    whose rejection was expected but the drive completed successfully: the
+    drive supports that value, so the rule does not apply - not a violation."""
+    if not _UNSUPPORTED_PREMISE_RE.search(plain_text(req.get("quote", ""))) or "reserved" in str(req.get("quote", "")).lower():
+        return None
+    for outcome in checks:
+        check = outcome["check"]
+        if check.get("kind") != "completion" or outcome["result"] != "violated":
+            continue
+        try:
+            i = integer(check["step"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        # Measured unsupported (probe or a support-table precondition) and
+        # still accepted: that is the violation, not a refuted premise.
+        if steps[i].get("selector_support") is False or _support_measured(steps, conditions, steps[i]):
+            return None
+        if outcome.get("observed") == "SUCCESS" and expected_status(steps[i]).startswith("INVALID"):
+            return (f"스텝 {i}이 '미지원이면 거부' 전제로 {expected_status(steps[i])}를 기대했지만 SUCCESS — "
+                    "장비가 그 값을 지원한다는 뜻이라 이 규정의 위반이 아님(전제가 장비 응답으로 반증됨)")
+    return None
 
 
 def verify_tc(tc, execution):
@@ -615,16 +1247,26 @@ def verify_tc(tc, execution):
     for condition in contract.get("precondition_checks", []):
         checks = [evaluate_check(c, steps, results) for c in condition["checks"]]
         conditions.append(dict(condition, results=checks))
+    # Harness snapshot/cleanup steps restore state; they are not part of the test.
+    test_steps = [(i, s) for i, s in enumerate(steps) if not s.get("harness") and s.get("phase") != "cleanup"]
     preconditions_ok = (all(c["result"] == "satisfied" for p in conditions for c in p["results"])
-                        and all(matches_expected(s, results.get(i)) for i, s in enumerate(steps)
+                        and all(matches_expected(s, results.get(i)) for i, s in test_steps
                                 if s.get("phase") == "setup"))
     # Every supporting command is a dependency; an unsupported/failed setup
     # cannot be discarded to turn its dependent action into a verified PASS.
-    chain_ok = all(matches_expected(s, results.get(i)) for i, s in enumerate(steps))
+    chain_ok = all(matches_expected(s, results.get(i)) for i, s in test_steps)
     evidence = {e.get("evidence_id"): e for e in contract.get("evidence", [])}
     requirements = []
-    for req in contract["requirements"]:
-        checks = [evaluate_check(c, steps, results) for c in req.get("checks", [])]
+    evaluated = [(req, [evaluate_check(c, steps, results) for c in req.get("checks", [])])
+                 for req in contract["requirements"]]
+    # A code variant sweeps a value the spec itself reserves: accepting it IS
+    # the deviation, there is no "maybe the drive supports it" premise.
+    is_variant = (contract.get("target_requirement") or {}).get("kind") == "variant"
+    for req, checks in ([] if is_variant else evaluated):
+        refuted = _premise_refuted(req, checks, steps, results, conditions)
+        if refuted and refuted not in issues:
+            issues.append(refuted)
+    for req, checks in evaluated:
         block = evidence.get(req.get("evidence_id"))
         grounded = bool(block and quote_in(req.get("quote", ""), block["text"]))
         if not grounded or issues or not preconditions_ok:

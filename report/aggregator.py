@@ -34,11 +34,22 @@ def build_tc_model() -> dict:
     coverage = load_json(config.COVERAGE_STATE_PATH, default=None)
     if config.active_coverage_index_path().exists():
         index = SpecCoverageIndexFile(config.active_coverage_index_path())
-        coverage = compute_coverage(index, tc_records, load_json(config.TARGET_SKIPS_PATH, default=[]))
+        from tc_system.generation.variants import variant_targets
+        device = load_json(config.DEVICE_INFO_PATH, default={}) or {}
+        variants = variant_targets(index, nsze=device.get("nsze"), lba_bytes=device.get("lba_bytes"))
+        coverage = compute_coverage(index, tc_records, load_json(config.TARGET_SKIPS_PATH, default=[]), variants)
     verdicts_by_source, fc_by_id = _judgments(("tc_exec",))
+    skips = load_json(config.TARGET_SKIPS_PATH, default=[])
+    # Every run writes a manifest, also one that produced no TC (all skipped):
+    # the latest run is the latest manifest/record, not the latest TC (review F05).
+    candidates = [p.stem for p in config.RUN_MANIFESTS_DIR.glob("*.json")] if config.RUN_MANIFESTS_DIR.exists() else []
+    candidates += [t.get("run_id") for t in tc_records] + [s.get("run_id") for s in skips]
+    run_id = max((c for c in candidates if c), default=None)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "coverage": coverage,
+        "run_id": run_id,
+        "skips": skips,
         "tc_records": tc_records,
         "verdicts": verdicts_by_source["tc_exec"],
         "failure_contexts_by_id": fc_by_id,

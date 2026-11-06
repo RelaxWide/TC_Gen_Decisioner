@@ -4,6 +4,7 @@ import json
 import config
 from report import components as c
 from tc_system.execution.expectation_checker import describe_outcome
+from tc_system.review import LEVEL_LABELS, LEVELS, review_tc
 from tc_system.verification import verify_tc
 
 SOURCE_LABELS = {"qst": "QST", "pulsefz": "PULSEFZ", "tc_exec": "TC 자동생성 실행 결과"}
@@ -18,11 +19,19 @@ def _coverage_section(coverage: dict | None) -> str:
     progress = (
         # The denominator is what the tool can test today; excluded clauses
         # are listed with their reason below instead of silently diluting it.
-        c.stat_tile("시도한 테스트 대상 조항", f"{tried}/{testable}",
-                    f"{round(100 * tried / testable, 1) if testable else 0.0}% — 지금 도구로 테스트 가능한 조항 기준")
+        c.stat_tile("시도한 요구사항 타겟", f"{s.get('requirements_tried', 0)}/{s.get('requirement_targets', 0)}",
+                    f"스펙 shall 문장(거부 규칙 {(targets.get('requirement_kinds') or {}).get('abort', 0)}개 포함) — "
+                    f"판정 {s.get('requirements_judged', 0)}개")
+        + c.stat_tile("코드 변형 TC", f"{s.get('variants_tried', 0)}/{s.get('variant_targets', 0)}",
+                      "LLM 없이 값만 바꾼 TC — " + ", ".join(f"{k} {v}" for k, v in
+                                                       (targets.get("variant_families") or {}).items()))
+        + c.stat_tile("시도한 테스트 대상 조항", f"{tried}/{testable}",
+                      f"{round(100 * tried / testable, 1) if testable else 0.0}% — 지금 도구로 테스트 가능한 조항 기준")
         + c.stat_tile("검증식을 평가한 요구사항", str(s.get("requirements_evaluated", 0)),
                       f"생성된 요구사항 {s.get('requirements_total', 0)}개 중 — 전체 스펙 분모 아님")
-        + c.stat_tile("요구사항 PASS", str(s.get("requirements_passed", 0)))
+        + c.stat_tile("요구사항 PASS", str(s.get("requirements_passed", 0)),
+                      " / ".join(f"{k} {v}" for k, v in (s.get("requirements_passed_by_scope") or {}).items())
+                      or "무엇을 관측했는지는 TC 검토 사유 참고")
         + c.stat_tile("요구사항 FAIL / 혼재", f"{s.get('requirements_failed', 0)} / {s.get('requirements_mixed', 0)}")
         + c.stat_tile("미검증 요구사항", str(s.get("requirements_unverified", 0)))
     )
@@ -72,11 +81,13 @@ def _command_table(commands: list[dict]) -> str:
                         for sec in cmd["sections"]]
         detail = c.table(["조항", "제목", "최근 결과", "TC 수", "건너뜀", "마지막 건너뜀 사유"], section_rows)
         rows.append([c.details_block(c.esc(cmd["name"]), detail), c.esc(cmd["command_set"]),
-                     c.esc(f"{cmd['tried']}/{cmd['targets']}")]
+                     c.esc(f"{cmd['tried']}/{cmd['targets']}"),
+                     c.esc(f"{cmd.get('requirements_tried', 0)}/{cmd.get('requirements', 0)}"),
+                     c.esc(f"{cmd.get('variants_tried', 0)}/{cmd.get('variants', 0)}")]
                     + [c.esc(cmd["statuses"].get(key, 0)) for key, _ in _STATUS_COLUMNS]
                     + [c.esc(cmd["skipped"]), c.esc(cmd["verified_requirements"])])
-    return c.table(["커맨드", "커맨드셋", "시도/대상 조항"] + [label for _, label in _STATUS_COLUMNS]
-                   + ["건너뜀", "평가된 요구사항"], rows)
+    return c.table(["커맨드", "커맨드셋", "시도/대상 조항", "시도/요구사항", "시도/코드 변형"]
+                   + [label for _, label in _STATUS_COLUMNS] + ["건너뜀", "평가된 요구사항"], rows)
 
 
 def _json(value):
@@ -176,6 +187,69 @@ def _tc_table(tc_records: list[dict]) -> str:
     return c.table(["TC ID", "Name", "저장된 결과", "Flags", "Section(s)", "Opcode(s)", "Updated", "검증 근거"], rows)
 
 
+def _review_of(tc):
+    """Stored review (with the auditor LLM's objections) or, for records
+    from before reviews existed, the code-only one."""
+    return tc.get("review") or review_tc(tc)
+
+
+def _review_section(tc_records: list[dict]) -> str:
+    """The TCs a person has to look at, most important first, with why."""
+    if not tc_records:
+        return '<div class="empty-state">아직 TC가 없습니다.</div>'
+    reviewed = [(tc, _review_of(tc)) for tc in tc_records]
+    counts = {lvl: sum(1 for _, r in reviewed if r["level"] == lvl) for lvl in LEVELS}
+    tiles = "".join(c.stat_tile(LEVEL_LABELS[lvl], str(counts[lvl]), hint) for lvl, hint in (
+        ("must", "FAIL·호스트 크래시·상태 미원복·계약 모순·결함 판정"),
+        ("recommend", "관측보다 넓게 주장한 PASS, 잘못된 필드로 막힌 사전조건 등"),
+        ("info", "코드 검사와 감사 모두 통과")))
+    rows = []
+    for tc, review in sorted(reviewed, key=lambda x: (-LEVELS.index(x[1]["level"]), x[0].get("name", ""))):
+        if review["level"] == "info":
+            continue
+        reasons = [r for r in review["reasons"] if r["level"] != "info"]
+        items = "".join(f"<li>[{c.esc(LEVEL_LABELS[r['level']])}{' · LLM 감사' if r['source'] == 'llm' else ''}] "
+                        f"{c.esc(r['text'])}</li>" for r in sorted(reasons, key=lambda r: -LEVELS.index(r["level"])))
+        rows.append([c.esc(LEVEL_LABELS[review["level"]]), c.esc(tc.get("name", "")), c.esc(tc.get("status", "")),
+                     c.esc(review.get("scope") or ""), f"<ul>{items}</ul>"])
+    table = c.table(["검토", "TC", "기계 판정", "PASS 범위", "사유"], rows) if rows else         '<div class="empty-state">꼭 확인/확인 권장 항목이 없습니다.</div>'
+    return (f'<div class="stat-row">{tiles}</div>'
+            '<p class="note">기계 판정(PASS/FAIL/...)은 그대로 두고, 그 판정을 얼마나 믿을지를 따로 표시합니다. '
+            "사유는 코드 검사가 기본이고 'LLM 감사'는 같은 LLM이 디코딩된 사실만 보고 낸 이의입니다 — "
+            "최종 판단은 사람이 합니다.</p>" + table)
+
+
+def _progress_section(tc_records: list[dict], skips: list[dict], run_id: str | None) -> str:
+    """Attempted is not verified: how far each target got, for the latest run."""
+    # A named run shows its own counts, zero included; only records from
+    # before run ids existed fall back to everything stored.
+    if run_id and (any(t.get("run_id") for t in tc_records) or any(s.get("run_id") for s in skips)):
+        tcs = [t for t in tc_records if t.get("run_id") == run_id]
+        skips = [s for s in skips if s.get("run_id") == run_id]
+    else:
+        tcs = tc_records
+    sent = stopped = 0
+    for tc in tcs:
+        results = {r["step_index"]: r for r in (tc.get("execution") or {}).get("step_results", [])}
+        action = next((i for i, s in enumerate(tc.get("steps") or []) if s.get("phase") == "action"), None)
+        r = results.get(action) if action is not None else None
+        if r and r.get("started", True) and not r.get("blocked_reason"):
+            sent += 1
+        else:
+            stopped += 1
+    statuses = {}
+    for tc in tcs:
+        statuses[tc.get("status")] = statuses.get(tc.get("status"), 0) + 1
+    label = f"실행 {c.esc(run_id)}" if tcs is not tc_records else "저장된 전체"
+    tiles = (c.stat_tile("TC 생성·실행", str(len(tcs)), label)
+             + c.stat_tile("본동작(action) 전송", str(sent), "장비에 실제로 나간 대상 명령")
+             + c.stat_tile("본동작 전에 중단", str(stopped), "사전조건/setup에서 멈춤 — 대상 명령은 안 나감")
+             + c.stat_tile("건너뜀(장비 전송 없음)", str(len(skips)), "생성·인자·전송 전 차단")
+             + c.stat_tile("판정 분포", " / ".join(f"{k} {v}" for k, v in sorted(statuses.items(), key=str)), ""))
+    return (f'<div class="stat-row">{tiles}</div><p class="note">"시도"는 검증 완료가 아닙니다. '
+            "본동작이 장비에 나간 수와, 그 중 요구사항을 판정한 수는 아래 커버리지에서 따로 셉니다.</p>")
+
+
 def _verdict_rows(source: str, verdicts: list[dict], fc_by_id: dict) -> list[list[str]]:
     rows = []
     for v in verdicts:
@@ -249,14 +323,23 @@ def render_log_report(model: dict) -> str:
 def render_tc_report(model: dict) -> str:
     """Spec coverage, per-command results and the TC list, with the judgments
     of failed TCs (same judge engine, but about TC executions)."""
+    linked = {t.get("verdict_id") for t in model["tc_records"] if t.get("verdict_id")}
+    current = [v for v in model["verdicts"] if v.get("verdict_id") in linked]
+    history = [v for v in model["verdicts"] if v.get("verdict_id") not in linked]
     subtitle = (f'generated_at: {c.esc(model["generated_at"])} | TC: {len(model["tc_records"])} | '
-                f'판정된 TC 실패: {len(model["verdicts"])}')
+                f'현재 TC의 판정: {len(current)} | 이전 실행 판정(현재 TC와 연결 안 됨): {len(history)}')
     sections = [
+        ("꼭 봐야 할 결과", _review_section(model["tc_records"])),
+        ("진행 상황", _progress_section(model["tc_records"], model.get("skips") or [], model.get("run_id"))),
         ("Spec 커버리지", _coverage_section(model["coverage"])),
         ("TC 목록", _tc_table(model["tc_records"])),
         (f"1차 판단 — {SOURCE_LABELS['tc_exec']}",
-         _judgment_section("tc_exec", model["verdicts"], model["failure_contexts_by_id"])),
+         _judgment_section("tc_exec", current, model["failure_contexts_by_id"])),
     ]
+    if history:
+        # Kept (judgments are never deleted), but not mixed into this result set.
+        sections.append(("이전 실행의 판정(보존 기록, 현재 TC와 연결 안 됨)",
+                         _judgment_section("tc_exec", history, model["failure_contexts_by_id"])))
     return _page("TC 자동생성 · 스펙 커버리지 리포트", subtitle, sections)
 
 

@@ -20,6 +20,7 @@ was actually sent and actually came back.
 import json
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,8 @@ IS_DUMMY = False
 REASONING_EFFORT = "low"
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
 _guide = None
+# Scenario/argument generation runs in worker threads (pipeline prefetch).
+_lock = threading.Lock()
 
 
 class LLMCallError(RuntimeError):
@@ -41,6 +44,11 @@ class LLMCallError(RuntimeError):
 def _load_guide():
     # Imported lazily so that importing this module never touches the network
     # or requires credentials to be present (tests import siblings of it).
+    with _lock:
+        return _load_guide_locked()
+
+
+def _load_guide_locked():
     global _guide
     if _guide is None:
         rag_dir = str(config.RAG_DIR)
@@ -120,8 +128,9 @@ def _complete(guide, prompt: str, system: str | None) -> str:
 
 def _append_log(record: dict) -> None:
     config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    with config.LLM_CALL_LOG_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    with _lock, config.LLM_CALL_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(line)
 
 
 def generate_llm_response(prompt: str, *, system: str | None = None,
@@ -187,7 +196,9 @@ def generate_llm_response(prompt: str, *, system: str | None = None,
             if missing:
                 raise LLMCallError(f"LLM response missing required keys: {missing}")
 
-        response_id = stable_id("llm", prompt, system or "", str(response_schema), text[:200])
+        # The whole reply: two replies sharing their first 200 characters got
+        # the same id (review R11).
+        response_id = stable_id("llm", prompt, system or "", str(response_schema), text)
         record["structured"], record["response_id"] = structured, response_id
         return {"response_id": response_id, "text": text, "structured": structured, "is_dummy": False}
     except LLMCallError as exc:

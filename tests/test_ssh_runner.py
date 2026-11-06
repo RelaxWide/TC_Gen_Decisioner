@@ -225,27 +225,32 @@ class TestProbeDeviceCapabilities(unittest.TestCase):
         config.get_ssh_target = self._real_get_target
         self.tmp.cleanup()
 
-    def test_runs_id_ctrl_id_ns_and_effects_log_and_returns_their_raw_stdout(self):
-        fakes = [_FakeProc(returncode=0, stdout="id-ctrl output"),
-                 _FakeProc(returncode=0, stdout="id-ns output"),
-                 _FakeProc(returncode=0, stdout="effects-log output")]
+    def test_runs_the_read_only_probes_and_returns_their_raw_stdout(self):
+        names = ["id-ctrl output", "id-ns output", "effects-log output", "logs", "fids", "versions"]
+        fakes = [_FakeProc(returncode=0, stdout=n) for n in names]
         with mock.patch.object(ssh_runner, "_plink", side_effect=fakes) as plink:
             out = probe_device_capabilities("/dev/nvme0", "/dev/nvme0n1")
         self.assertEqual(out, {"id_ctrl": "id-ctrl output", "id_ns": "id-ns output",
-                                "effects_log": "effects-log output"})
+                                "effects_log": "effects-log output", "supported_logs": "logs",
+                                "fid_support": "fids", "host_versions": "versions"})
         commands = [call.args[1] for call in plink.call_args_list]
         self.assertIn("sudo nvme id-ctrl /dev/nvme0", commands)
         self.assertIn("sudo nvme id-ns /dev/nvme0n1", commands)
         self.assertIn("sudo nvme effects-log /dev/nvme0", commands)
+        self.assertTrue(any("--log-id=0" in c for c in commands))
+        # Support probe: Get Features SEL=011b (capabilities) only - read-only.
+        loop = next(c for c in commands if "get-feature" in c)
+        self.assertIn("-s 3", loop)
+        self.assertNotIn("set-feature", " ".join(commands))
 
     def test_commands_and_timing_are_logged(self):
-        fakes = [_FakeProc(returncode=0), _FakeProc(returncode=0), _FakeProc(returncode=0)]
+        fakes = [_FakeProc(returncode=0) for _ in range(6)]
         with mock.patch.object(ssh_runner, "_plink", side_effect=fakes):
             probe_device_capabilities("/dev/nvme0", "/dev/nvme0n1")
         lines = [json.loads(l) for l in config.SSH_COMMAND_LOG_PATH.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(len(lines), 1)
         self.assertTrue(lines[0]["probe"])
-        self.assertEqual(len(lines[0]["stages"]), 3)
+        self.assertEqual(len(lines[0]["stages"]), 6)
         for stage in lines[0]["stages"]:
             self.assertIn("elapsed_sec", stage)
 
@@ -310,6 +315,82 @@ class TestTestsCannotReachTheRealTarget(unittest.TestCase):
         self.assertEqual(config.SSH_COMMAND_LOG_PATH, ssh_runner._REAL_SSH_LOG_PATH)
         with self.assertRaisesRegex(RuntimeError, "real logs/ssh_commands.jsonl"):
             ssh_runner._append_ssh_log({"tc_id": "should-not-be-written"})
+
+
+
+class TestHostActions(unittest.TestCase):
+    """Controller reset / PMU power cycle, sequence as in pc_sampling_fuzzer_v11.5 POR."""
+    PMU = {"enabled": True, "script": "/opt/pmu/pmu_4_1.py", "dev_idx": 1, "voltage_mv": 3300,
+           "poweroff_wait_sec": 3, "rescan_delay_sec": 10, "boot_wait_sec": 30, "remove": "root"}
+
+    def test_power_cycle_follows_the_fuzzer_por_order(self):
+        from tc_system.execution.host_actions import host_action_command
+        command, timeout = host_action_command("power_cycle", "/dev/nvme0", self.PMU)
+        self.assertTrue(command.startswith("sudo -S bash -c '"))
+        # rindex for ON: it also appears in the failed-OFF branch, before the remove.
+        order = [command.index("pmu_4_1.py 7 1"), command.index("/remove"), command.index("sleep 3.0"),
+                 command.rindex("pmu_4_1.py 4 1 3300 0 12000 0 0"), command.index("sleep 10.0"),
+                 command.index("/sys/bus/pci/rescan"), command.index("nvme id-ctrl /dev/nvme0")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("devices/$ROOT/remove", command)  # remove="root": the topmost bridge
+        self.assertEqual(timeout, 3 + 10 + 30 + 30)
+
+    def test_a_failed_power_off_is_not_a_power_cycle(self):
+        # Review: a fake PMU returning OFF=9, ON=0 ended as a successful power
+        # cycle (exit 0), so "retained across power loss" could PASS with no loss.
+        from tc_system.execution.host_actions import host_action_command
+        command, _ = host_action_command("power_cycle", "/dev/nvme0", self.PMU)
+        off_branch = command[command.index("off=$?"):command.index("/remove")]
+        self.assertIn("if [ $off -ne 0 ]", off_branch)
+        self.assertIn("pmu_4_1.py 4 1 3300 0 12000 0 0", off_branch)  # powered back on, just in case
+        self.assertIn("exit 96", off_branch)  # a PMU error (ERROR), not 98 (drive never came back)
+
+    def test_power_cycle_without_a_pmu_is_refused(self):
+        from tc_system.execution.host_actions import host_action_command
+        with self.assertRaisesRegex(ValueError, "PMU"):
+            host_action_command("power_cycle", "/dev/nvme0", None)
+
+    def test_controller_reset_waits_for_the_controller_to_answer(self):
+        from tc_system.execution.host_actions import host_action_command
+        command, _ = host_action_command("controller_reset", "/dev/nvme0", None)
+        self.assertIn("nvme reset /dev/nvme0", command)
+        self.assertIn("exit 98", command)  # never answered again -> distinct exit code
+
+    def test_power_cycle_is_offered_only_with_a_pmu(self):
+        from tc_system.execution.host_actions import host_action_entries
+        self.assertEqual([e["name"] for e in host_action_entries(None)], ["Controller Reset"])
+        entries = host_action_entries(self.PMU)
+        self.assertEqual([e["name"] for e in entries], ["Controller Reset", "Power Cycle (PMU)"])
+        self.assertTrue(entries[1]["destructive"])  # a sudden power loss: blocked by --no-destructive
+
+
+class TestRunHostActionOverSsh(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for name, value in (("SSH_COMMAND_LOG_PATH", Path(self.tmp.name) / "ssh.jsonl"),
+                            ("get_ssh_target", lambda: {"host": "h", "user": "u", "password": "pw-not-logged",
+                                                        "nvme_ctrl": "/dev/nvme0", "nvme_ns": "/dev/nvme0n1"}),
+                            ("get_pmu", lambda: None)):
+            patcher = mock.patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_the_reset_runs_as_one_root_shell_and_is_logged_without_the_password(self):
+        calls = []
+
+        def fake_plink(target, command, stdin=None, timeout=60):
+            calls.append((command, stdin, timeout))
+            return _FakeProc(returncode=0, stdout="RESET_RC=0\nREADY_AFTER_SEC=2\n")
+
+        with mock.patch.object(ssh_runner, "_plink", side_effect=fake_plink):
+            result = ssh_runner.run_host_action("controller_reset", "/dev/nvme0", tc_id="t", step_index=1)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertIn("READY_AFTER_SEC=2", result["stdout"])
+        self.assertEqual(calls[0][1], "pw-not-logged\n")  # password only on stdin
+        log = config.SSH_COMMAND_LOG_PATH.read_text(encoding="utf-8")
+        self.assertIn('"host_action": "controller_reset"', log)
+        self.assertNotIn("pw-not-logged", log)
 
 
 if __name__ == "__main__":

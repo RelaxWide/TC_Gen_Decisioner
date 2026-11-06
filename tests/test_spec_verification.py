@@ -11,7 +11,7 @@ from shared import spec_evidence
 from shared.rag_client import generate_rag_response
 from tc_system.coverage.spec_coverage_index import SpecCoverageIndexFile
 from tc_system.verification import (verify_tc, validate_fixed_fields, decode_payload, payload_bytes,
-                                    validate_plan_contract)
+                                    payload_for_step, validate_plan_contract)
 from tc_system.command_fields import validate_transfer, verify_selectors
 from tc_system.execution.expectation_checker import (check_expectation, check_execution, rejected_arguments,
                                                       check_step_expectations, device_hung)
@@ -270,7 +270,15 @@ class TestPayloadHex(unittest.TestCase):
             validate_plan_contract(plan, [], "nvm:3.3.6", [{"name": "Write", "raw_opcode": "0x01",
                                                            "command_set": "NVM"}])
 
-    def test_pattern_that_does_not_fill_the_buffer_goes_through_the_args_retry(self):
+    def test_a_structure_payload_is_zero_padded_not_repeated(self):
+        # Measured: 8 targets skipped because a 43-byte management structure
+        # did not divide 4096. Repeating it would write garbage into reserved
+        # fields; reserved is zero.
+        step = {"direction": "write", "data_len": 8, "payload_hex": "0102030405"}
+        self.assertEqual(payload_for_step(step), bytes([1, 2, 3, 4, 5, 0, 0, 0]))
+        self.assertEqual(payload_for_step(dict(step, payload_hex="A55A")), bytes.fromhex("A55AA55AA55AA55A"))
+
+    def test_payload_longer_than_the_buffer_goes_through_the_args_retry(self):
         write = {"name": "Write", "raw_opcode": "0x01", "command_set": "NVM"}
         reply = {"cdw10": "0x0", "cdw11": "0x0", "cdw12": "0x0", "nsid": 1, "data_len": 512,
                  "direction": "write", "shared_facts": {}, "field_breakdown": "x"}
@@ -280,7 +288,7 @@ class TestPayloadHex(unittest.TestCase):
              mock.patch.object(args_author, "generate_llm_response", llm):
             with self.assertRaisesRegex(args_author.ArgsAuthoringError, "payload_hex"):
                 args_author.author_args({"section_id": "nvm:3.3.6", "spec_doc": "x"}, write, 1,
-                                        test_intent={"payload_hex": "A55A5A"})  # 3 B into 512 B
+                                        test_intent={"payload_hex": "A5" * 513})  # 513 B into 512 B
         self.assertEqual(llm.call_count, 2)  # first try + the one retry
 
 
@@ -291,10 +299,14 @@ class TestContractExecutorSshRoundTrips(unittest.TestCase):
         reply = {"step_results": [_result(0, OK, 0)], "batch_stderr": "", "timed_out": False,
                  "dmesg_captured_scoped": True, "dmesg_text": ""}
         with mock.patch("tc_system.execution.ssh_runner.passthru_cmd"), \
+             mock.patch("tc_system.execution.ssh_runner.clear_dmesg", return_value=True) as clear, \
              mock.patch("tc_system.execution.ssh_runner.execute_tc_steps", return_value=reply) as wire, \
              mock.patch("tc_system.execution.ssh_runner.capture_dmesg", return_value="dmesg") as dump:
             result = SSHTCExecutor().execute(tc)
-        self.assertEqual([c.kwargs["clear_dmesg"] for c in wire.call_args_list], [True, False])
+        # Cleared once before the first step of any kind (review R05), never per step.
+        clear.assert_called_once()
+        self.assertEqual([c.kwargs["clear_dmesg"] for c in wire.call_args_list], [False, False])
+        self.assertTrue(result["dmesg_captured_scoped"])
         self.assertTrue(all(c.kwargs["dump_dmesg"] is False for c in wire.call_args_list))
         self.assertEqual([c.kwargs["step_index"] for c in wire.call_args_list], [0, 1])
         dump.assert_called_once()
@@ -326,8 +338,16 @@ class TestPromptBudget(unittest.TestCase):
         return sizes
 
     def test_scenario_prompts(self):
-        sizes = self._measure(scenario_generator, lambda s, o: scenario_generator.generate_scenario(s, o, [o]))
-        self.assertEqual(len(sizes), len(self.targets))
+        # Every requirement target, with its sentence added when the budget left it out.
+        from tc_system.coverage.coverage_state import pick_next_targets
+        targets = pick_next_targets(self.index, [], 10**9)
+        sizes, saved = [], self.targets
+        self.targets = targets
+        try:
+            sizes = self._measure(scenario_generator, lambda s, o: scenario_generator.generate_scenario(s, o, [o]))
+        finally:
+            self.targets = saved
+        self.assertEqual(len(sizes), len(targets))
         self.assertLessEqual(max(sizes), self.MAX_CHARS)
 
     def test_args_prompts(self):
@@ -866,3 +886,126 @@ class TestAStoppedChainSaysWhy(unittest.TestCase):
         results = {1: {"step_index": 1, "started": False, "exit_code": None, "stdout": "", "blocked_reason": "x"}}
         outcome = evaluate_check({"kind": "completion", "step": 1}, tc["steps"], results)
         self.assertEqual(outcome["detail"], "step 1 not run (chain stopped earlier)")
+
+
+
+class TestHostStepsInAChain(unittest.TestCase):
+    def _tc(self, host_result):
+        set_f = {"name": "Set Features", "phase": "setup", "opcode": "0x09", "mode": "admin-passthru",
+                 "direction": "none", "data_len": 0, "expected_status": "SUCCESS", "cdw10": "0x2"}
+        cycle = {"name": "Power Cycle (PMU)", "phase": "setup", "host_action": "power_cycle", "mode": "host",
+                 "device": "/dev/nvme0", "expected_status": "SUCCESS"}
+        get_f = dict(set_f, name="Get Features", phase="action", opcode="0x0a")
+        ok = {"exit_code": 0, "started": True, "stdout": "Admin Command X is Success and result: 0x0"}
+        tc = {"steps": [set_f, cycle, get_f]}
+        execution = {"step_results": [dict(ok, step_index=0), dict(host_result, step_index=1, started=True,
+                                                                   host_action="power_cycle"),
+                                      dict(ok, step_index=2)]}
+        return tc, execution
+
+    def test_a_completed_power_cycle_is_a_passing_step(self):
+        tc, execution = self._tc({"exit_code": 0, "stdout": "POWER_ON_RC=0\nREADY_AFTER_SEC=5"})
+        self.assertEqual(check_step_expectations(tc, execution), ["PASS", "PASS", "PASS"])
+
+    def test_a_controller_that_never_comes_back_is_a_finding(self):
+        tc, execution = self._tc({"exit_code": 98, "stdout": "NOT_READY_AFTER_SEC=30"})
+        self.assertEqual(check_step_expectations(tc, execution)[1], "FAIL")
+
+    def test_a_pmu_failure_is_the_host_side(self):
+        tc, execution = self._tc({"exit_code": 2, "stdout": "pmu: device not found"})
+        self.assertEqual(check_step_expectations(tc, execution)[1], "ERROR")
+
+    def test_the_contract_executor_sends_host_steps_through_ssh_not_nvme_cli(self):
+        tc, _ = self._tc({})
+        tc.update(tc_id="t", verification_contract={"version": 2, "precondition_checks": []})
+        nvme_reply = {"step_results": [{"step_index": 0, "exit_code": 0, "started": True,
+                                        "stdout": "Admin Command X is Success and result: 0x0"}],
+                      "batch_stderr": "", "timed_out": False, "dmesg_captured_scoped": True, "dmesg_text": ""}
+        host_reply = {"exit_code": 0, "stdout": "READY_AFTER_SEC=4", "batch_stderr": "", "timed_out": False}
+        with mock.patch("tc_system.execution.ssh_runner.passthru_cmd"), \
+             mock.patch("tc_system.execution.ssh_runner.execute_tc_steps", return_value=nvme_reply) as wire, \
+             mock.patch("tc_system.execution.ssh_runner.run_host_action", return_value=host_reply) as host, \
+             mock.patch("tc_system.execution.ssh_runner.capture_dmesg", return_value=""):
+            result = SSHTCExecutor(allow_destructive=True).execute(tc)
+        self.assertEqual(wire.call_count, 2)
+        host.assert_called_once()
+        self.assertEqual(result["step_results"][1]["host_action"], "power_cycle")
+
+
+
+class TestTargetRequirementBinding(unittest.TestCase):
+    OPS = [{"name": "Get Log Page", "raw_opcode": "0x02", "command_set": "ADMIN"}]
+    RULE = {"requirement_id": "sreq-1", "section_id": "base:5.2.12", "kind": "abort",
+            "expected_status": "INVALID_FIELD",
+            "text": "If a Get Log Page command is processed that specifies a Log Page Identifier that is not "
+                    "supported, then the controller should abort the command with a status code of Invalid "
+                    "Field in Command."}
+
+    def _plan(self, quote, expected="INVALID_FIELD"):
+        return {"steps_plan": [{"opcode_name": "Get Log Page", "phase": "action", "expected_status": expected,
+                                "field_constraints": [{"field": "cdw10", "mask": "0xff", "value": "0xEE"}]}],
+                "requirements": [{"evidence_id": "e", "quote": quote, "description": "d",
+                                  "checks": [{"kind": "completion", "step": 0}]}],
+                "preconditions": [], "precondition_checks": []}
+
+    def _validate(self, plan):
+        validate_plan_contract(plan, [{"evidence_id": "e", "text": self.RULE["text"]
+                                       + " An unrelated sentence that sits in the same evidence block."}],
+                               "base:5.2.12", self.OPS, target_requirement=self.RULE)
+        return plan
+
+    def test_the_requirement_quoting_the_target_is_linked(self):
+        plan = self._validate(self._plan("specifies a Log Page Identifier that is not supported"))
+        self.assertEqual(plan["requirements"][0]["target_requirement_id"], "sreq-1")
+
+    def test_a_scenario_that_tests_something_else_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "TARGET_REQUIREMENT is not tested"):
+            self._validate(self._plan("An unrelated sentence that sits in the same evidence block."))
+
+    def test_an_abort_rule_needs_the_action_to_expect_its_status(self):
+        with self.assertRaisesRegex(ValueError, "must provoke its condition and expect INVALID_FIELD"):
+            self._validate(self._plan("specifies a Log Page Identifier that is not supported", expected="SUCCESS"))
+
+
+
+class TestHostEventTargets(unittest.TestCase):
+    """"retained across power cycles and resets" is not tested by one Get Log Page."""
+    from tc_system.execution.host_actions import host_action_entries as _entries
+    OPS = [{"name": "Get Log Page", "raw_opcode": "0x02", "command_set": "ADMIN"}] + _entries(None)
+    TEXT = "The information in this log page shall be retained across power cycles and resets."
+    TARGET = {"requirement_id": "sreq-h", "section_id": "base:5.2.12.1.14", "kind": "shall", "expected_status": None,
+              "text": TEXT, "host_actions": ["controller_reset", "power_cycle"], "host_steps": ["Controller Reset"]}
+    LID = [{"field": "cdw10", "mask": "0xff", "value": "0x0D"}]
+
+    def _plan(self, steps, check_step):
+        return {"steps_plan": steps,
+                "requirements": [{"evidence_id": "e", "quote": self.TEXT, "description": "d",
+                                  "checks": [{"kind": "completion", "step": check_step}]}],
+                "preconditions": [], "precondition_checks": []}
+
+    def _validate(self, plan):
+        validate_plan_contract(plan, [{"evidence_id": "e", "text": self.TEXT}], "base:5.2.12.1.14", self.OPS,
+                               target_requirement=self.TARGET)
+        return plan
+
+    def _log(self, phase):
+        return {"opcode_name": "Get Log Page", "phase": phase, "expected_status": "SUCCESS",
+                "field_constraints": self.LID}
+
+    def test_a_single_read_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "across a reset/power cycle.*'Controller Reset'"):
+            self._validate(self._plan([self._log("action")], 0))
+
+    def test_a_reset_after_the_observed_step_is_rejected(self):
+        plan = self._plan([self._log("action"), {"opcode_name": "Controller Reset", "phase": "verify"}], 0)
+        with self.assertRaisesRegex(ValueError, "host steps now at \\[1\\]"):
+            self._validate(plan)
+
+    def test_record_reset_read_back_is_accepted(self):
+        plan = self._plan([self._log("setup"), {"opcode_name": "Controller Reset", "phase": "setup"},
+                           self._log("action")], 2)
+        self.assertEqual(self._validate(plan)["requirements"][0]["target_requirement_id"], "sreq-h")
+
+    def test_the_prompt_tells_the_model_to_use_it(self):
+        from tc_system.generation.scenario_generator import _target_block
+        self.assertIn("MUST perform it with a 'Controller Reset' step", _target_block(self.TARGET))

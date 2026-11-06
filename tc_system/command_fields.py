@@ -1,4 +1,5 @@
 """Deterministic encodings checked against the local NVMe specification tables."""
+from tc_system.spec_fields import feature_buffer
 from tc_system.verification import integer
 
 # (command set, opcode, field name) -> (register, shift, mask).
@@ -75,6 +76,101 @@ def _validate_nvm_transfer(fields, opcode_entry, lba_bytes):
                          f"(needs blocks x one of {sorted(LBA_DATA_SIZES)})")
 
 
+_DIRECTION_BITS = {0b01: "write", 0b10: "read"}  # opcode bits 1:0 (11b bidirectional: left alone)
+_NUMD_IN_CDW10 = {0x11, 0x19, 0x1A}  # Firmware Image Download, Directive Send/Receive: CDW10 = NUMD, 0-based
+
+
+def _fixed_mask(constraints, field):
+    mask = 0
+    for c in constraints or []:
+        if c.get("field") == field:
+            mask |= integer(c["mask"])
+    return mask
+
+
+def derive_transfer(fields, opcode_entry, lba_bytes=None, constraints=None):
+    """Write the transfer fields the spec determines, instead of rejecting the
+    author's arithmetic. Returns what changed, for the terminal and report.
+
+    Replayed against the logged replies (logs/llm_calls.jsonl, 235 replies):
+    22 of the 24 that today's checks reject are a length field that disagrees
+    with data_len (Get Log Page NUMDL/NUMDU, Directive NUMD) and the other two
+    a direction against the opcode's own bits. Both sides are fixed by the
+    spec, so the harness computes one from the other, keeping whichever side
+    the scenario pinned (field_constraints) or else the one that carries the
+    test: the buffer size for dword counts, NLB (the LBA range later steps
+    reuse) for Read/Write/Compare. Two pinned sides that disagree are left
+    alone for validate_transfer to reject (the scenario contradicts itself)."""
+    changes = []
+
+    def put(field, value, why):
+        old = fields[field]
+        same = old == value if field == "direction" else integer(old) == integer(value)
+        if not same:
+            new = f"0x{value:08X}" if field.startswith("cdw") else value
+            changes.append(f"{field} {old} -> {new} ({why})")
+            fields[field] = new
+
+    if opcode_entry.get("host_action") or opcode_entry.get("raw_opcode") is None:
+        return changes
+    opcode = int(opcode_entry["raw_opcode"], 16)
+    cset = opcode_entry["command_set"]
+    length = integer(fields["data_len"])
+    len_fixed = bool(_fixed_mask(constraints, "data_len"))
+    if cset == "ADMIN" and opcode == 0x06:
+        put("data_len", 4096, "Identify는 항상 4096B 구조 하나")
+        put("direction", "read", "opcode 비트 1:0")
+    elif cset == "ADMIN" and opcode == 0x02:
+        numd_fixed = bool(_fixed_mask(constraints, "cdw10") & 0xFFFF0000 or _fixed_mask(constraints, "cdw11") & 0xFFFF)
+        numd = ((integer(fields["cdw11"]) & 0xFFFF) << 16) | (integer(fields["cdw10"]) >> 16)
+        if numd_fixed and len_fixed:
+            pass
+        elif not numd_fixed and length > 0 and length % 4 == 0:
+            want = length // 4 - 1
+            put("cdw10", (integer(fields["cdw10"]) & 0xFFFF) | ((want & 0xFFFF) << 16),
+                f"NUMDL = data_len {length}B/4 - 1")
+            put("cdw11", (integer(fields["cdw11"]) & 0xFFFF0000) | (want >> 16), "NUMDU")
+        else:
+            put("data_len", (numd + 1) * 4, f"NUMD 0x{numd:X} dwords, 0-based")
+        put("direction", "read", "opcode 비트 1:0")
+    elif cset == "ADMIN" and opcode in _NUMD_IN_CDW10 and length > 0:
+        cdw10_fixed = bool(_fixed_mask(constraints, "cdw10"))
+        if cdw10_fixed and not len_fixed:
+            put("data_len", (integer(fields["cdw10"]) + 1) * 4, "NUMD = CDW10, 0-based")
+        elif not cdw10_fixed and length % 4 == 0:
+            put("cdw10", length // 4 - 1, f"NUMD = data_len {length}B/4 - 1")
+        put("direction", _DIRECTION_BITS[opcode & 0b11], "opcode 비트 1:0")
+    elif cset == "ADMIN" and opcode in (0x09, 0x0A):
+        # The buffer is the feature's own structure (measured: a 4-byte
+        # buffer for the 4096-byte HMB Attributes crashed nvme-cli).
+        c10 = integer(fields["cdw10"])
+        fid, sel, is_set = c10 & 0xFF, (c10 >> 8) & 0x7, opcode == 0x09
+        size = feature_buffer(fid, is_set, sel, integer(fields["cdw11"]))
+        if size is not None and not len_fixed:
+            what = f"FID {fid:02X}h {'Set' if is_set else 'Get'} Features"
+            put("data_len", size, f"{what} 버퍼 {size}B(스펙 구조 크기)" if size else f"{what}는 버퍼 없음")
+            put("direction", ("write" if is_set else "read") if size else "none",
+                "opcode 비트 1:0" if size else "버퍼 없음")
+        elif integer(fields["data_len"]) > 0:
+            put("direction", "write" if is_set else "read", "opcode 비트 1:0")
+    elif cset == "NVM" and opcode in NVM_NO_DATA_COMMANDS:
+        put("data_len", 0, "이 커맨드는 버퍼가 없음")
+        put("direction", "none", "이 커맨드는 버퍼가 없음")
+    elif cset == "NVM" and opcode in NVM_DATA_COMMANDS:
+        put("direction", NVM_DATA_COMMANDS[opcode], "opcode 비트 1:0")
+        nlb_fixed = bool(_fixed_mask(constraints, "cdw12") & 0xFFFF)
+        if lba_bytes and not (nlb_fixed and len_fixed):
+            if len_fixed and length > 0 and length % lba_bytes == 0:
+                put("cdw12", (integer(fields["cdw12"]) & 0xFFFF0000) | (length // lba_bytes - 1),
+                    f"NLB = data_len {length}B / LBA {lba_bytes}B - 1")
+            elif not len_fixed:
+                blocks = (integer(fields["cdw12"]) & 0xFFFF) + 1
+                put("data_len", blocks * lba_bytes, f"NLB {blocks}블록 x LBA {lba_bytes}B")
+    elif _DIRECTION_BITS.get(opcode & 0b11) and length > 0:
+        put("direction", _DIRECTION_BITS[opcode & 0b11], "opcode 비트 1:0")
+    return changes
+
+
 def validate_transfer(fields, opcode_entry, lba_bytes=None):
     """Buffer length/direction implied by the encoded command dwords.
 
@@ -110,6 +206,13 @@ def validate_transfer(fields, opcode_entry, lba_bytes=None):
             fix = f"CDW10=0x{length // 4 - 1:08X}"
     elif opcode == 0x06:
         required, encoded = 4096, "Identify always returns one 4096-byte data structure"
+    elif opcode in (0x09, 0x0A):
+        c10 = integer(fields["cdw10"])
+        size = feature_buffer(c10 & 0xFF, opcode == 0x09, (c10 >> 8) & 0x7, integer(fields["cdw11"]))
+        if size is None or (length == size and (direction == "none") == (size == 0)):
+            return
+        raise ValueError(f"{opcode_entry['name']} FID {c10 & 0xFF:02X}h moves a {size}-byte buffer"
+                         f"{'' if size else ' (none)'}, but data_len={length} direction={direction}")
     else:
         return
     if length != required or direction == "none":

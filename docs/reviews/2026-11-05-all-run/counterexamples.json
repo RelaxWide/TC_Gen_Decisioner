@@ -1,0 +1,14 @@
+{
+  "backend_commit": "ae3306f",
+  "original_records_modified": false,
+  "write_zeroes": {
+    "tc_id": "tc-de15664d98",
+    "recorded_bytes": 512,
+    "recorded_nonzero_count": 0,
+    "synthetic_modified_offset": 100,
+    "synthetic_modified_byte": 255,
+    "result": "PASS",
+    "note": "의도적인 메모리 내 반례. 실제 장비가 FF를 반환했다는 뜻 아님"
+  },
+  "stored_verification_mismatches": []
+}

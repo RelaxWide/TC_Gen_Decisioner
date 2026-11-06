@@ -1,0 +1,50 @@
+{
+  "F01_interrupt_during_change": {
+    "expected_value": 360,
+    "actual_value": 300,
+    "calls": [
+      [
+        "setup",
+        "Get Features"
+      ],
+      [
+        "action",
+        "Set Features"
+      ]
+    ],
+    "reproduced": true
+  },
+  "F02_unrelated_support_measurement": {
+    "expected": "do not assert a violation of an unmeasured unsupported premise",
+    "actual_status": "FAIL",
+    "unmeasured": [],
+    "reproduced": true
+  },
+  "F03_host_identifier_transition": {
+    "expected_hostid": "0000000000000000",
+    "actual_hostid": "abababababababab",
+    "cleanup": "NVMe status: CMD_SEQ_ERROR: synthetic rejection",
+    "tc_status": "PASS",
+    "reproduced": true
+  },
+  "F04_failed_readback_review": {
+    "expected": "request review when a restore cannot be confirmed",
+    "actual_level": "info",
+    "actual_status": "PASS",
+    "reasons": [
+      {
+        "level": "info",
+        "code": "cleanup_unverified",
+        "text": "원복 스텝 2: 다시 읽기가 성공하지 않음: INTERNAL",
+        "source": "code"
+      }
+    ],
+    "reproduced": true
+  },
+  "F05_skipped_only_latest_run": {
+    "expected_run_id": "20261105T020000Z",
+    "actual_run_id": "20261105T010000Z",
+    "actual_progress": "   TC 생성·실행  1  실행 20261105T010000Z    본동작(action) 전송  1  장비에 실제로 나간 대상 명령    본동작 전에 중단  0  사전조건/setup에서 멈춤 — 대상 명령은 안 나감    건너뜀(장비 전송 없음)  0  생성·인자·전송 전 차단    판정 분포  PASS 1    \"시도\"는 검증 완료가 아닙니다. 본동작이 장비에 나간 수와, 그 중 요구사항을 판정한 수는 아래 커버리지에서 따로 셉니다. ",
+    "reproduced": true
+  }
+}

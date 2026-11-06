@@ -1,0 +1,232 @@
+{
+  "R01_permanent_write_protection": {
+    "expected": {
+      "admitted_without_destructive_permission": false,
+      "final_wps": 0
+    },
+    "actual": {
+      "admitted_without_destructive_permission": true,
+      "final_wps": 3,
+      "tc_status": "PASS",
+      "cleanup_status": "NVMe status: FEATURE_NOT_CHANGEABLE: synthetic rejection",
+      "sent": [
+        "Get Features",
+        "Set Features",
+        "Set Features"
+      ]
+    },
+    "reproduced": true
+  },
+  "R02a_plm_config_restore_register": {
+    "expected": {
+      "final_value": 1
+    },
+    "actual": {
+      "final_value": 0,
+      "cleanup_cdw11": "0x00000001",
+      "cleanup_cdw12": "0x00000000",
+      "cleanup_status": "Admin Command Synthetic is Success and result: 0x00000000"
+    },
+    "reproduced": true
+  },
+  "R02b_plm_window_restore_register": {
+    "expected": {
+      "final_value": 2
+    },
+    "actual": {
+      "final_value": 1,
+      "cleanup_cdw11": "0x00000001",
+      "cleanup_cdw12": "0x00000000",
+      "cleanup_status": "NVMe status: INVALID_FIELD: synthetic rejection"
+    },
+    "reproduced": true
+  },
+  "R02c_read_recovery_restore_register": {
+    "expected": {
+      "final_value": 7
+    },
+    "actual": {
+      "final_value": 0,
+      "cleanup_cdw11": "0x00000007",
+      "cleanup_cdw12": "0x00000000",
+      "cleanup_status": "Admin Command Synthetic is Success and result: 0x00000000"
+    },
+    "reproduced": true
+  },
+  "R02d_timestamp_restore_reserved_bytes": {
+    "expected": {
+      "set_features_reserved_bytes": "0000"
+    },
+    "actual": {
+      "set_features_reserved_bytes": "0200"
+    },
+    "reproduced": true
+  },
+  "R03a_snapshot_missing_cqe": {
+    "expected": {
+      "action_sent": false
+    },
+    "actual": {
+      "action_sent": true,
+      "writes": [
+        {
+          "phase": "action",
+          "cdw11": "0x12c"
+        },
+        {
+          "phase": "cleanup",
+          "cdw11": "0x00000000"
+        }
+      ],
+      "cleanup_skipped": null
+    },
+    "reproduced": true
+  },
+  "R03b_snapshot_short_payload": {
+    "expected": {
+      "action_sent": false
+    },
+    "actual": {
+      "action_sent": true,
+      "writes": [
+        {
+          "phase": "action",
+          "cdw11": "0x0"
+        }
+      ],
+      "cleanup_skipped": "스텝 0가 원래 버퍼를 돌려주지 않아 원복하지 않음"
+    },
+    "reproduced": true
+  },
+  "R04a_retry_changes_namespace": {
+    "expected": {
+      "namespace2": 200
+    },
+    "actual": {
+      "namespace2": 300,
+      "action_nsid": 4294967295,
+      "cleanup_nsid": 1,
+      "action_cdw10": "0x05",
+      "cleanup_cdw10": "0x00000005"
+    },
+    "reproduced": true
+  },
+  "R04b_retry_changes_save_bit": {
+    "expected": {
+      "saved1": 150
+    },
+    "actual": {
+      "saved1": 300,
+      "action_nsid": 1,
+      "cleanup_nsid": 1,
+      "action_cdw10": "0x80000005",
+      "cleanup_cdw10": "0x00000005"
+    },
+    "reproduced": true
+  },
+  "R05_host_first_dmesg_scope": {
+    "expected": {
+      "dmesg_captured_scoped": false
+    },
+    "actual": {
+      "dmesg_captured_scoped": true,
+      "nvme_calls": 0,
+      "captured": "synthetic prior-boot message"
+    },
+    "reproduced": true
+  },
+  "R05b_host_first_success_log_loss": {
+    "expected": {
+      "reset_warning_preserved": true
+    },
+    "actual": {
+      "reset_warning_preserved": false,
+      "stages": [
+        "reset",
+        "clear dmesg",
+        "action"
+      ]
+    },
+    "reproduced": true
+  },
+  "R06_judge_normalization": {
+    "expected": {
+      "negated_classification": "needs_engineer_review",
+      "nan_confidence": 0.0
+    },
+    "actual": {
+      "negated_classification": "firmware_defect",
+      "nan_confidence": 1.0
+    },
+    "reproduced": true
+  },
+  "R07_unmeasured_premise_defect_verdict": {
+    "expected": {
+      "classification": "needs_engineer_review"
+    },
+    "actual": {
+      "classification": "firmware_defect",
+      "status": "FAIL",
+      "verification": "UNVERIFIED",
+      "issues": [
+        "사전조건 미측정이라 요구사항을 판정하지 않음: the controller is a Discovery controller",
+        "일부 단계의 예상 완료 상태가 확인되지 않음"
+      ]
+    },
+    "reproduced": true
+  },
+  "R08a_malformed_conditions_crash": {
+    "expected": {
+      "uncaught_by_pipeline": false
+    },
+    "actual": {
+      "error": "AttributeError",
+      "uncaught_by_pipeline": true
+    },
+    "reproduced": true
+  },
+  "R08b_non_string_precondition_dropped": {
+    "expected": {
+      "status": "UNVERIFIED"
+    },
+    "actual": {
+      "status": "PASS",
+      "remaining_preconditions": [],
+      "unmeasured": []
+    },
+    "reproduced": true
+  },
+  "R09_rejudge_unlinked_verdict": {
+    "expected": {
+      "current_tc_judgments": 1
+    },
+    "actual": {
+      "current_tc_judgments": 0,
+      "saved_judgments": 1,
+      "tc_verdict_id": null
+    },
+    "reproduced": true
+  },
+  "R10_feature_unsupported_description": {
+    "expected": {
+      "claims_opcode_not_implemented": false
+    },
+    "actual": {
+      "claims_opcode_not_implemented": true,
+      "status": "UNSUPPORTED",
+      "description": "드라이브가 이 커맨드를 구현하지 않음(INVALID_OPCODE)",
+      "actual_completion": "INVALID_FIELD"
+    },
+    "reproduced": true
+  },
+  "R11_response_id_collision": {
+    "expected": {
+      "distinct_response_ids": true
+    },
+    "actual": {
+      "distinct_response_ids": false,
+      "responses_differ": true
+    },
+    "reproduced": true
+  }
+}

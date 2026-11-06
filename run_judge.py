@@ -30,7 +30,9 @@ def judge_source(source: str, force: bool = False) -> tuple[list[dict], int, lis
             continue
         try:
             verdict = judge_failure_context(fc)
-        except (LLMCallError, ValueError, KeyError, TypeError) as exc:
+            if source == "tc_exec":
+                verdict = _link_tc(verdict)
+        except (LLMCallError, ValueError, KeyError, TypeError, AttributeError) as exc:
             # Leave this one unjudged so the next run retries it; fabricating a
             # verdict would put an unfounded classification in the report. Broad
             # on purpose: one malformed LLM reply must not discard the verdicts
@@ -54,6 +56,20 @@ def judge_source(source: str, force: bool = False) -> tuple[list[dict], int, lis
     orphaned = len(merged) - len(kept)
     save_json_atomic(verdicts_path, kept)
     return new_verdicts, orphaned, failures
+
+
+def _link_tc(verdict):
+    """A re-judged TC_EXEC verdict goes the same way as the first judgment:
+    held if the code found the test definition contradictory, linked to its
+    TC, the TC's review refreshed (review R09)."""
+    from tc_system.review import apply_tc_verdict
+    from tc_system.store import tc_store
+    tc = next((t for t in tc_store.load_all() if t.get("failure_context_id") == verdict["failure_context_id"]), None)
+    if tc is None:
+        return verdict
+    verdict = apply_tc_verdict(tc, verdict)
+    tc_store.upsert(tc)
+    return verdict
 
 
 def main():

@@ -50,23 +50,53 @@ class TestAuthorArgs(unittest.TestCase):
     def test_direction_with_zero_length_is_rejected_not_coerced(self):
         # Coercing to "none" here used to hide the case from
         # _vacuous_success, letting a no-op command register as a PASS and
-        # count as real spec coverage.
+        # count as real spec coverage. Get Features has no length field the
+        # harness could compute the buffer from, so it is still rejected.
         with self.assertRaises(ArgsAuthoringError) as ctx:
-            _run(dict(GOOD, data_len=0))
+            _run(dict(GOOD, cdw10="0x0000007D", data_len=0),  # FID 7Dh: buffer size not in the table
+                 opcode=dict(OPCODE, name="Get Features", raw_opcode="0x0A"))
         self.assertIn("transfers nothing", str(ctx.exception))
 
+    def test_identify_always_moves_its_4096_byte_structure(self):
+        out = _run(dict(GOOD, data_len=0, direction="none"))
+        self.assertEqual((out["data_len"], out["direction"]), (4096, "read"))
+        self.assertTrue(out["derived_fields"])
     def test_length_without_direction_is_rejected(self):
+        # opcode bits 00 (no data transfer): a buffer is the author's mistake
         with self.assertRaises(ArgsAuthoringError):
-            _run(dict(GOOD, direction="none", data_len=512))
-
+            _run(dict(GOOD, direction="none", data_len=512), opcode=dict(OPCODE, name="Abort", raw_opcode="0x08"))
     def test_bad_direction_is_rejected(self):
         with self.assertRaises(ArgsAuthoringError):
             _run(dict(GOOD, direction="both"))
 
     def test_absurd_length_is_rejected(self):
         with self.assertRaises(ArgsAuthoringError):
-            _run(dict(GOOD, data_len=1 << 30))
+            _run(dict(GOOD, cdw10="0x0000007D", data_len=1 << 30),
+                 opcode=dict(OPCODE, name="Get Features", raw_opcode="0x0A"))
 
+    def test_a_feature_buffer_is_its_spec_structure_size(self):
+        # Measured: HMB (FID 0Dh) Get Features with a 4-byte buffer crashed
+        # nvme-cli (malloc assertion, exit 134); the structure is 4096 bytes.
+        out = _run(dict(GOOD, cdw10="0x0000000D", data_len=4), opcode=dict(OPCODE, name="Get Features", raw_opcode="0x0A"))
+        self.assertEqual((out["data_len"], out["direction"]), (4096, "read"))
+        out = _run(dict(GOOD, cdw10="0x00000001", data_len=4), opcode=dict(OPCODE, name="Get Features", raw_opcode="0x0A"))
+        self.assertEqual((out["data_len"], out["direction"]), (0, "none"))  # Arbitration: value in DW0
+
+    def test_host_owned_feature_cannot_be_set(self):
+        with self.assertRaisesRegex(ArgsAuthoringError, "Host Memory Buffer"):
+            _run(dict(GOOD, cdw10="0x0000000D", data_len=0, direction="none"),
+                 opcode=dict(OPCODE, name="Set Features", raw_opcode="0x09"))
+
+    def test_io_command_nsid_must_be_the_namespace_device(self):
+        # Kernel: "nsid (0) in cmd does not match nsid (1) of namespace".
+        read = {"name": "Read", "raw_opcode": "0x02", "command_set": "NVM"}
+        with self.assertRaisesRegex(ArgsAuthoringError, "kernel"):
+            _run(dict(GOOD, cdw10="0x0", nsid=0, data_len=512, direction="read"), opcode=read)
+
+    def test_a_queue_command_on_a_driver_qid_is_refused(self):
+        create_cq = {"name": "Create I/O Completion Queue", "raw_opcode": "0x05", "command_set": "ADMIN"}
+        with self.assertRaisesRegex(ArgsAuthoringError, "큐"):
+            _run(dict(GOOD, cdw10="0x00030002", nsid=0, data_len=0, direction="none"), opcode=create_cq)
     def test_non_integer_length_is_rejected(self):
         with self.assertRaises(ArgsAuthoringError):
             _run(dict(GOOD, data_len="lots"))
@@ -77,22 +107,16 @@ class TestAuthorArgs(unittest.TestCase):
             with self.assertRaises(ArgsAuthoringError):
                 author_args(SECTION, OPCODE, ACTIVE_NSID)
 
-    def test_direction_conflicting_with_opcode_bits_is_rejected(self):
+    def test_direction_is_taken_from_the_opcode_bits(self):
         # Measured on real hardware: opcode 0x2A's bits 1:0 encode
         # controller-to-host ("read"), but a TC authored direction="write".
         # nvme-cli warned and sent it anyway, and the command never
-        # completed — a ~125s SSH batch timeout for a request that was
-        # malformed before it left this host.
+        # completed — a ~125s SSH batch timeout. The bits decide it now.
         opcode = dict(OPCODE, name="Create Exported NVM Subsystem", raw_opcode="0x2A")
-        with mock.patch.object(args_author, "generate_rag_response",
-                                return_value={"chunks": [{"text": "spec text"}], "response_id": "r"}), \
-             mock.patch.object(args_author, "generate_llm_response",
-                                return_value={"structured": dict(GOOD, direction="write"), "response_id": "l"}):
-            with self.assertRaises(ArgsAuthoringError) as ctx:
-                author_args(SECTION, opcode, ACTIVE_NSID)
-        self.assertIn("conflicts", str(ctx.exception))
-
-    def test_direction_mismatch_is_retried_once_with_feedback_before_giving_up(self):
+        out = _run(dict(GOOD, direction="write"), opcode=opcode)
+        self.assertEqual(out["direction"], "read")
+        self.assertIn("opcode 비트", out["derived_fields"][0])
+    def test_an_invalid_reply_is_retried_once_with_feedback_before_giving_up(self):
         # The mistake is the LLM's own and never reached the device, so it
         # gets one chance to see what it got wrong and fix it itself — the
         # same corrective pattern already used for controller rejections —
@@ -101,8 +125,8 @@ class TestAuthorArgs(unittest.TestCase):
 
         def _capture(prompt, **kwargs):
             attempts.append(prompt)
-            direction = "write" if len(attempts) == 1 else "read"  # OPCODE 0x06 expects "read"
-            return {"structured": dict(GOOD, direction=direction), "response_id": f"l{len(attempts)}"}
+            nsid = 7 if len(attempts) == 1 else ACTIVE_NSID  # 7 is not a namespace of this target
+            return {"structured": dict(GOOD, nsid=nsid), "response_id": f"l{len(attempts)}"}
 
         with mock.patch.object(args_author, "generate_rag_response",
                                 return_value={"chunks": [{"text": "spec text"}], "response_id": "r"}), \
@@ -110,24 +134,21 @@ class TestAuthorArgs(unittest.TestCase):
             out = author_args(SECTION, OPCODE, ACTIVE_NSID)
         self.assertEqual(len(attempts), 2)
         self.assertIn("INVALID", attempts[1])
-        self.assertIn("conflicts", attempts[1])
-        self.assertEqual(out["direction"], "read")
-
+        self.assertIn("nsid=7", attempts[1])
+        self.assertEqual(out["nsid"], ACTIVE_NSID)
     def test_two_consecutive_bad_attempts_still_raise(self):
-        opcode = dict(OPCODE, name="Create Exported NVM Subsystem", raw_opcode="0x2A")
         attempts = []
 
         def _capture(prompt, **kwargs):
             attempts.append(prompt)
-            return {"structured": dict(GOOD, direction="write"), "response_id": "l"}  # wrong both times
+            return {"structured": dict(GOOD, nsid=7), "response_id": "l"}  # wrong both times
 
         with mock.patch.object(args_author, "generate_rag_response",
                                 return_value={"chunks": [{"text": "spec text"}], "response_id": "r"}), \
              mock.patch.object(args_author, "generate_llm_response", _capture):
             with self.assertRaises(ArgsAuthoringError):
-                author_args(SECTION, opcode, ACTIVE_NSID)
+                author_args(SECTION, OPCODE, ACTIVE_NSID)
         self.assertEqual(len(attempts), 2)
-
     def test_none_direction_is_exempt_from_the_opcode_bit_check(self):
         # Many read-capable commands (Get Features returning its value in
         # CDW0) legitimately move no buffer at all — that zero-length choice
@@ -283,22 +304,19 @@ class TestAuthorArgs(unittest.TestCase):
                                required_field_values=[{"field_name": "CNS", "hex_value": "0x01"}])
         self.assertTrue(out["field_value_verified"])
 
-    def test_required_field_value_mismatch_is_retried_then_raises(self):
-        attempts = []
-
-        def _capture(prompt, **kwargs):
-            attempts.append(prompt)
-            return {"structured": dict(GOOD), "response_id": f"l{len(attempts)}"}  # cdw10 byte=0x01 both times
-
+    def test_the_clause_selector_is_written_by_the_harness(self):
+        # The index knows the clause's CNS/LID/FID: written, not checked.
+        # Measured: "clause requires LID=0x15, got 0xF" skipped targets after
+        # the retry repeated the same slip.
+        llm = mock.Mock(return_value={"structured": dict(GOOD), "response_id": "l"})  # CNS 01h
         with mock.patch.object(args_author, "generate_rag_response",
-                                return_value={"chunks": [{"text": "spec"}], "response_id": "r"}), \
-             mock.patch.object(args_author, "generate_llm_response", _capture):
-            with self.assertRaises(ArgsAuthoringError) as ctx:
-                author_args(SECTION, OPCODE, ACTIVE_NSID,
-                            required_field_values=[{"field_name": "CNS", "hex_value": "0x02"}])
-        self.assertEqual(len(attempts), 2)
-        self.assertIn("CNS=0x02", str(ctx.exception))
-        self.assertIn("INVALID", attempts[1])
+                                return_value={"chunks": [{"text": "spec"}], "response_id": "r"}),              mock.patch.object(args_author, "generate_llm_response", llm):
+            out = author_args(SECTION, OPCODE, ACTIVE_NSID,
+                              required_field_values=[{"field_name": "CNS", "hex_value": "0x02"}])
+        self.assertEqual(llm.call_count, 1)
+        self.assertEqual(int(out["cdw10"], 16) & 0xFF, 0x02)
+        self.assertTrue(out["field_value_verified"])
+        self.assertTrue(any("조항 선택자" in c for c in out["constraint_overrides"]))
 
     def test_field_name_outside_the_allowlist_is_not_hard_checked(self):
         # Event Type is response-side-only (discovered by parsing a returned
@@ -399,20 +417,57 @@ class TestPersistentEventLogCasesFromTheField(unittest.TestCase):
         self.assertEqual(result["constraint_overrides"], ["cdw10 0x007F020D -> 0x007F030D"])
         self.assertEqual(llm.call_count, 1)
 
-    def test_numdl_in_the_wrong_register_gets_a_retry_that_says_where_it_goes(self):
+    def test_numdl_in_the_wrong_register_is_rewritten_from_data_len(self):
         # 0x7F written into CDW11 (NUMDU): 32 MB requested into 512 bytes.
-        result, llm = self._author([self._reply("0x0000000D", cdw11="0x7F")] * 2, [])
-        self.assertIsInstance(result, ArgsAuthoringError)
-        retry_prompt = llm.call_args_list[1][0][0]
-        self.assertIn("NUMDU(CDW11[15:0]=0x007F)", retry_prompt)
-        self.assertIn("for data_len=512 set CDW10[31:16]=0x007F and CDW11[15:0]=0x0000", retry_prompt)
-
-    def test_a_fixed_numd_makes_the_retry_ask_for_the_matching_length(self):
+        # The harness writes NUMD from the buffer size: no retry needed.
+        result, llm = self._author([self._reply("0x0000000D", cdw11="0x7F")], [])
+        self.assertEqual((result["cdw10"], result["cdw11"], result["data_len"]),
+                         ("0x007F000D", "0x00000000", 512))
+        self.assertEqual(llm.call_count, 1)
+        self.assertIn("NUMDL", result["derived_fields"][0])
+    def test_a_fixed_numd_sets_the_matching_length(self):
+        # NUMDL pinned by the scenario: the buffer follows it, not the reverse.
         constraints = [{"field": "cdw10", "mask": "0xFFFF00FF", "value": "0x4000000D"}]
-        result, llm = self._author([self._reply("0x03FF000D", data_len=4096),
-                                    self._reply("0x03FF000D", data_len=65540)], constraints)
-        self.assertIn("data_len=65540", llm.call_args_list[1][0][0])
+        result, llm = self._author([self._reply("0x03FF000D", data_len=4096)], constraints)
         self.assertEqual((result["cdw10"], result["data_len"]), ("0x4000000D", 65540))
+        self.assertEqual(llm.call_count, 1)
+
+
+class TestDeriveTransfer(unittest.TestCase):
+    """The fields the spec ties together are computed, not checked."""
+
+    def _derive(self, op, constraints=None, lba_bytes=None, **fields):
+        from tc_system.command_fields import derive_transfer
+        base = {f"cdw{i}": "0x00000000" for i in range(10, 16)}
+        base.update(nsid=1, data_len=0, direction="none")
+        base.update(fields)
+        changes = derive_transfer(base, op, lba_bytes=lba_bytes, constraints=constraints)
+        return base, changes
+
+    def test_directive_receive_numd_follows_the_buffer(self):
+        out, _ = self._derive({"command_set": "ADMIN", "raw_opcode": "0x1A", "name": "Directive Receive"},
+                              data_len=4096, direction="read", cdw10="0x00000001")
+        self.assertEqual(out["cdw10"], "0x000003FF")
+
+    def test_nvm_read_buffer_follows_nlb(self):
+        out, _ = self._derive({"command_set": "NVM", "raw_opcode": "0x02", "name": "Read"}, lba_bytes=4096,
+                              data_len=512, direction="write", cdw12="0x00000001")
+        self.assertEqual((out["data_len"], out["direction"]), (8192, "read"))
+
+    def test_write_zeroes_moves_no_buffer(self):
+        out, _ = self._derive({"command_set": "NVM", "raw_opcode": "0x08", "name": "Write Zeroes"},
+                              data_len=512, direction="write")
+        self.assertEqual((out["data_len"], out["direction"]), (0, "none"))
+
+    def test_two_pinned_sides_that_disagree_are_left_for_validation(self):
+        from tc_system.command_fields import validate_transfer
+        op = {"command_set": "ADMIN", "raw_opcode": "0x02", "name": "Get Log Page"}
+        pins = [{"field": "cdw10", "mask": "0xFFFF0000", "value": "0x00FF0000"},
+                {"field": "data_len", "mask": "0xFFFFFFFF", "value": "512"}]
+        out, changes = self._derive(op, pins, data_len=512, direction="read", cdw10="0x00FF0002")
+        self.assertEqual([c for c in changes if not c.startswith("direction")], [])
+        with self.assertRaises(ValueError):
+            validate_transfer(out, op)
 
 
 if __name__ == "__main__":

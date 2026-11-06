@@ -57,6 +57,48 @@ def _parse_effects_log(raw: str) -> list[str]:
     return _EFFECTS_RE.findall(raw or "")
 
 
+# FIDs whose support is probed with Get Features SEL=011b at the start of a run.
+PROBED_FIDS = list(range(0x01, 0x25)) + [0x7D, 0x7E, 0x7F] + list(range(0x80, 0x86))
+_FID_BLOCK_RE = re.compile(r"FID=([0-9A-Fa-f]{2})\r?\n(.*?)RC=(\d+)", re.S)
+
+
+def device_support(raw: dict[str, str] | None) -> dict:
+    """{"lids": {lid: bool}, "fids": {fid: bool}} from the probe; an id that
+    was not answered is simply absent (unknown), never assumed either way."""
+    from tc_system.verification import decode_payload
+    raw = raw or {}
+    support = {"lids": {}, "fids": {}}
+    data = decode_payload({"stdout": raw.get("supported_logs", "")})
+    if data is not None and len(data) >= 1024:
+        support["lids"] = {lid: bool(data[lid * 4] & 1) for lid in range(256)}
+    for fid, out, rc in _FID_BLOCK_RE.findall(raw.get("fid_support", "") or ""):
+        if rc == "0":
+            support["fids"][int(fid, 16)] = True
+        elif out.count("INVALID_FIELD") >= (2 if "NSID_RETRY" in out else 1):
+            support["fids"][int(fid, 16)] = False
+    # SEL=011b is itself an invalid field on a drive without Save/Select
+    # (ONCS bit 4): then every FID answers INVALID_FIELD and proves nothing.
+    # Arbitration (01h) is mandatory, so its rejection means the same.
+    oncs = _as_int(_parse_fields(raw.get("id_ctrl", "")).get("oncs"))
+    if (oncs is not None and not oncs & 0x10) or support["fids"].get(0x01) is False:
+        support["fids"] = {}
+    return support
+
+
+def host_versions(raw: dict[str, str] | None) -> dict:
+    text = (raw or {}).get("host_versions", "") or ""
+    nvme = re.search(r"nvme version\s+(\S+)", text)
+    kernel = next((l.strip() for l in text.splitlines() if re.match(r"^\d+\.\d+", l.strip())), None)
+    ctrl = _parse_fields((raw or {}).get("id_ctrl", ""))
+    return {"nvme_cli": nvme.group(1) if nvme else None, "kernel": kernel,
+            "model": ctrl.get("mn"), "firmware": ctrl.get("fr")}
+
+
+def namespace_size(raw: dict[str, str] | None) -> int | None:
+    """NSZE (logical blocks) from `nvme id-ns`, or None."""
+    return _as_int(_parse_fields((raw or {}).get("id_ns", "")).get("nsze"))
+
+
 def in_use_lba_bytes(raw: dict[str, str] | None) -> int | None:
     """LBA data size of the namespace's in-use format, or None if unknown."""
     match = _LBA_IN_USE_RE.search((raw or {}).get("id_ns", "") or "")
@@ -96,6 +138,17 @@ def summarize_device_capabilities(raw: dict[str, str]) -> str:
     lba_match = _LBA_IN_USE_RE.search((raw or {}).get("id_ns", "") or "")
     if lba_match:
         lines.append(f"현재 사용 중인 LBA 포맷의 섹터 크기={lba_match.group(1)} bytes")
+
+    support = device_support(raw)
+    if support["lids"]:
+        lids = [f"{lid:02X}h" for lid, ok in sorted(support["lids"].items()) if ok]
+        lines.append("Supported Log Pages(LID 00h)로 실측된 지원 LID: " + ", ".join(lids)
+                     + " — 이 밖의 LID는 이 드라이브가 지원하지 않음")
+    if support["fids"]:
+        yes = [f"{f:02X}h" for f, ok in sorted(support["fids"].items()) if ok]
+        no = [f"{f:02X}h" for f, ok in sorted(support["fids"].items()) if not ok]
+        lines.append(f"Get Features SEL=011b로 실측된 지원 FID: {', '.join(yes) or '없음'}; "
+                     f"미지원 FID(INVALID_FIELD): {', '.join(no) or '없음'}")
 
     supported_opcodes = _parse_effects_log((raw or {}).get("effects_log", ""))
     if supported_opcodes:

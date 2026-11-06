@@ -74,7 +74,7 @@ python run_report.py                   # 두 리포트 다시 생성 (--kind log
 ```
 python build_spec_index.py             # 최초 1회(또는 RAG 인덱스 갱신 시): 커버리지 인덱스 생성
 python run_tc_pipeline.py --count 12   # 미커버 조항 선정 -> 인자 생성 -> 실제 실행 -> 판정 -> 커버리지 갱신
-python run_tc_pipeline.py --all --no-destructive   # 선정 가능한 타겟 전부(~232개, 수 시간). 중단해도 다시 돌리면 안 해 본 타겟부터 이어서
+python run_tc_pipeline.py --all --no-destructive   # 선정 가능한 타겟 전부(요구사항 ~1,322개 + 코드 변형 ~389개, 하루 이상). 중단해도 다시 돌리면 안 해 본 타겟부터 이어서
 ```
 **파괴적 커맨드가 기본 포함됩니다** (대상 드라이브 데이터는 소모품 전제). 내용이 중요한 드라이브에 돌릴 때만 `--no-destructive`. 배치 안에서는 비파괴적 커맨드가 먼저 실행되도록 정렬되어, Sanitize/Format 같은 장시간·전면삭제 커맨드가 앞서 나오지 않습니다.
 
@@ -89,6 +89,9 @@ TC 1건당 LLM 호출이 2~3회(시나리오 + 인자 + 거부 시 재생성) �
 python run_tc_pipeline.py --count 12 --reset-coverage
 ```
 `tc_store.json`/`coverage_state.json`을 지우기 **전에** `data/coverage_backups/<UTC타임스탬프>/`로 복사해두므로, 잘못 눌러도 이전 커버리지 기록이 영구히 사라지지 않습니다. 같은 드라이브를 계속 쓰는 일반적인 반복 실행에서는 이 플래그를 주면 안 됩니다 — 그동안 쌓은 커버리지가 매번 날아갑니다.
+
+### PMU 보드로 전원 사이클 쓰기 (선택)
+`secrets.local.json`의 `pmu` 항목을 채우고 `enabled: true`로 바꾸면 시나리오가 "Power Cycle (PMU)" 스텝을 쓸 수 있다(템플릿: `secrets.local.example.json`). `script`는 **대상 호스트**의 `pmu_4_1.py` 경로다. 순서는 PC-sampling 퍼저의 POR과 같다(전원 OFF → PCIe remove → 방전 대기 → 전원 ON → rescan + id-ctrl 대기). `remove`는 SSD 자신(`endpoint`) 또는 최상단 브리지(`root`, P9/P7 계열 PMU 보드)다. 전원 사이클은 `--no-destructive`에서 막힌다. "Controller Reset" 스텝은 PMU 없이 항상 쓸 수 있다.
 
 ### 4-3. 결과 확인
 - `report/output/tc_coverage_latest.html`: 시도한 테스트 대상 조항 수(지금 도구로 테스트 가능한 232개 기준)와 제외 사유별 조항 수, 요구사항 검증 결과, **커맨드별 표**(시도/대상 조항, PASS/FAIL/미지원/미검증/ERROR, 건너뜀, 평가된 요구사항 — 펼치면 조항별 최근 결과와 마지막 건너뜀 사유), TC 목록(판단·원인·다음, 재시도 이력, 근거와 실제 응답), TC 실패 판정 결과.
