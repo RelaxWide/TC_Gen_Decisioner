@@ -77,23 +77,35 @@ def _load_secrets():
     return json.loads(SECRETS_PATH.read_text(encoding="utf-8"))
 
 
+# Where the PMU script and pmu_ip.json are copied on the target host.
+PMU_REMOTE_DIR = "/tmp/tc_gen_pmu"
+
+
 def get_pmu():
     """PMU board settings (secrets.local.json "pmu") when enabled, else None.
     Without it the Power Cycle host step is not offered at all.
 
-    run_on "local" (default): the script runs on this PC; a relative `script`
-    (default "pmu_4_1.py") is under the project folder, next to pmu_ip.json.
-    run_on "target": `script` is a path on the target host."""
+    run_on "target" (default): the script runs on the target host (the test
+    PC), which reaches the PMU board at the IP in pmu_ip.json - the fuzzer's
+    setup. A relative `script` (default "pmu_4_1.py") is a file in this project
+    folder, next to pmu_ip.json: both are copied to PMU_REMOTE_DIR at the start
+    of each run (`upload_from`). An absolute POSIX path is used as it is.
+    run_on "local": the script runs on this PC (the board is reachable from
+    here); a relative `script` is under the project folder."""
     try:
         pmu = dict(_load_secrets().get("pmu") or {})
     except Exception:  # noqa: BLE001 - no secrets file: no PMU
         return None
-    if not pmu.get("enabled") or pmu.get("run_on", "local") not in ("local", "target"):
+    run_on = pmu.setdefault("run_on", "target")
+    if not pmu.get("enabled") or run_on not in ("local", "target"):
         return None
-    if pmu.get("run_on", "local") == "local":
-        script = Path(pmu.get("script") or "pmu_4_1.py")
-        pmu["script"] = str(script if script.is_absolute() else BASE_DIR / script)
-    return pmu if pmu.get("script") else None
+    script = str(pmu.get("script") or "pmu_4_1.py")
+    if run_on == "local":
+        pmu["script"] = str(Path(script) if Path(script).is_absolute() else BASE_DIR / script)
+    elif not script.startswith("/"):
+        pmu["upload_from"] = str(BASE_DIR / script)
+        pmu["script"] = f"{PMU_REMOTE_DIR}/{Path(script).name}"
+    return pmu
 
 
 def pmu_status():
@@ -111,10 +123,8 @@ def pmu_status():
         return None, "secrets.local.json에 pmu 항목 없음"
     if not pmu.get("enabled"):
         return None, "pmu.enabled=false"
-    if pmu.get("run_on", "local") not in ("local", "target"):
-        return None, f"pmu.run_on={pmu.get('run_on')!r} (local 또는 target)"
-    if not pmu.get("script"):
-        return None, "pmu.script(run_on=target이면 대상 호스트의 pmu_4_1.py 경로) 없음"
+    if pmu.get("run_on", "target") not in ("local", "target"):
+        return None, f"pmu.run_on={pmu.get('run_on')!r} (target 또는 local)"
     return None, "PMU 설정을 읽지 못함"
 
 

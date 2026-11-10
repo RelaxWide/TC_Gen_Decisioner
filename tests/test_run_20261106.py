@@ -332,17 +332,50 @@ class TestPowerCycleOffer(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no PMU board"):
             _validate_steps_plan(plan, ops[0], ops + host_action_entries(None))
 
-    def test_the_probe_checks_the_script_on_the_target(self):
+    def _target_check(self, check_reply, files=("pmu_4_1.py", "pmu_ip.json")):
+        import tempfile
+        from pathlib import Path
         from tc_system.execution import ssh_runner
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for name in files:
+            (Path(tmp.name) / name).write_text("# " + name, encoding="utf-8")
+        pmu = {"enabled": True, "run_on": "target", "dev_idx": 1, "script": "/tmp/tc_gen_pmu/pmu_4_1.py",
+               "upload_from": str(Path(tmp.name) / "pmu_4_1.py")}
+        calls = []
 
-        class Proc:
-            returncode, stdout, stderr = 0, "PMU_SCRIPT_MISSING", ""
-        with mock.patch.object(ssh_runner, "_plink", return_value=Proc()) as plink, \
-                mock.patch.object(ssh_runner, "_append_ssh_log"), \
-                mock.patch.object(config, "get_ssh_target", return_value={"host": "h", "user": "u", "password": "p"}):
-            out = ssh_runner.probe_device_capabilities("/dev/nvme0", "/dev/nvme0n1", "/opt/pmu dir/pmu_4_1.py")
-        self.assertEqual(out["pmu_script"], "PMU_SCRIPT_MISSING")
-        self.assertIn("'/opt/pmu dir/pmu_4_1.py'", plink.call_args_list[-1].args[1])
+        def fake_plink(target, command, stdin=None, timeout=60):
+            calls.append((command, stdin))
+            class Proc:
+                stderr = ""
+            proc = Proc()
+            proc.returncode, proc.stdout = (0, b"PMU_UPLOADED") if "cat >" in command else check_reply
+            return proc
+
+        with mock.patch.object(ssh_runner, "_plink", side_effect=fake_plink), \
+             mock.patch.object(ssh_runner, "_append_ssh_log"), \
+             mock.patch.object(config, "get_ssh_target", return_value={"host": "h", "user": "u", "password": "p"}):
+            return ssh_runner.target_pmu_problem(pmu), calls
+
+    def test_the_pmu_files_go_to_the_test_pc_and_are_run_there(self):
+        # This PC -> SSH -> test PC -> PMU board: pmu_ip.json is an address on
+        # the test PC's network (measured: run from Windows, it timed out).
+        problem, calls = self._target_check((0, "12.5"))
+        self.assertEqual(problem, "")
+        self.assertIn("cat > /tmp/tc_gen_pmu/pmu_4_1.py", calls[0][0])
+        self.assertEqual(calls[0][1], b"# pmu_4_1.py")  # the file itself on stdin
+        self.assertIn("cat > /tmp/tc_gen_pmu/pmu_ip.json", calls[1][0])
+        check = calls[2][0]
+        self.assertTrue(check.startswith("sudo -S bash -c '(cd /tmp/tc_gen_pmu && timeout 20 python3 pmu_4_1.py 3 1)'"))
+
+    def test_a_failed_check_on_the_test_pc_says_why(self):
+        problem, _ = self._target_check((1, "ModuleNotFoundError: No module named 'paramiko'"))
+        self.assertIn("paramiko", problem)
+        problem, _ = self._target_check((124, ""))
+        self.assertIn("20초 안에 끝나지 않음", problem)
+        problem, calls = self._target_check((0, ""), files=("pmu_4_1.py",))
+        self.assertIn("pmu_ip.json", problem)
+        self.assertEqual(calls, [])  # nothing sent without both files
 
 
 
@@ -455,7 +488,8 @@ class TestFollowUpReview(unittest.TestCase):
         from tc_system.execution.host_actions import host_action_command
         pmu = {"enabled": True, "run_on": "target", "script": "/opt/pmu_4_1.py"}
         command, _ = host_action_command("power_cycle", "/dev/nvme0", pmu)
-        trap, off = command.index("trap \"python3 /opt/pmu_4_1.py 4 1 3300"), command.index("pmu_4_1.py 7 1")
+        trap = command.index("trap \"(cd /opt && timeout 20 python3 pmu_4_1.py 4 1 3300")
+        off = command.index("pmu_4_1.py 7 1")
         self.assertLess(trap, off)  # armed before the power goes off
         self.assertIn("trap - HUP INT TERM", command[command.rindex("POWER_ON_RC"):])
 

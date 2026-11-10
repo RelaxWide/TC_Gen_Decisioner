@@ -25,7 +25,8 @@ from tc_system.execution.expectation_checker import (check_expectation, check_ex
 from shared.llm_client import LLMCallError
 from tc_system.execution.host_actions import host_action_entries, pmu_runs_locally, usable_host_steps
 from tc_system.execution.ssh_runner import (DestructiveStepBlocked, device_responsive, passthru_cmd,
-                                            local_pmu_problem, probe_device_capabilities)
+                                            local_pmu_problem, probe_device_capabilities,
+                                            target_pmu_problem)
 from tc_system.execution.tc_executor import SSHTCExecutor
 from tc_system.generation.variants import build_variant_tc, variant_targets
 from tc_system.generation.device_capabilities import (device_support as probed_support, firmware_activation_pending,
@@ -505,8 +506,7 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
         # Best-effort and run exactly once per batch, not once per TC: a probe
         # failure (unreachable target, an nvme-cli version missing a
         # subcommand) must never block the run it only exists to speed up.
-        probe = probe_device_capabilities(target["nvme_ctrl"], target["nvme_ns"],
-                                          None if not pmu or pmu_runs_locally(pmu) else pmu["script"])
+        probe = probe_device_capabilities(target["nvme_ctrl"], target["nvme_ns"])
         device_facts = summarize_device_capabilities(probe)
         # Measured, not assumed: NVM Read/Write/Compare buffers are checked
         # against NLB x this before anything reaches the wire.
@@ -548,13 +548,12 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
     # ADMIN/NVM combos are allowed in one chain, so the model is always shown
     # the whole table, not just the primary target's own command_set.
     # Host steps (reset, PMU power cycle) can be setup/verify steps of a chain.
-    if pmu and probe is not None and "PMU_SCRIPT_MISSING" in (probe.get("pmu_script") or ""):
-        pmu, pmu_off = None, f"대상 호스트에 {pmu['script']}(또는 python3)가 없음"
-    if pmu and pmu_runs_locally(pmu) and allow_destructive:
-        # The board is driven from this PC: files present and it answers a
-        # read-only current measurement, or the power cycle is not offered.
+    if pmu and allow_destructive:
+        # Files present (copied to the test PC for run_on=target) and the
+        # board answers a read-only current measurement from where the power
+        # cycle will drive it, or the power cycle is not offered this run.
         try:
-            problem = local_pmu_problem(pmu)
+            problem = local_pmu_problem(pmu) if pmu_runs_locally(pmu) else target_pmu_problem(pmu)
         except Exception as exc:  # noqa: BLE001 - a check, never a reason to stop the run
             problem = f"PMU 확인 중 오류: {exc}"
         if problem:

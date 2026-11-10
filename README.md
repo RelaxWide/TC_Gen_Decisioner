@@ -93,16 +93,18 @@ python run_tc_pipeline.py --count 12 --reset-coverage
 ### PMU 보드로 전원 사이클 쓰기 (선택)
 `secrets.local.json`의 `pmu` 항목을 채우고 `enabled: true`로 바꾸면 시나리오가 "Power Cycle (PMU)" 스텝을 쓸 수 있다(템플릿: `secrets.local.example.json`).
 
-1. 프로젝트 폴더(이 README가 있는 폴더)에 PMU 보드 스크립트 `pmu_4_1.py`와 보드 IP를 적은 `pmu_ip.json`을 둔다. 둘 다 `.gitignore` 대상이라 커밋되지 않는다. 스크립트는 그 폴더를 작업 디렉터리로 해서 실행된다.
-2. `secrets.local.json`에 `pmu`를 넣는다(기본값 `run_on: "local"`, `script: "pmu_4_1.py"` — 프로젝트 폴더 기준).
+PMU 보드는 퍼저와 같이 **대상 호스트(test PC)** 에서 구동한다: 이 PC → SSH → test PC → PMU 보드(`pmu_ip.json`의 IP는 test PC 네트워크의 주소다).
+
+1. 프로젝트 폴더(이 README가 있는 폴더)에 PMU 보드 스크립트 `pmu_4_1.py`와 보드 IP를 적은 `pmu_ip.json`을 둔다. 둘 다 `.gitignore` 대상이라 커밋되지 않는다. 실행 시작마다 두 파일이 test PC의 `/tmp/tc_gen_pmu/`로 복사되고, 거기서 root(`sudo`)의 `python3`로 그 폴더를 작업 디렉터리로 해서 실행된다. 그래서 `pmu_4_1.py`가 쓰는 라이브러리(paramiko 등)는 **test PC의 root python3**에 있어야 한다(퍼저가 그 PC에서 돌고 있으면 이미 있다. 없으면 test PC에서 `sudo apt install python3-paramiko` 또는 `sudo python3 -m pip install paramiko`).
+2. `secrets.local.json`에 `pmu`를 넣는다(기본값 `run_on: "target"`, `script: "pmu_4_1.py"` — 프로젝트 폴더의 파일).
    ```json
-   "pmu": {"enabled": true, "run_on": "local", "script": "pmu_4_1.py", "dev_idx": 1, "voltage_mv": 3300,
+   "pmu": {"enabled": true, "run_on": "target", "script": "pmu_4_1.py", "dev_idx": 1, "voltage_mv": 3300,
            "poweroff_wait_sec": 3, "rescan_delay_sec": 10, "boot_wait_sec": 30, "remove": "endpoint"}
    ```
-   `remove`는 PCIe에서 뗄 대상이다. SSD 자신(`endpoint`), 최상단 브리지(`root`, P9/P7 계열 — 퍼저의 `auto-root`), 또는 `none`. PMU 스크립트가 파이프라인과 다른 파이썬 환경에 의존하면 `"python": "C:/.../python.exe"`로 지정한다.
-3. 파괴적 명령을 허용해 실행한다(`--no-destructive`면 전원 사이클은 막힌다). 시작할 때 보드에 읽기 전용 전류 측정(`pmu_4_1.py 3 <dev_idx>`)을 한 번 보내 응답을 확인하고, 첫 부분에 `호스트 스텝: Controller Reset, Power Cycle (PMU)`가 찍히면 켜진 것이다. 아니면 같은 줄에 이유(파일 없음, `pmu_ip.json` 없음, 보드 응답 실패 등)가 찍힌다.
+   `remove`는 PCIe에서 뗄 대상이다. SSD 자신(`endpoint`), 최상단 브리지(`root`, P9/P7 계열 — 퍼저의 `auto-root`), 또는 `none`. test PC에 이미 있는 스크립트를 쓰려면 `script`에 그 절대경로(`/home/.../pmu_4_1.py`, 같은 폴더에 `pmu_ip.json`)를 준다 — 그때는 복사하지 않는다.
+3. 파괴적 명령을 허용해 실행한다(`--no-destructive`면 전원 사이클은 막힌다). 시작할 때 test PC에서 읽기 전용 전류 측정(`pmu_4_1.py 3 <dev_idx>`)을 한 번 보내 응답을 확인하고, 첫 부분에 `호스트 스텝: Controller Reset, Power Cycle (PMU)`가 찍히면 켜진 것이다. 아니면 같은 줄에 이유(파일 없음, `pmu_ip.json` 없음, 복사 실패, `ModuleNotFoundError` 같은 스크립트 오류, 20초 안에 응답 없음)가 찍힌다.
 
-순서는 PC-sampling 퍼저의 POR과 같다: PCIe 주소 확인(대상 호스트) → 전원 OFF(이 PC에서 PMU) → PCIe remove(대상 호스트) → 방전 대기 → 전원 ON(PMU) → rescan + id-ctrl 대기(대상 호스트). 퍼저처럼 대상 호스트에서 스크립트를 돌리려면 `"run_on": "target"`과 대상 호스트의 절대경로를 `script`에 준다. "Controller Reset" 스텝은 PMU 없이 항상 쓸 수 있다.
+순서는 PC-sampling 퍼저의 POR과 같다(전부 test PC에서): PCIe 주소 확인 → 전원 OFF → PCIe remove → 방전 대기 → 전원 ON → rescan + id-ctrl 대기. PMU 명령마다 20초 제한(퍼저 5초/10초). 이 PC에서 보드에 직접 닿는 구성이면 `"run_on": "local"`(이 PC의 python으로 실행, PCIe 작업만 SSH). "Controller Reset" 스텝은 PMU 없이 항상 쓸 수 있다.
 
 ### 4-3. 결과 확인
 - `report/output/tc_coverage_latest.html`: 시도한 테스트 대상 조항 수(지금 도구로 테스트 가능한 232개 기준)와 제외 사유별 조항 수, 요구사항 검증 결과, **커맨드별 표**(시도/대상 조항, PASS/FAIL/미지원/미검증/ERROR, 건너뜀, 평가된 요구사항 — 펼치면 조항별 최근 결과와 마지막 건너뜀 사유), TC 목록(판단·원인·다음, 재시도 이력, 근거와 실제 응답), TC 실패 판정 결과.

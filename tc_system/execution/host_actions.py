@@ -17,11 +17,15 @@ power on, `<script> 3 <dev>` read the current (read-only, used as the
 start-of-run check).
 
 Where the PMU script runs (`pmu.run_on`):
-- "local" (default): on the PC that runs this pipeline, `pmu_4_1.py` and its
-  `pmu_ip.json` (the board's IP) in the project folder. The PMU board is
-  reached over the network; only the PCIe remove/rescan and the readiness
-  wait go to the target host over SSH (`ssh_runner._local_power_cycle`).
-- "target": on the target host as root, like the fuzzer (`host_action_script`).
+- "target" (default): on the target host (the test PC) as root, like the
+  fuzzer - the board is on the test PC's network (its IP is in pmu_ip.json),
+  not necessarily reachable from the PC running this pipeline. The files are
+  kept in this project folder and copied to the target at the start of each
+  run (`ssh_runner.target_pmu_problem`). Each PMU call runs in the script's
+  folder (so it finds pmu_ip.json) under `timeout`, like the fuzzer's 5 s/10 s.
+- "local": on the PC that runs this pipeline, when the board is reachable from
+  it; only the PCIe remove/rescan and the readiness wait go to the target
+  (`ssh_runner._local_power_cycle`).
 """
 import re
 import shlex
@@ -92,7 +96,19 @@ def _entry(name, action, destructive):
 
 
 def pmu_runs_locally(pmu: dict | None) -> bool:
-    return bool(pmu) and pmu.get("run_on", "local") == "local"
+    return bool(pmu) and pmu.get("run_on", "target") == "local"
+
+
+PMU_CALL_TIMEOUT_SEC = 20  # one board command; the fuzzer allows 5 s (OFF) / 10 s (ON)
+
+
+def target_pmu_call(pmu: dict, what: str) -> str:
+    """Shell for one PMU board command on the target host: in the script's
+    folder (pmu_ip.json beside it) and bounded, so an unreachable board is a
+    PMU error, not a hang until the whole host step times out."""
+    folder, _, name = str(pmu["script"]).rpartition("/")
+    return (f"(cd {shlex.quote(folder or '.')} && timeout {PMU_CALL_TIMEOUT_SEC} python3 {shlex.quote(name)} "
+            + " ".join(pmu_args(pmu, what)) + ")")
 
 
 def pmu_timing(pmu: dict) -> tuple[int, int, float, float, int]:
@@ -115,16 +131,20 @@ def local_pmu_argv(pmu: dict, what: str) -> list[str]:
     return [pmu.get("python") or sys.executable, str(pmu["script"]), *pmu_args(pmu, what)]
 
 
-def local_pmu_files_problem(pmu: dict) -> str:
-    """Why the local PMU files are not usable, or "". pmu_ip.json sits next to
-    the script (the script is run with that folder as its working directory)."""
-    script = Path(pmu["script"])
+def pmu_files_problem(script: str | Path, ip_name: str = "pmu_ip.json") -> str:
+    """Why the PMU files on this PC are not usable, or "". pmu_ip.json sits
+    next to the script (the script runs with that folder as its working
+    directory)."""
+    script = Path(script)
     if not script.is_file():
         return f"{script} 없음"
-    ip_file = script.with_name(pmu.get("ip_file", "pmu_ip.json"))
-    if not ip_file.is_file():
-        return f"{ip_file} 없음(PMU IP 파일, pmu_4_1.py와 같은 폴더)"
+    if not script.with_name(ip_name).is_file():
+        return f"{script.with_name(ip_name)} 없음(PMU IP 파일, pmu_4_1.py와 같은 폴더)"
     return ""
+
+
+def local_pmu_files_problem(pmu: dict) -> str:
+    return pmu_files_problem(pmu["script"], pmu.get("ip_file", "pmu_ip.json"))
 
 
 _BDF_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
@@ -178,9 +198,8 @@ def host_action_script(action: str, nvme_ctrl: str, pmu: dict | None) -> tuple[s
             raise ValueError("Power Cycle needs a PMU board configured (secrets.local.json \"pmu\")")
         if pmu_runs_locally(pmu):
             raise ValueError("pmu.run_on=local: the power cycle runs from this PC (ssh_runner.run_host_action)")
-        script = shlex.quote(pmu["script"])
         _, _, off_wait, rescan_delay, boot_wait = pmu_timing(pmu)
-        off, on = " ".join(pmu_args(pmu, "off")), " ".join(pmu_args(pmu, "on"))
+        off, on = target_pmu_call(pmu, "off"), target_pmu_call(pmu, "on")
         # endpoint: the SSD itself; root: the topmost bridge above it (some
         # PMU boards only cycle cleanly that way); none: no remove at all.
         target = {"endpoint": "$EP", "root": "$ROOT"}.get(pmu.get("remove", "endpoint"))
@@ -189,15 +208,15 @@ def host_action_script(action: str, nvme_ctrl: str, pmu: dict | None) -> tuple[s
         body = (pcie_locate_script(nvme_ctrl)
                 # Interrupted between OFF and ON (Ctrl+C kills plink, the
                 # session closes, bash gets HUP): power back on before exiting.
-                + f"trap \"python3 {script} {on}; exit 95\" HUP INT TERM; "
+                + f"trap \"{on}; exit 95\" HUP INT TERM; "
                 # A failed OFF is no power loss: power back on in case it half
                 # worked, and stop with a PMU error (not 98, which means the
                 # drive never came back) so nothing after it is judged.
-                + f"python3 {script} {off}; off=$?; echo POWER_OFF_RC=$off; "
-                + f"if [ $off -ne 0 ]; then python3 {script} {on}; exit 96; fi; "
+                + f"{off}; off=$?; echo POWER_OFF_RC=$off; "
+                + f"if [ $off -ne 0 ]; then {on}; exit 96; fi; "
                 + remove_cmd
                 + f"sleep {off_wait}; "
-                + f"python3 {script} {on}; rc=$?; echo POWER_ON_RC=$rc; trap - HUP INT TERM; "
+                + f"{on}; rc=$?; echo POWER_ON_RC=$rc; trap - HUP INT TERM; "
                 + "[ $rc -eq 0 ] || exit $rc; "
                 + f"sleep {rescan_delay}; "
                 + _wait_ready(nvme_ctrl, boot_wait, rescan=True))

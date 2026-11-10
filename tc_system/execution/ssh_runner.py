@@ -215,7 +215,7 @@ def _timed_plink(target: dict, command: str, stage: str, **kwargs):
     }
 
 
-def probe_device_capabilities(nvme_ctrl: str, nvme_ns: str, pmu_script: str | None = None) -> dict[str, str]:
+def probe_device_capabilities(nvme_ctrl: str, nvme_ns: str) -> dict[str, str]:
     """Runs a handful of read-only diagnostic nvme-cli commands against the
     real target once per pipeline run (not once per TC) and returns their raw
     stdout, keyed by a fixed label — Identify Controller/Namespace plus (best
@@ -257,8 +257,7 @@ def probe_device_capabilities(nvme_ctrl: str, nvme_ns: str, pmu_script: str | No
         ("fw_log", f"sudo nvme fw-log {nvme_ctrl} 2>&1"),
         # Recorded in the run manifest: results depend on the host tool too.
         ("host_versions", "nvme version 2>&1; uname -r"),
-    ) + ((("pmu_script", f"if [ -f {shlex.quote(pmu_script)} ] && command -v python3 >/dev/null; "
-                         "then echo PMU_SCRIPT_OK; else echo PMU_SCRIPT_MISSING; fi"),) if pmu_script else ()):
+    ):
         proc, stage = _timed_plink(target, cmd, f"probe_{key}", timeout=30)
         log_record["stages"].append(stage)
         outputs[key] = proc.stdout
@@ -360,6 +359,51 @@ def local_pmu_problem(pmu: dict) -> str:
         last = out.strip().splitlines()[-1] if out.strip() else "(출력 없음)"
         return f"PMU 응답 확인(pmu_4_1.py {' '.join(stage['command'].split()[-2:])}) 실패: rc={rc}, {last}"
     return ""
+
+
+def target_pmu_problem(pmu: dict) -> str:
+    """Start-of-run check for pmu.run_on=target, the fuzzer's setup: this PC
+    -> SSH -> test PC -> PMU board (pmu_ip.json holds an address on the test
+    PC's network, which this PC may not reach - measured: run from Windows,
+    the board command timed out). Copies pmu_4_1.py and pmu_ip.json from the
+    project folder to the target when `upload_from` is set, then runs the
+    read-only current measurement there as root, as the power cycle will.
+    "" when usable, else why not (a missing paramiko on the test PC shows here)."""
+    from tc_system.execution.host_actions import PMU_CALL_TIMEOUT_SEC, pmu_files_problem, target_pmu_call
+    target = config.get_ssh_target()
+    record = {"timestamp": datetime.now(timezone.utc).isoformat(), "pmu_check": True, "stages": []}
+    ip_name = pmu.get("ip_file", "pmu_ip.json")
+    try:
+        if pmu.get("upload_from"):
+            local = Path(pmu["upload_from"])
+            problem = pmu_files_problem(local, ip_name)
+            if problem:
+                return problem
+            folder, _, name = pmu["script"].rpartition("/")
+            for src, dest in ((local, name), (local.with_name(ip_name), ip_name)):
+                command = (f"mkdir -p {shlex.quote(folder)} && cat > {shlex.quote(folder + '/' + dest)} "
+                           "&& echo PMU_UPLOADED")
+                proc, stage = _timed_plink(target, command, f"pmu_upload_{dest}", stdin=src.read_bytes(),
+                                           timeout=30)
+                record["stages"].append(stage)
+                if proc.returncode != 0:
+                    return f"대상 호스트로 {dest} 복사 실패(rc={proc.returncode})"
+        call = target_pmu_call(pmu, "current")
+        if "'" in call:
+            return f"PMU 스크립트 경로에 작은따옴표를 쓸 수 없음: {pmu['script']}"
+        proc, stage = _timed_plink(target, f"sudo -S bash -c '{call}' 2>&1", "pmu_check",
+                                   stdin=target["password"] + "\n", timeout=PMU_CALL_TIMEOUT_SEC + 15)
+        record["stages"].append(stage)
+        out = (proc.stdout or "").strip()
+        record["output"] = out[-500:]
+        if proc.returncode != 0:
+            last = out.splitlines()[-1] if out else "(출력 없음)"
+            why = f" - {PMU_CALL_TIMEOUT_SEC}초 안에 끝나지 않음" if proc.returncode in (124, None) else ""
+            return (f"대상 호스트에서 PMU 응답 확인({pmu['script']} 3 {pmu.get('dev_idx', 1)}) 실패: "
+                    f"rc={proc.returncode}{why}, {last}")
+        return ""
+    finally:
+        _append_ssh_log(record)
 
 
 def _local_power_cycle(nvme_ctrl: str, pmu: dict, target: dict, log_record: dict) -> dict:

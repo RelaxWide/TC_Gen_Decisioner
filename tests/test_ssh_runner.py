@@ -437,12 +437,20 @@ class TestLocalPmu(unittest.TestCase):
 
     def test_relative_script_is_under_the_project_folder(self):
         # config.get_pmu is patched in setUp; _REAL_GET_PMU is the real one.
+        # Default: the test PC runs it (the fuzzer's setup), copied from here.
         with mock.patch.object(config, "_load_secrets", return_value={"pmu": {"enabled": True}}):
             pmu = _REAL_GET_PMU()
-        self.assertEqual(Path(pmu["script"]), config.BASE_DIR / "pmu_4_1.py")
+        self.assertEqual(pmu["run_on"], "target")
+        self.assertEqual(Path(pmu["upload_from"]), config.BASE_DIR / "pmu_4_1.py")
+        self.assertEqual(pmu["script"], config.PMU_REMOTE_DIR + "/pmu_4_1.py")
+        with mock.patch.object(config, "_load_secrets",
+                               return_value={"pmu": {"enabled": True, "run_on": "local"}}):
+            self.assertEqual(Path(_REAL_GET_PMU()["script"]), config.BASE_DIR / "pmu_4_1.py")
         with mock.patch.object(config, "_load_secrets",
                                return_value={"pmu": {"enabled": True, "run_on": "target", "script": "/opt/p.py"}}):
-            self.assertEqual(_REAL_GET_PMU()["script"], "/opt/p.py")  # a path on the target host, untouched
+            pmu = _REAL_GET_PMU()
+        self.assertEqual(pmu["script"], "/opt/p.py")  # already on the target host: used as it is
+        self.assertNotIn("upload_from", pmu)
         with mock.patch.object(config, "_load_secrets", return_value={"pmu": {"enabled": True, "run_on": "pc"}}):
             self.assertIsNone(_REAL_GET_PMU())
 
