@@ -674,8 +674,8 @@ def _await_prepared(future, i, total, opcode_entry):
             waited = time.monotonic() - started
             if waited >= config.TC_PREPARE_WAIT_SEC:
                 return None
-            print(f"  [대기] [{i}/{total}] {opcode_entry['name']} TC 생성(LLM 응답) 대기 {int(waited)}초 - "
-                  f"{config.TC_PREPARE_WAIT_SEC}초가 지나면 이 타겟은 건너뜀")
+            print(f"  [대기] [{i}/{total}] {opcode_entry['name']}: 이 타겟의 TC 생성(LLM 응답)을 {int(waited)}초째 기다리는 중 "
+                  f"(장비는 대기 상태, {config.TC_PREPARE_WAIT_SEC}초를 넘기면 이 타겟만 건너뜀)")
 
 
 def _run_targets(targets, total, ctx, pool, futures, _ensure, unsupported_in_run, workers, executor, index, variants,
@@ -685,6 +685,12 @@ def _run_targets(targets, total, ctx, pool, futures, _ensure, unsupported_in_run
     for i, (section, opcode_entry) in enumerate(targets, start=1):
         attempts, verdict = [], None
         key = _opcode_key(opcode_entry)
+        # Slide the prefetch window on every target, skipped ones included:
+        # after a run of opcode_unsupported_in_run skips the next real target
+        # was only queued when reached and its whole generation was waited
+        # out in front of the user (2026-11-10: "[대기] [229/1654]" right
+        # after skips that said no LLM call was made).
+        _ensure(i + max(workers or 1, config.TC_GENERATION_LOOKAHEAD if pool else 1))
         if key in unsupported_in_run:
             # The drive already answered INVALID_OPCODE for this command in
             # this run: another clause of it cannot learn more (measured: 41
@@ -698,7 +704,6 @@ def _run_targets(targets, total, ctx, pool, futures, _ensure, unsupported_in_run
             if on_skip:
                 on_skip(i, total, section, opcode_entry, reason)
             continue
-        _ensure(i + max(workers or 1, config.TC_GENERATION_LOOKAHEAD if pool else 1))
         future = futures.get(i - 1)
         if future is not None and future.cancelled():
             future = None

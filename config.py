@@ -40,7 +40,11 @@ LLM_CALL_TRANSPORT_RETRIES = 1
 # The main loop gives up on one target's generation after this long, skips it
 # with a reason and moves on (2026-11-10: a run sat silent after a TC's
 # review line while the next target's generation waited on the LLM).
-TC_PREPARE_WAIT_SEC = 1200
+# 2026-11-06: one target's whole generation (scenario + retries + args)
+# p50 60 s, p99 330 s, slowest that finished 403 s; only stuck calls (920 s)
+# went past 600. The wait starts when the main loop reaches the target, after
+# its generation began, so this allows more than 600 s of generation.
+TC_PREPARE_WAIT_SEC = 600
 # ...and says it is waiting every this many seconds meanwhile.
 TC_WAIT_NOTICE_SEC = 60
 # The same LLM, in an auditor role, adds review reasons to PASS/FAIL TCs.

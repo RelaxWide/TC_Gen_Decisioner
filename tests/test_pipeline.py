@@ -311,6 +311,35 @@ class TestOneRunLearnsOnce(PipelineTestCase):
         log = json.loads(Path(config.TARGET_SKIPS_PATH).read_text(encoding="utf-8"))
         self.assertEqual(log[0]["kind"], "generation_timeout")
 
+    def test_skipped_targets_still_move_the_generation_window(self):
+        # 2026-11-10: after a run of "LLM 호출도 생략" skips the next target was
+        # queued only when reached, so its whole generation was waited out
+        # ("[대기] [229/1654]") right after skips that said nothing was called.
+        siblings = [dict(SECTION_READ, section_id=f"nvm:1.1.{n}", clause=f"1.1.{n}") for n in (7, 8, 9)]
+        index = dict(INDEX_JSON, sections=[SECTION_READ, *siblings, SECTION_WRITE])
+        Path(config.active_coverage_index_path()).write_text(json.dumps(index), encoding="utf-8")
+        order = [SECTION_READ["section_id"], *(s["section_id"] for s in siblings), SECTION_WRITE["section_id"]]
+        real_pick = pipeline.pick_next_targets
+
+        def pick(*args, **kwargs):
+            return sorted(real_pick(*args, **kwargs), key=lambda t: order.index(t[0]["section_id"]))
+
+        submitted, at_last_skip = [], []
+        real_submit = pipeline._DaemonPool.submit
+
+        def submit(pool, fn, *args):
+            submitted.append(args[0]["section_id"])
+            return real_submit(pool, fn, *args)
+
+        executor = _FakeExecutor([[_ok(0), _unsupported(1)], [_ok(0), _ok(1)]])
+        with mock.patch.object(pipeline, "pick_next_targets", side_effect=pick),              mock.patch.object(pipeline, "generate_scenario", side_effect=_two_step_scenario),              mock.patch.object(pipeline._DaemonPool, "submit", submit),              mock.patch.object(config, "TC_GENERATION_LOOKAHEAD", 2):
+            result = pipeline.run_pipeline(
+                count=5, executor=executor, allow_destructive=True, generation_workers=2,
+                on_skip=lambda i, n, s, o, reason: at_last_skip.append(list(submitted)) if i == 4 else None)
+        self.assertIn(SECTION_WRITE["section_id"], at_last_skip[0])  # queued while skipping (was: only when reached)
+        self.assertNotIn(siblings[2]["section_id"], submitted)  # a known-unsupported clause is still not generated
+        self.assertEqual(result["executed"], 2)
+
     def test_generation_is_queued_further_ahead_than_the_worker_count(self):
         # 2026-11-06: the window was the worker count, so one slow target left
         # the other workers idle (one call in flight for 120 of 284 minutes).

@@ -72,7 +72,7 @@
 2. **인자 생성** (`placeholder command arguments`, 스텝마다 1회 재시도, 어느 스텝이든 실패하면 TC 전체): LLM 실패, 스텝 역할의 `NAME=값`(DEAC, NSZ, CA, SEL 등)과 실제 인코딩 불일치, 성공을 기대하는 Set Features의 CDW11 예약 비트, cdw 형식, direction 값이 read/write/none이 아님, 허용 밖 nsid(관리 명령은 기대 상태가 INVALID_NS일 때만 다른 NSID 허용, I/O 명령은 활성 NSID만 — 커널이 다른 값을 장치에 보내기 전에 버림), 위험한 큐 명령, HMB Set Features, data_len 범위, 버퍼 크기를 계산할 수 없는 커맨드의 빈 전송(방향은 있는데 data_len=0)·버퍼 없는 커맨드에 data_len, 선택자 레지스터 위치 불일치, 고정 필드 위반, 시나리오가 길이 필드와 data_len을 둘 다 고정했는데 서로 어긋남, payload가 data_len보다 김. 길이 필드(NUMD/NLB)↔data_len 불일치, opcode 방향 비트 모순, Get/Set Features의 FID별 버퍼 크기(HMB 4096B, Timestamp 8B, APST 256B, Host Behavior·PLM 512B, LBA Range Type 4096B, SEL=011b·값이 DW0인 FID는 0), 조항 선택자(LID/FID/CNS) 값은 거부하지 않고 하네스가 계산해 쓴다(`derive_transfer`, 터미널 `하네스 계산값 적용`/`시나리오 고정값 적용`). Identify Controller/Namespace setup·verify 스텝은 LLM 없이 코드가 만든다.
 3. **전송 직전**: `--no-destructive`에서 파괴적/펌웨어 스텝, 스텝 형식 검증 실패, I/O 명령 nsid가 네임스페이스 장치와 다름, 위험한 큐 명령, HMB Set Features. 이미지를 바꾸거나 활성화하는 Firmware Commit(CA 000b/001b/011b)을 SUCCESS로 기대하는데 체인 앞에 실제 이미지 전체 다운로드("Firmware Image Download (full image)", `secrets.local.json` `firmware.image`)가 없거나 그 뒤 일부 다운로드가 있음(`pipeline._firmware_commit_problem`).
 4. **헬스체크 실패**: 앞 TC 뒤 장비 무응답이면 남은 타겟 전체(시도 횟수에 넣지 않음).
-5. **생성 시간 초과**: 미리 생성한 TC가 `config.TC_PREPARE_WAIT_SEC`(1200초) 안에 끝나지 않음(`generation_timeout`, LLM 호출 하나는 300초 제한).
+5. **생성 시간 초과**: 미리 생성한 TC가 `config.TC_PREPARE_WAIT_SEC`(600초) 안에 끝나지 않음(`generation_timeout`, LLM 호출 하나는 300초 제한).
 
 거부하지 않고 하네스가 고쳐 쓰는 형식 실수(`check_repairs`, 터미널 `검사식 보정`): offset/width가 있는 검사의 종류 이름(`offset`/`data` → `data_field`), mask 없는 `data_field`(폭 전체), 이름에 적은 오프셋(`GENCTR@0+8`), mask 없는 고정 필드(필드 전체), mask 0인 고정 필드(제거), `cdw1`(NSID)·`cdw010` 같은 필드 철자.
 
