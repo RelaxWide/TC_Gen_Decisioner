@@ -117,6 +117,14 @@ def _command_step(section: dict, opcode_entry: dict, nvme_ctrl: str, nvme_ns: st
         "payload_hex": (test_intent or {}).get("payload_hex"),
         "lba_bytes": (test_intent or {}).get("lba_bytes"),
     }
+    if is_admin and str(opcode_entry.get("raw_opcode", "")).lower() == "0x11" and (test_intent or {}).get("firmware_image"):
+        # A real image is configured: the step sends its bytes at OFST, not a
+        # pattern (2026-11-10: zero-filled downloads made every Commit that
+        # needed an image a rejection, judged as the drive's failure).
+        step["firmware_image"] = test_intent["firmware_image"]
+        step["payload_hex"] = None
+        # The scenario's pattern is not sent, so it is not checked either.
+        test_intent = step["test_intent"] = dict(test_intent, payload_hex=None)
     standard = None if rejected else _standard_identify(opcode_entry, phase, test_intent, active_nsid)
     if standard:
         step.update(standard, args_source=AUTHORED_ARGS, harness_built=True, shared_facts={},
@@ -230,10 +238,13 @@ def _host_step(opcode_entry: dict, nvme_ctrl: str, phase, role, test_intent) -> 
     return {"name": opcode_entry["name"], "phase": phase, "role": role, "mode": "host",
             "host_action": opcode_entry["host_action"], "device": nvme_ctrl, "opcode": opcode_entry["opcode"],
             "nsid": 0, **{f"cdw{i}": zero for i in range(10, 16)}, "data_len": 0, "direction": "none",
-            "destructive": opcode_entry.get("destructive", False), "firmware_state": False,
+            "destructive": opcode_entry.get("destructive", False),
+            "firmware_state": opcode_entry.get("firmware_state", False),
             "lockout_risk": False, "args_source": AUTHORED_ARGS, "shared_facts": {},
             "field_value_verified": False, "test_intent": test_intent or {}, "field_constraints": [],
-            "expected_status": (test_intent or {}).get("expected_status", "SUCCESS"), "payload_hex": None}
+            "expected_status": (test_intent or {}).get("expected_status", "SUCCESS"), "payload_hex": None,
+            "firmware_image": ((test_intent or {}).get("firmware_image")
+                               if opcode_entry["host_action"] == "firmware_download" else None)}
 
 
 def _harness_step(name, raw, command_set, device, nsid, phase, role, harness, cdw10=0, cdw11=0, cdw12=0,
@@ -407,7 +418,8 @@ def reauthor_steps(tc: dict, resolved_steps: list[dict], rejected: dict, active_
 
 def build_tc(tc_id: str, resolved_steps: list[dict], scenario: dict,
              nvme_ctrl: str, nvme_ns: str, active_nsid: int, device_facts: str | None = None,
-             lba_bytes: int | None = None, device_support: dict | None = None) -> dict:
+             lba_bytes: int | None = None, device_support: dict | None = None,
+             firmware_image: dict | None = None) -> dict:
     from tc_system.models import make_tc_record
 
     action = next(rs for rs in resolved_steps if rs["phase"] == "action")
@@ -425,7 +437,7 @@ def build_tc(tc_id: str, resolved_steps: list[dict], scenario: dict,
                   "payload_hex": rs.get("payload_hex"),
                   # Rides in test_intent so a reauthor (which reuses the stored
                   # intent) checks the same buffer size as the first attempt.
-                  "lba_bytes": lba_bytes}
+                  "lba_bytes": lba_bytes, "firmware_image": firmware_image}
         steps.append(_command_step(rs["section"], rs["opcode_entry"], nvme_ctrl, nvme_ns, active_nsid,
                                     phase=rs["phase"], role=rs.get("role"), prior_steps=prior_steps,
                                     device_facts=device_facts, test_intent=intent, device_support=device_support))

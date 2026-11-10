@@ -36,6 +36,7 @@ from pathlib import Path
 HOST_ACTIONS = {
     "Controller Reset": "controller_reset",
     "Power Cycle (PMU)": "power_cycle",
+    "Firmware Image Download (full image)": "firmware_download",
 }
 
 # A requirement about state across a reset or a power loss is only tested by a
@@ -78,21 +79,26 @@ def usable_host_steps(target: dict, available_opcodes: list[dict], allow_destruc
             if o.get("host_action") in needed and (allow_destructive or not o.get("destructive"))]
 
 
-def host_action_entries(pmu: dict | None) -> list[dict]:
+def host_action_entries(pmu: dict | None, firmware: dict | None = None) -> list[dict]:
     """Pseudo opcode entries for `available_opcodes`. Power Cycle only when a
     PMU board is configured. A power cycle without shutdown notification is
-    a sudden power loss, so it counts as destructive (--no-destructive)."""
+    a sudden power loss, so it counts as destructive (--no-destructive). The
+    full-image download only when a real image is configured and on the
+    target; it changes firmware state (--no-destructive blocks it)."""
     entries = [_entry("Controller Reset", "controller_reset", destructive=False)]
     if pmu:
         entries.append(_entry("Power Cycle (PMU)", "power_cycle", destructive=True))
+    if firmware:
+        entries.append(_entry("Firmware Image Download (full image)", "firmware_download", destructive=False,
+                              firmware_state=True))
     return entries
 
 
-def _entry(name, action, destructive):
+def _entry(name, action, destructive, firmware_state=False):
     return {"name": name, "host_action": action, "command_set": "HOST", "opcode": f"host:{action}",
             "raw_opcode": None, "section_ref": None, "destructive": destructive,
-            "firmware_state": False, "lockout_risk": False, "risk_class": 2 if destructive else 1,
-            "direction": "none"}
+            "firmware_state": firmware_state, "lockout_risk": False,
+            "risk_class": 2 if destructive or firmware_state else 1, "direction": "none"}
 
 
 def pmu_runs_locally(pmu: dict | None) -> bool:
@@ -187,9 +193,19 @@ def _wait_ready(nvme_ctrl: str, seconds: int, rescan: bool) -> str:
             f"echo NOT_READY_AFTER_SEC={int(seconds)}; exit 98")
 
 
-def host_action_script(action: str, nvme_ctrl: str, pmu: dict | None) -> tuple[str, int]:
+def host_action_script(action: str, nvme_ctrl: str, pmu: dict | None,
+                       firmware: dict | None = None) -> tuple[str, int]:
     """(shell script run as root on the target, timeout seconds)."""
     ctrl = shlex.quote(nvme_ctrl)
+    if action == "firmware_download":
+        # The whole configured image, in chunks nvme-cli sizes (or xfer_bytes),
+        # from the copy made at the start of the run. Firmware Commit can then
+        # act on a complete, real image instead of a dummy.
+        if not firmware:
+            raise ValueError("Firmware Image Download (full image) needs secrets.local.json firmware.image")
+        xfer = f" --xfer={int(firmware['xfer_bytes'])}" if firmware.get("xfer_bytes") else ""
+        return (f"nvme fw-download {ctrl} --fw={shlex.quote(firmware['remote'])}{xfer}; rc=$?; "
+                "echo FW_DOWNLOAD_RC=$rc; exit $rc"), 120 + int(firmware.get("size", 0)) // (1 << 20) * 10
     if action == "controller_reset":
         return (f"nvme reset {ctrl}; rc=$?; echo RESET_RC=$rc; "
                 f"[ $rc -eq 0 ] || exit $rc; " + _wait_ready(nvme_ctrl, 30, rescan=False)), 60
@@ -224,10 +240,11 @@ def host_action_script(action: str, nvme_ctrl: str, pmu: dict | None) -> tuple[s
     raise ValueError(f"unknown host action {action!r}")
 
 
-def host_action_command(action: str, nvme_ctrl: str, pmu: dict | None) -> tuple[str, int]:
+def host_action_command(action: str, nvme_ctrl: str, pmu: dict | None,
+                        firmware: dict | None = None) -> tuple[str, int]:
     """One root shell for the whole sequence: the sudo password is read once
     from stdin. The script contains no single quote, so it nests safely."""
-    body, timeout = host_action_script(action, nvme_ctrl, pmu)
+    body, timeout = host_action_script(action, nvme_ctrl, pmu, firmware)
     if "'" in body:
         raise ValueError("host action script must not contain a single quote")
     return f"sudo -S bash -c '{body}' 2>&1", timeout

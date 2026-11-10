@@ -299,7 +299,8 @@ def device_responsive(nvme_ctrl: str, timeout: int = 15) -> tuple[bool, str]:
     return True, ""
 
 
-def run_host_action(action: str, nvme_ctrl: str, tc_id=None, attempt_id=None, step_index=None) -> dict:
+def run_host_action(action: str, nvme_ctrl: str, tc_id=None, attempt_id=None, step_index=None,
+                    firmware: dict | None = None) -> dict:
     """Controller reset / PMU power cycle (host_actions.py): on the target host,
     except the PMU board commands of a power cycle with pmu.run_on=local."""
     from tc_system.execution.host_actions import host_action_command, pmu_runs_locally
@@ -312,7 +313,7 @@ def run_host_action(action: str, nvme_ctrl: str, tc_id=None, attempt_id=None, st
             return _local_power_cycle(nvme_ctrl, pmu, target, log_record)
         finally:
             _append_ssh_log(log_record)
-    command, timeout = host_action_command(action, nvme_ctrl, pmu)
+    command, timeout = host_action_command(action, nvme_ctrl, pmu, firmware)
     log_record["step_commands"] = [command]
     try:
         proc, stage = _timed_plink(target, command, f"host_{action}", stdin=target["password"] + "\n",
@@ -359,6 +360,29 @@ def local_pmu_problem(pmu: dict) -> str:
         last = out.strip().splitlines()[-1] if out.strip() else "(출력 없음)"
         return f"PMU 응답 확인(pmu_4_1.py {' '.join(stage['command'].split()[-2:])}) 실패: rc={rc}, {last}"
     return ""
+
+
+def upload_firmware_image(firmware: dict) -> str:
+    """Copies the configured image to the target (plink stdin, like the PMU
+    files) for the full-image download and checks its sha256 there. "" when
+    it is in place, else why not."""
+    target = config.get_ssh_target()
+    record = {"timestamp": datetime.now(timezone.utc).isoformat(), "firmware_upload": True, "stages": []}
+    remote = firmware["remote"]
+    try:
+        command = (f"mkdir -p {shlex.quote(remote.rpartition('/')[0])} && cat > {shlex.quote(remote)} && "
+                   f"sha256sum {shlex.quote(remote)}")
+        proc, stage = _timed_plink(target, command, "firmware_upload", stdin=Path(firmware["path"]).read_bytes(),
+                                   timeout=60 + firmware["size"] // (1 << 20) * 10)
+        record["stages"].append(stage)
+        out = proc.stdout.decode(errors="replace") if isinstance(proc.stdout, bytes) else (proc.stdout or "")
+        if proc.returncode != 0:
+            return f"대상 호스트로 {firmware['name']} 복사 실패(rc={proc.returncode})"
+        if firmware["sha256"] not in out:
+            return f"대상 호스트의 {remote} sha256이 원본과 다름"
+        return ""
+    finally:
+        _append_ssh_log(record)
 
 
 def target_pmu_problem(pmu: dict) -> str:

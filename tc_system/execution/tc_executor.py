@@ -54,7 +54,8 @@ class SSHTCExecutor(TCExecutor):
         def send(i, step):
             if step.get("host_action"):
                 host = ssh_runner.run_host_action(step["host_action"], step["device"], tc_id=tc_id,
-                                                  attempt_id=attempt_id, step_index=i)
+                                                  attempt_id=attempt_id, step_index=i,
+                                                  firmware=step.get("firmware_image"))
                 stderr.append(host["batch_stderr"])
                 state["timed_out"] = state["timed_out"] or host["timed_out"]
                 return {"step_index": i, "exit_code": host["exit_code"], "stdout": host["stdout"],

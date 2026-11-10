@@ -106,6 +106,16 @@ PMU 보드는 퍼저와 같이 **대상 호스트(test PC)** 에서 구동한다
 
 순서는 PC-sampling 퍼저의 POR과 같다(전부 test PC에서): PCIe 주소 확인 → 전원 OFF → PCIe remove → 방전 대기 → 전원 ON → rescan + id-ctrl 대기. PMU 명령마다 20초 제한(퍼저 5초/10초). 이 PC에서 보드에 직접 닿는 구성이면 `"run_on": "local"`(이 PC의 python으로 실행, PCIe 작업만 SSH). "Controller Reset" 스텝은 PMU 없이 항상 쓸 수 있다.
 
+### 펌웨어 이미지 (선택)
+Firmware Image Download / Firmware Commit을 실제 이미지로 시험하려면 프로젝트 폴더에 `.bin`을 두고 `secrets.local.json`에 파일명을 적는다(`.bin`/`.img`는 `.gitignore` 대상).
+```json
+"firmware": {"image": "my_fw.bin", "xfer_bytes": null}
+```
+- 실행 시작에 `펌웨어 이미지: my_fw.bin (N바이트, sha256 …)`가 찍힌다. LLM이 만든 Firmware Image Download 스텝은 이 이미지의 OFST 위치 바이트를 보낸다.
+- 파괴적 명령을 허용한 실행이면 이미지를 test PC(`/tmp/tc_gen_fw/`)로 복사하고(sha256 확인) "Firmware Image Download (full image)" 스텝(`nvme fw-download`, setup 전용)을 제공한다.
+- 이미지를 바꾸거나 활성화하는 Commit(CA 000b/001b/011b)을 성공으로 기대하는 TC는 체인 앞에 전체 다운로드가 있어야 보낸다. 더미·일부 이미지는 거부되는 게 정상이라, 그 거부를 장비 실패로 판정하던 문제를 막는다. 이미지가 없으면 그런 TC는 보내지 않고(거부를 기대하는 테스트, CA 010b는 그대로) 시작 줄에 `펌웨어 이미지 없음(사유)`가 찍힌다.
+- Commit이 이 이미지를 다음 리셋에 활성화할 수 있다. 지금 펌웨어와 같은(또는 검증된) 이미지를 쓸 것.
+
 ### 4-3. 결과 확인
 - `report/output/tc_coverage_latest.html`: 시도한 테스트 대상 조항 수(지금 도구로 테스트 가능한 232개 기준)와 제외 사유별 조항 수, 요구사항 검증 결과, **커맨드별 표**(시도/대상 조항, PASS/FAIL/미지원/미검증/ERROR, 건너뜀, 평가된 요구사항 — 펼치면 조항별 최근 결과와 마지막 건너뜀 사유), TC 목록(판단·원인·다음, 재시도 이력, 근거와 실제 응답), TC 실패 판정 결과.
 - `report/output/log_judgment_latest.html`: QST/PULSEFZ 실패의 1차 판정 결과와 근거 로그.

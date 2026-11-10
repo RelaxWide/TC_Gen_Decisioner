@@ -4,7 +4,8 @@ import subprocess
 import sys
 import queue
 import threading
-from concurrent.futures import Future
+import time
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from functools import lru_cache
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -26,7 +27,7 @@ from shared.llm_client import LLMCallError
 from tc_system.execution.host_actions import host_action_entries, pmu_runs_locally, usable_host_steps
 from tc_system.execution.ssh_runner import (DestructiveStepBlocked, device_responsive, passthru_cmd,
                                             local_pmu_problem, probe_device_capabilities,
-                                            target_pmu_problem)
+                                            target_pmu_problem, upload_firmware_image)
 from tc_system.execution.tc_executor import SSHTCExecutor
 from tc_system.generation.variants import build_variant_tc, variant_targets
 from tc_system.generation.device_capabilities import (device_support as probed_support, firmware_activation_pending,
@@ -36,7 +37,7 @@ from tc_system.generation.scenario_generator import generate_scenario
 from tc_system.generation.tc_writer import build_tc, namespace_id_from_device_path, reauthor_steps
 from tc_system.review import apply_tc_verdict, code_review, review_tc
 from tc_system.store import tc_store
-from tc_system.verification import command_support_measured_absent, completion_status, verify_tc
+from tc_system.verification import canonical_status, command_support_measured_absent, completion_status, verify_tc
 
 
 def _execute_attempt(tc, executor, attempts):
@@ -219,11 +220,40 @@ def _reset_coverage() -> None:
     save_json_atomic(config.TARGET_SKIPS_PATH, [])
 
 
+def _firmware_commit_problem(tc: dict) -> str | None:
+    """A Firmware Commit that replaces or activates the downloaded image
+    (CA 000b/001b/011b, CDW10 bits 5:3) expected to SUCCEED needs the whole
+    real image downloaded earlier in the chain, with no partial download in
+    between. A dummy or partial image is rejected by a conforming drive, and
+    that rejection was judged as the drive's failure (2026-11-10). Expecting a
+    rejection, or CA 010b (an image already in a slot), is a valid test."""
+    full = False
+    for i, step in enumerate(tc["steps"]):
+        if step.get("host_action") == "firmware_download":
+            full = True
+        elif step.get("mode") == "admin-passthru" and str(step.get("opcode", "")).lower() == "0x11":
+            full = False  # a later chunk overwrites part of what was downloaded
+        elif step.get("mode") == "admin-passthru" and str(step.get("opcode", "")).lower() == "0x10":
+            try:
+                ca = (int(step["cdw10"], 16) >> 3) & 7
+            except (KeyError, TypeError, ValueError):
+                continue
+            if ca in (0, 1, 3) and canonical_status(step.get("expected_status") or "SUCCESS") == "SUCCESS" \
+                    and not full:
+                return (f"스텝 {i} Firmware Commit CA={ca:03b}b를 SUCCESS로 기대하지만 체인 앞에 실제 이미지 전체 다운로드"
+                        "(Firmware Image Download (full image))가 없음 — 더미·일부 이미지는 거부되는 게 정상이라 "
+                        "판정이 틀어짐(secrets.local.json firmware.image 설정 필요, 또는 거부를 기대하는 테스트로)")
+    return None
+
+
 def _preflight(tc: dict, allow_destructive: bool) -> None:
     """The checks the executor makes before anything reaches the wire, run
     before the TC is announced. Otherwise the terminal printed the TC, its
     commands and "실행 중...", then a second "[i/N] ... 건너뜀" header for the
     same index, while nothing had been sent (so no SSH log either)."""
+    problem = _firmware_commit_problem(tc)
+    if problem:
+        raise ValueError(problem)
     for i, step in enumerate(tc["steps"]):
         if not step.get("host_action"):
             passthru_cmd(step)  # the same field validation execute_tc_steps applies
@@ -426,6 +456,7 @@ def _prepare_target(section, opcode_entry, ctx) -> dict:
             resolved_steps = _resolve_steps_plan(ctx["index"], scenario["steps_plan"], ctx["available_opcodes"], section)
             tc = build_tc(tc_id, resolved_steps, scenario, target["nvme_ctrl"], target["nvme_ns"], ctx["active_nsid"],
                           device_facts=ctx["device_facts"], lba_bytes=ctx["lba_bytes"],
+                          firmware_image=ctx.get("firmware_image"),
                           device_support=ctx["device_support"])
     except _LLM_REPLY_ERRORS as exc:
         # A transient malformed/incomplete reply for this one target must
@@ -563,7 +594,39 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
     print("호스트 스텝: Controller Reset" + (", Power Cycle (PMU)" if pmu and allow_destructive else "")
           + ("" if pmu and allow_destructive else
              f" - 전원 사이클 없음({pmu_off or '--no-destructive'}); 전원 사이클 전후 문장은 건너뜀"))
-    available_opcodes = index.list_opcodes() + host_action_entries(pmu)
+    # A real firmware image (secrets.local.json firmware.image): downloads
+    # send its bytes; the full-image host step needs the copy on the target.
+    firmware, firmware_off = config.firmware_image_status()
+    full_image = None
+    if firmware and allow_destructive:
+        try:
+            upload_problem = upload_firmware_image(firmware)
+        except Exception as exc:  # noqa: BLE001 - a copy, never a reason to stop the run
+            upload_problem = f"복사 중 오류: {exc}"
+        full_image = None if upload_problem else firmware
+        firmware_off = upload_problem
+    if firmware:
+        print(f"펌웨어 이미지: {firmware['name']} ({firmware['size']}바이트, sha256 {firmware['sha256'][:12]}) - "
+              "Firmware Image Download가 이 이미지를 보냄"
+              + (", 전체 다운로드 스텝 제공" if full_image else f", 전체 다운로드 스텝 없음({firmware_off or '--no-destructive'})")
+              + ". Commit이 이 이미지를 활성화할 수 있으니 지금 펌웨어와 같은(또는 검증된) 이미지를 쓸 것")
+        facts = (f"FIRMWARE_IMAGE: a real {firmware['size']}-byte firmware image is configured. A Firmware Image "
+                 "Download step sends that image's bytes starting at its OFST (CDW11, dwords) for data_len bytes "
+                 "(do not give payload_hex; keep OFST*4+data_len within the image). "
+                 + ("'Firmware Image Download (full image)' (setup only) downloads the whole image; a Firmware Commit "
+                    "that replaces or activates an image (CA 000b/001b/011b) expected to succeed needs it earlier in "
+                    "the chain with no partial download after it. " if full_image else "")
+                 + "CA 011b may complete with a Firmware Activation Requires ... Reset status when the drive needs a "
+                 "reset to activate.")
+    else:
+        print(f"펌웨어 이미지 없음({firmware_off}) - Firmware Image Download는 0으로 채운 더미 데이터를 보냄; "
+              "이미지를 바꾸거나 활성화하는 Commit을 성공으로 기대하는 TC는 보내지 않음")
+        facts = ("FIRMWARE_IMAGE: no real firmware image is configured; every Firmware Image Download sends "
+                 "zero-filled dummy data. Do not expect a Firmware Commit that replaces or activates an image "
+                 "(CA 000b/001b/011b) to succeed - test the rejection of an invalid image, or CA 010b on an "
+                 "existing slot.")
+    device_facts = f"{device_facts}\n{facts}" if device_facts else facts
+    available_opcodes = index.list_opcodes() + host_action_entries(pmu, full_image)
 
     existing = tc_store.load_all()
     targets = pick_next_targets(index, existing, sys.maxsize if count is None else count,
@@ -573,7 +636,8 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
     generated, executed, failed, host_crashes, unsupported, skipped = [], [], [], [], [], []
     ctx = {"existing": existing, "available_opcodes": available_opcodes, "allow_destructive": allow_destructive,
            "allow_placeholder_args": allow_placeholder_args, "target": target, "active_nsid": active_nsid,
-           "lba_bytes": lba_bytes, "device_facts": device_facts, "device_support": support, "index": index}
+           "lba_bytes": lba_bytes, "device_facts": device_facts, "device_support": support, "index": index,
+           "firmware_image": firmware}
     unsupported_in_run = {}  # (command set, opcode) -> section id that showed it
     pool = _DaemonPool(workers) if workers and workers > 1 else None
     futures = {}
@@ -595,6 +659,23 @@ def run_pipeline(count: int | None = 5, executor=None, allow_placeholder_args: b
     finally:
         if pool:
             pool.shutdown()
+
+
+def _await_prepared(future, i, total, opcode_entry):
+    """The prefetched generation of target i, or None after
+    config.TC_PREPARE_WAIT_SEC. Says it is waiting meanwhile: before, the run
+    printed nothing after the previous TC while an LLM call hung, which looked
+    the same as a stuck device."""
+    started = time.monotonic()
+    while True:
+        try:
+            return future.result(timeout=config.TC_WAIT_NOTICE_SEC)
+        except FutureTimeout:
+            waited = time.monotonic() - started
+            if waited >= config.TC_PREPARE_WAIT_SEC:
+                return None
+            print(f"  [대기] [{i}/{total}] {opcode_entry['name']} TC 생성(LLM 응답) 대기 {int(waited)}초 - "
+                  f"{config.TC_PREPARE_WAIT_SEC}초가 지나면 이 타겟은 건너뜀")
 
 
 def _run_targets(targets, total, ctx, pool, futures, _ensure, unsupported_in_run, workers, executor, index, variants,
@@ -621,7 +702,14 @@ def _run_targets(targets, total, ctx, pool, futures, _ensure, unsupported_in_run
         future = futures.get(i - 1)
         if future is not None and future.cancelled():
             future = None
-        prepared = future.result() if future is not None else _prepare_target(section, opcode_entry, ctx)
+        if future is not None:
+            prepared = _await_prepared(future, i, total, opcode_entry)
+            if prepared is None:
+                prepared = {"section": section, "kind": "generation_timeout",
+                            "skip": f"TC 생성이 {config.TC_PREPARE_WAIT_SEC}초 안에 끝나지 않음(LLM 응답 지연) - "
+                                    "장비에는 아무것도 보내지 않고 다음 타겟으로"}
+        else:
+            prepared = _prepare_target(section, opcode_entry, ctx)
         section = prepared["section"]
         if "skip" in prepared:
             _record_skip(skipped, section, opcode_entry, prepared["skip"], prepared["kind"], run_id=run_id)
@@ -779,7 +867,7 @@ def _run_targets(targets, total, ctx, pool, futures, _ensure, unsupported_in_run
                     replanned_tc = build_tc(tc_id, replanned_steps, replanned_scenario,
                                              target["nvme_ctrl"], target["nvme_ns"], active_nsid,
                                              device_facts=device_facts, lba_bytes=lba_bytes,
-                                             device_support=support)
+                                             device_support=support, firmware_image=ctx.get("firmware_image"))
                     replanned_tc["run_id"] = run_id
                 except _LLM_REPLY_ERRORS:
                     # The replan is "nice to have, falls back to what's

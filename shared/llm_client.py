@@ -106,8 +106,15 @@ def _complete(guide, prompt: str, system: str | None) -> str:
     if system:
         messages.append({"role": "system", "content": system})
     messages.append({"role": "user", "content": prompt})
+    client = guide.client
+    if hasattr(client, "with_options"):
+        # Bounded: the library default (600 s x 3 attempts) let one stuck call
+        # stall a run for half an hour. A timeout is an LLMCallError, which
+        # every caller handles as "skip this target".
+        client = client.with_options(timeout=config.LLM_CALL_TIMEOUT_SEC,
+                                     max_retries=config.LLM_CALL_TRANSPORT_RETRIES)
     try:
-        completion = guide.client.chat.completions.create(
+        completion = client.chat.completions.create(
             model=guide.model or "testmodel",
             messages=messages,
             reasoning_effort=REASONING_EFFORT,

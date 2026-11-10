@@ -494,5 +494,32 @@ class TestFollowUpReview(unittest.TestCase):
         self.assertIn("trap - HUP INT TERM", command[command.rindex("POWER_ON_RC"):])
 
 
+
+class TestLlmCallIsBounded(unittest.TestCase):
+    """2026-11-10: the client had no timeout (library default 600 s x 3
+    attempts); a stuck call held the run silent."""
+
+    def test_every_call_carries_the_timeout_and_retry_budget(self):
+        from types import SimpleNamespace
+        from shared import llm_client
+        seen = {}
+
+        class Client:
+            def with_options(self, **kwargs):
+                seen.update(kwargs)
+                return self
+
+            @property
+            def chat(self):
+                reply = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+                return SimpleNamespace(completions=SimpleNamespace(create=lambda **k: reply))
+
+        self.assertEqual(llm_client._complete(SimpleNamespace(client=Client(), model="m"), "p", None), "ok")
+        self.assertEqual(seen, {"timeout": config.LLM_CALL_TIMEOUT_SEC,
+                                "max_retries": config.LLM_CALL_TRANSPORT_RETRIES})
+        self.assertLessEqual(config.LLM_CALL_TIMEOUT_SEC * (1 + config.LLM_CALL_TRANSPORT_RETRIES),
+                             config.TC_PREPARE_WAIT_SEC)
+
+
 if __name__ == "__main__":
     unittest.main()

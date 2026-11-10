@@ -24,3 +24,7 @@ TC_Gen_Decisioner-main.zip
 # PMU board script and its IP file: placed by hand in the project folder (pmu.run_on=local)
 /pmu_4_1.py
 /pmu_ip.json
+
+# Firmware images placed in the project folder (secrets.local.json firmware.image)
+/*.bin
+/*.img

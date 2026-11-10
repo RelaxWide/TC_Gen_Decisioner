@@ -5,8 +5,11 @@ Missing payloads, missing prerequisites and legacy prose are UNVERIFIED, not a
 successful assertion. Citations prove provenance, not the model's interpretation;
 the report exposes the quote, encoded request, observation and comparison.
 """
+import functools
+import hashlib
 import re
 import unicodedata
+from pathlib import Path
 
 from shared.ids import stable_id
 from shared.spec_evidence import plain_text
@@ -320,8 +323,31 @@ def payload_bytes(raw):
     return bytes.fromhex(text)
 
 
+@functools.lru_cache(maxsize=2)
+def _firmware_bytes(path, sha256):
+    data = Path(path).read_bytes()
+    if hashlib.sha256(data).hexdigest() != sha256:
+        raise ValueError(f"firmware image {path} changed since the TC was built")
+    return data
+
+
+def firmware_chunk(step):
+    """The configured image's bytes a Firmware Image Download step sends: from
+    OFST (CDW11, dwords) for data_len bytes, zeros past the end of the image."""
+    fw = step["firmware_image"]
+    try:
+        data = _firmware_bytes(fw["path"], fw["sha256"])
+    except OSError as exc:
+        raise ValueError(f"firmware image unavailable: {exc}") from exc
+    offset, length = integer(step.get("cdw11", "0x0")) * 4, step["data_len"]
+    chunk = data[offset:offset + length]
+    return chunk + bytes(length - len(chunk))
+
+
 def payload_for_step(step):
-    """Bytes a write step sends. `payload_hex` that divides data_len is a
+    """Bytes a write step sends. A Firmware Image Download built while a real
+    image was configured (`firmware_image`) sends that image's bytes at its
+    offset. Otherwise `payload_hex` that divides data_len is a
     pattern repeated to fill it (a 4 KiB block need not be spelled out in the
     prompt). One that does not is a structure: its bytes, then zeros for the
     rest (reserved fields are zero) - repeating a structure would write garbage
@@ -330,6 +356,8 @@ def payload_for_step(step):
     the buffer is zero-filled."""
     if step.get("direction") != "write":
         return b""
+    if step.get("firmware_image"):
+        return firmware_chunk(step)
     raw = step.get("payload_hex")
     if raw is None:
         return bytes(step["data_len"])

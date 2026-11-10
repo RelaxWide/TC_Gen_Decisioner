@@ -5,6 +5,7 @@ function already accepts one), so only the branching logic under test runs
 for real.
 """
 import json
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -158,6 +159,8 @@ class PipelineTestCase(unittest.TestCase):
             mock.patch.object(config, "REVIEW_AUDIT_WITH_LLM", False),
             # the real secrets.local.json may enable a PMU; tests choose it explicitly
             mock.patch.object(config, "get_pmu", return_value=None),
+            # and may name a firmware image; tests choose it explicitly
+            mock.patch.object(config, "firmware_image_status", return_value=(None, "test")),
             mock.patch.object(config, "FAILURE_CONTEXTS_DIR", tmp_path / "failure_contexts"),
             mock.patch.object(config, "VERDICTS_DIR", tmp_path / "verdicts"),
             mock.patch.object(config, "get_ssh_target", lambda: {
@@ -279,6 +282,34 @@ class TestOneRunLearnsOnce(PipelineTestCase):
                                        on_start=lambda i, total, tc: started.append(i))
         self.assertEqual(started, [1, 2])
         self.assertEqual(result["executed"], 2)
+
+    def test_a_generation_that_never_returns_is_skipped_with_a_reason_and_the_run_goes_on(self):
+        # 2026-11-10: the run sat silent after a TC's review line while the next
+        # target's generation waited on the LLM.
+        index = dict(INDEX_JSON, sections=[SECTION_READ, SECTION_WRITE])
+        Path(config.active_coverage_index_path()).write_text(json.dumps(index), encoding="utf-8")
+        real = pipeline._prepare_target
+        release = threading.Event()
+        self.addCleanup(release.set)  # let the stuck worker finish after the test
+
+        def prepare(section, opcode_entry, ctx):
+            if section["section_id"] == SECTION_READ["section_id"]:
+                release.wait(5)  # never returns within the wait below
+            return real(section, opcode_entry, ctx)
+
+        executor, skips, printed = _FakeExecutor([[_ok(0), _ok(1)]]), [], []
+        with mock.patch.object(pipeline, "_prepare_target", side_effect=prepare), \
+             mock.patch.object(config, "TC_WAIT_NOTICE_SEC", 0.05), \
+             mock.patch.object(config, "TC_PREPARE_WAIT_SEC", 0.2), \
+             mock.patch("builtins.print", side_effect=lambda *a, **k: printed.append(" ".join(map(str, a)))):
+            result = pipeline.run_pipeline(count=2, executor=executor, allow_destructive=True, generation_workers=2,
+                                           on_skip=lambda i, n, s, o, reason: skips.append((s["section_id"], reason)))
+        self.assertEqual([s for s, _ in skips], [SECTION_READ["section_id"]])
+        self.assertIn("초 안에 끝나지 않음", skips[0][1])
+        self.assertTrue(any("[대기]" in line for line in printed))  # said it was waiting
+        self.assertEqual(result["executed"], 1)  # the next target still ran
+        log = json.loads(Path(config.TARGET_SKIPS_PATH).read_text(encoding="utf-8"))
+        self.assertEqual(log[0]["kind"], "generation_timeout")
 
     def test_generation_is_queued_further_ahead_than_the_worker_count(self):
         # 2026-11-06: the window was the worker count, so one slow target left
@@ -496,7 +527,8 @@ class TestDeviceFactsReachGeneration(PipelineTestCase):
                                 side_effect=RuntimeError("unreachable")), \
              mock.patch.object(pipeline, "generate_scenario", side_effect=_two_step_scenario) as gen:
             result = self._run(executor)
-        self.assertIsNone(gen.call_args.kwargs["device_facts"])
+        # No probe facts: only the firmware-image note the run always adds.
+        self.assertTrue(gen.call_args.kwargs["device_facts"].startswith("FIRMWARE_IMAGE: no real firmware image"))
         self.assertEqual(result["failed"], 0)
 
 

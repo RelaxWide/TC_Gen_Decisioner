@@ -31,6 +31,18 @@ TC_GENERATION_WORKERS = 5
 # in flight for 120 of them. Results are still read in order; generation of
 # a command found unsupported mid-run is cancelled if not started yet.
 TC_GENERATION_LOOKAHEAD = 12
+# One LLM call may take this long (seconds) with this many transport retries.
+# The client had no timeout, so the OpenAI library's defaults applied - 600 s
+# per attempt plus 2 retries: one stuck call could hold a target ~30 minutes
+# (2026-11-06: slowest scenario call 920 s; p99 133 s, args p99 44 s).
+LLM_CALL_TIMEOUT_SEC = 300
+LLM_CALL_TRANSPORT_RETRIES = 1
+# The main loop gives up on one target's generation after this long, skips it
+# with a reason and moves on (2026-11-10: a run sat silent after a TC's
+# review line while the next target's generation waited on the LLM).
+TC_PREPARE_WAIT_SEC = 1200
+# ...and says it is waiting every this many seconds meanwhile.
+TC_WAIT_NOTICE_SEC = 60
 # The same LLM, in an auditor role, adds review reasons to PASS/FAIL TCs.
 REVIEW_AUDIT_WITH_LLM = True
 INGEST_STATE_QST_PATH = DATA_DIR / "ingest_state_qst.json"
@@ -126,6 +138,37 @@ def pmu_status():
     if pmu.get("run_on", "target") not in ("local", "target"):
         return None, f"pmu.run_on={pmu.get('run_on')!r} (target 또는 local)"
     return None, "PMU 설정을 읽지 못함"
+
+
+# Where the firmware image is copied on the target host for the full-image download.
+FIRMWARE_REMOTE_DIR = "/tmp/tc_gen_fw"
+
+
+def firmware_image_status():
+    """(image or None, why there is none) from secrets.local.json "firmware":
+    {"image": "<file in the project folder, or an absolute path>",
+    "xfer_bytes": <optional nvme fw-download --xfer>}. Without a real image
+    every Firmware Image Download sends zero-filled dummy data, so a Commit
+    that replaces or activates an image can only be rejected."""
+    import hashlib
+    try:
+        fw = _load_secrets().get("firmware") or {}
+    except Exception:  # noqa: BLE001
+        return None, "secrets.local.json 없음"
+    name = fw.get("image")
+    if not name:
+        return None, "secrets.local.json에 firmware.image 없음"
+    path = Path(name) if Path(name).is_absolute() else BASE_DIR / name
+    if not path.is_file():
+        return None, f"{path} 없음"
+    data = path.read_bytes()
+    if not data or len(data) % 4:
+        # Firmware Image Download moves dwords (NUMD/OFST); nvme fw-download
+        # refuses such a file too.
+        return None, f"{path.name}: 크기 {len(data)}바이트가 4의 배수가 아님"
+    return {"name": path.name, "path": str(path), "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(), "remote": f"{FIRMWARE_REMOTE_DIR}/{path.name}",
+            "xfer_bytes": int(fw["xfer_bytes"]) if fw.get("xfer_bytes") else None}, ""
 
 
 def get_ssh_target():
