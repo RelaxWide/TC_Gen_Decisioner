@@ -202,7 +202,10 @@ class TestMidrunReview(unittest.TestCase):
         target = {"kind": "shall", "requirement_id": "t-dslba", "text": quote}
         contract = {"version": VERSION, "requirements": [req], "precondition_checks": [],
                     "evidence": [{"evidence_id": "e", "text": quote}], "target_requirement": target}
-        _bind_target_requirement(contract, [{"opcode_name": "Get LBA Status"}], 0, target)
+        # Plan time: a success-only check does not read DSLBA (follow-up review).
+        with self.assertRaisesRegex(ValueError, "not observed"):
+            _bind_target_requirement(contract, [{"opcode_name": "Get LBA Status"}], 0, target)
+        req["target_requirement_id"] = "t-dslba"  # as a plan validated before the rule would be
         tc = {"uses_placeholder_args": False, "scenario": {"preconditions": []}, "verification_contract": contract,
               "steps": [{"name": "Get LBA Status", "phase": "action", "expected_status": "INVALID_OPCODE"}]}
         execution = {"step_results": [{"step_index": 0, "exit_code": 1,
@@ -340,6 +343,121 @@ class TestPowerCycleOffer(unittest.TestCase):
             out = ssh_runner.probe_device_capabilities("/dev/nvme0", "/dev/nvme0n1", "/opt/pmu dir/pmu_4_1.py")
         self.assertEqual(out["pmu_script"], "PMU_SCRIPT_MISSING")
         self.assertIn("'/opt/pmu dir/pmu_4_1.py'", plink.call_args_list[-1].args[1])
+
+
+
+class TestFollowUpReview(unittest.TestCase):
+    """Follow-up review (2026-11-10) of the fixes above."""
+    DSLBA = ("The Descriptor Starting LBA (DSLBA) field in the first LBA Status Descriptor Entry returned in the "
+             "LBA Status Descriptor List shall contain the lowest numbered LBA that is greater than or equal to "
+             "the value specified in the Starting LBA field in the Get LBA Status command.")
+
+    def _verify(self, text, steps, checks, outcomes):
+        from tc_system.verification import VERSION
+        req = {"description": "d", "quote": text, "evidence_id": "e", "checks": checks,
+               "target_requirement_id": "t"}
+        contract = {"version": VERSION, "requirements": [req], "precondition_checks": [],
+                    "evidence": [{"evidence_id": "e", "text": text}],
+                    "target_requirement": {"kind": "shall", "requirement_id": "t", "text": text}}
+        tc = {"uses_placeholder_args": False, "scenario": {"preconditions": []}, "verification_contract": contract,
+              "steps": steps}
+        execution = {"step_results": [dict({"step_index": i, "started": True}, **o) for i, o in enumerate(outcomes)]}
+        return verify_tc(tc, execution)
+
+    OK = {"exit_code": 0, "stdout": "Admin Command X is Success and result: 0x00000000"}
+    REFUSED = {"exit_code": 1, "stdout": "NVMe status: INVALID_OPCODE: Invalid Command Opcode(0x1)"}
+
+    def test_success_alone_does_not_judge_a_value_sentence(self):
+        out = self._verify(self.DSLBA, [{"name": "Get LBA Status", "phase": "action"}],
+                           [{"kind": "completion", "step": 0}], [self.OK])
+        self.assertEqual(out["requirements"][0]["status"], "UNVERIFIED")
+        self.assertIn("성공 완료만", out["requirements"][0]["unobserved"])
+
+    def test_an_unrelated_success_after_a_planned_refusal_does_not_judge_it(self):
+        steps = [{"name": "Get LBA Status", "phase": "action", "expected_status": "INVALID_OPCODE"},
+                 {"name": "Identify", "phase": "verify"}]
+        out = self._verify(self.DSLBA, steps, [{"kind": "completion", "step": 0}, {"kind": "completion", "step": 1}],
+                           [self.REFUSED, self.OK])
+        self.assertEqual(out["requirements"][0]["status"], "UNVERIFIED")
+        self.assertIn("거부되도록 계획", out["requirements"][0]["unobserved"])
+
+    def test_a_sentence_about_the_completion_is_judged_by_it(self):
+        text = "a) shall complete successfully if a sanitize operation is not in progress; and"
+        out = self._verify(text, [{"name": "Sanitize", "phase": "action"}], [{"kind": "completion", "step": 0}],
+                           [self.OK])
+        self.assertEqual(out["requirements"][0]["status"], "PASS")
+
+    def test_a_sentence_naming_its_error_is_a_rejection_rule(self):
+        from tc_system.verification import _REJECTION_TEXT_RE
+        self.assertTrue(_REJECTION_TEXT_RE.search(
+            "Ignore Existing Key (IEKEY): If this bit is set to '1', then the controller shall return an error of "
+            "Invalid Field in Command."))
+        self.assertFalse(_REJECTION_TEXT_RE.search(self.DSLBA))
+
+    def test_the_plan_is_refused_before_anything_is_sent(self):
+        from tc_system.verification import _bind_target_requirement
+        target = {"kind": "shall", "requirement_id": "t", "text": self.DSLBA}
+        planned_refusal = {"requirements": [{"quote": self.DSLBA, "checks": [{"kind": "completion", "step": 1}]}]}
+        with self.assertRaisesRegex(ValueError, "not observed"):
+            _bind_target_requirement(planned_refusal, [{"opcode_name": "Get LBA Status", "expected_status": "INVALID_OPCODE"},
+                                                       {"opcode_name": "Identify"}], 0, target)
+        reads_it = {"requirements": [{"quote": self.DSLBA, "checks": [
+            {"kind": "data_field", "step": 0, "offset": 8, "width": 8, "mask": "0xFFFFFFFFFFFFFFFF", "value": 0,
+             "operator": "ge"}]}]}
+        _bind_target_requirement(reads_it, [{"opcode_name": "Get LBA Status"}], 0, target)
+        self.assertEqual(reads_it["requirements"][0]["target_requirement_id"], "t")
+
+    def test_no_lba_size_no_buffer_checks_past_what_surely_moved(self):
+        from tc_system.verification import evaluate_check
+        read = step(name="Read", mode="io-passthru", device="/dev/nvme0n1", opcode="0x02", nsid=1, cdw12="0x3",
+                    data_len=4096, direction="read")  # NLB 4 blocks: at least 2048 bytes moved
+        dump = "\n".join(f"{o:04x}: " + " ".join("00" for _ in range(16)) for o in range(0, 4096, 16))
+        results = {0: {"step_index": 0, "started": True, "exit_code": 0,
+                       "stdout": f"IO Command Read is Success and result: 0x00000000\n{dump}"}}
+        whole = evaluate_check({"kind": "data_all", "step": 0, "value": 0}, [read], results)
+        self.assertEqual(whole["result"], "unevaluated")
+        late = evaluate_check({"kind": "data_field", "step": 0, "offset": 3000, "width": 4, "mask": "0xFFFFFFFF",
+                               "value": 0}, [read], results)
+        self.assertEqual(late["result"], "unevaluated")
+        early = evaluate_check({"kind": "data_field", "step": 0, "offset": 100, "width": 4, "mask": "0xFFFFFFFF",
+                                "value": 0}, [read], results)
+        self.assertEqual(early["result"], "satisfied")  # inside the first 4 x 512 bytes
+        measured = evaluate_check({"kind": "data_all", "step": 0, "value": 0}, [dict(read, lba_bytes=1024)], results)
+        self.assertEqual(measured["result"], "satisfied")
+
+    def test_an_interrupted_power_cycle_powers_the_drive_back_on(self):
+        import tempfile
+        from pathlib import Path
+        from tc_system.execution import ssh_runner
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        pmu = {"enabled": True, "run_on": "local", "script": str(Path(tmp.name) / "pmu_4_1.py"), "remove": "none"}
+        calls = []
+
+        class Proc:
+            returncode, stdout, stderr = 0, "PCIE_EP=0000:02:00.0 PCIE_ROOT=0000:00:01.1", ""
+
+        def fake_pmu(p, what, timeout=30):
+            calls.append(what)
+            return 0, "", {"stage": what, "command": what}
+
+        with mock.patch.object(config, "SSH_COMMAND_LOG_PATH", Path(tmp.name) / "ssh.jsonl"), \
+             mock.patch.object(config, "get_ssh_target", lambda: {"host": "h", "user": "u", "password": "p"}), \
+             mock.patch.object(config, "get_pmu", lambda: pmu), \
+             mock.patch.object(ssh_runner, "_plink", return_value=Proc()), \
+             mock.patch.object(ssh_runner, "_run_local_pmu", side_effect=fake_pmu), \
+             mock.patch.object(ssh_runner.time, "sleep", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                ssh_runner.run_host_action("power_cycle", "/dev/nvme0")
+        self.assertEqual(calls, ["off", "on"])
+
+    def test_the_target_host_script_powers_on_when_its_session_is_cut(self):
+        from tc_system.execution.host_actions import host_action_command
+        pmu = {"enabled": True, "run_on": "target", "script": "/opt/pmu_4_1.py"}
+        command, _ = host_action_command("power_cycle", "/dev/nvme0", pmu)
+        trap, off = command.index("trap \"python3 /opt/pmu_4_1.py 4 1 3300"), command.index("pmu_4_1.py 7 1")
+        self.assertLess(trap, off)  # armed before the power goes off
+        self.assertIn("trap - HUP INT TERM", command[command.rindex("POWER_ON_RC"):])
 
 
 if __name__ == "__main__":

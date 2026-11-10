@@ -137,6 +137,14 @@ def _target_block(target: dict) -> str:
     if target.get("kind") == "abort" and target.get("expected_status"):
         lines.append(f"  This is an abort rule: build a chain that creates its condition, and give the action "
                      f"expected_status={target['expected_status']}.")
+    from tc_system.verification import _REJECTION_TEXT_RE
+    if target.get("kind") not in ("abort", "variant") and not _REJECTION_TEXT_RE.search(target.get("text", "")):
+        # The same rule the plan check and verify_tc apply (_target_unobserved).
+        lines.append("  This sentence is not about a rejection: the action must expect SUCCESS (if the drive does not "
+                     "implement it, that is recorded as UNSUPPORTED), and the requirement quoting it must READ what "
+                     "the sentence is about (data_field/result_bits/data_equal/data_matches_write/data_all on the "
+                     "action or a later step). A completion check only shows the command succeeded - enough only "
+                     "when the sentence is about the completion itself.")
     if target.get("host_steps"):
         options = " or ".join(repr(n) for n in target["host_steps"])
         lines.append(f"  This sentence is about state across a reset/power cycle: the chain MUST perform it with a "

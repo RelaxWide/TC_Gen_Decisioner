@@ -65,7 +65,7 @@
    - 기대 완료 상태가 (SCT, SC) 코드로 풀리지 않는 이름(어느 스텝이든 SUCCESS가 아니면): 이름으로만 비교하면 같은 코드의 다른 철자가 "위반"이 된다(2026-11-06: READ_ERROR 2/81h vs UNRECOVERED_ERROR). 오류에 가까운 상태 이름을 제안한다.
    - 고정 필드·`payload_hex` 형식 오류(필드 이름, mask/value 모순, hex 아님).
    - 요구사항: 없음, 설명/검증식 없음, 인용이 근거에 없음(번역·의역·의미 반전), action을 확인하는 요구사항이 하나도 없음, 검증식 형식 오류.
-   - 타겟 요구사항: 그 문장을 인용하는 요구사항이 없음, 거부 규칙인데 action의 기대 상태가 그 상태가 아님, 리셋/전원 사이클 전후 문장인데 호스트 스텝이 없거나 요구사항이 그 스텝 뒤를 확인하지 않음.
+   - 타겟 요구사항: 그 문장을 인용하는 요구사항이 없음, 거부 규칙인데 action의 기대 상태가 그 상태가 아님, 리셋/전원 사이클 전후 문장인데 호스트 스텝이 없거나 요구사항이 그 스텝 뒤를 확인하지 않음. **그 문장을 관측하지 않음**(`verification._target_unobserved`, 실행 후 판정과 같은 규칙): 거부를 말하지 않는 문장인데 action을 거부되도록 계획함(미지원이면 SUCCESS를 기대하고 보내야 UNSUPPORTED로 남음), 또는 완료 상태만 확인함 — 완료 확인은 action 자신의 것이고 문장이 완료 자체를 말할 때("complete successfully", "post a completion queue entry", "shall be ignored", "shall not return this status", "shall succeed/be supported")만 관측으로 친다. 값을 말하는 문장(DSLBA, STC, FB 등)은 action이나 그 뒤 스텝의 data_field/result_bits/data_* 검사가 있어야 한다. 2026-11-06 시나리오 응답 재검증 기준 최종 통과 218 → 184/329(줄어든 34개는 PASS여도 그 문장의 판정이 아니었음).
    - 데이터 비교: 쓰기 비교인데 상대가 쓰기가 아님/0이 아닌 패턴 없음, 읽는 LBA가 쓴 범위 밖, LBA와 비-LBA 비교, 스스로 바뀌는 로그(LID 02h/03h) 전체 비교.
    - 반환 레이아웃: Get Features 완료 DW0의 정의되지 않은(예약) 비트 검사, SEL=011b 결과에서 bits 2:0 밖 검사.
    - 사전조건/메모가 배열이 아님, 사전조건 검증식 형식 오류.

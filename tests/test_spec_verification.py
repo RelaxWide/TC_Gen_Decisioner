@@ -1004,6 +1004,8 @@ class TestHostEventTargets(unittest.TestCase):
     def test_record_reset_read_back_is_accepted(self):
         plan = self._plan([self._log("setup"), {"opcode_name": "Controller Reset", "phase": "setup"},
                            self._log("action")], 2)
+        # Retention is the log read back equal to the one recorded before the reset.
+        plan["requirements"][0]["checks"] = [{"kind": "data_equal", "step": 2, "other_step": 0}]
         self.assertEqual(self._validate(plan)["requirements"][0]["target_requirement_id"], "sreq-h")
 
     def test_the_prompt_tells_the_model_to_use_it(self):

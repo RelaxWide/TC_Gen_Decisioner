@@ -187,6 +187,9 @@ def host_action_script(action: str, nvme_ctrl: str, pmu: dict | None) -> tuple[s
         remove_cmd = (f"echo 1 > /sys/bus/pci/devices/{target}/remove 2>/dev/null; echo REMOVED={target}; "
                       if target else "")
         body = (pcie_locate_script(nvme_ctrl)
+                # Interrupted between OFF and ON (Ctrl+C kills plink, the
+                # session closes, bash gets HUP): power back on before exiting.
+                + f"trap \"python3 {script} {on}; exit 95\" HUP INT TERM; "
                 # A failed OFF is no power loss: power back on in case it half
                 # worked, and stop with a PMU error (not 98, which means the
                 # drive never came back) so nothing after it is judged.
@@ -194,7 +197,7 @@ def host_action_script(action: str, nvme_ctrl: str, pmu: dict | None) -> tuple[s
                 + f"if [ $off -ne 0 ]; then python3 {script} {on}; exit 96; fi; "
                 + remove_cmd
                 + f"sleep {off_wait}; "
-                + f"python3 {script} {on}; rc=$?; echo POWER_ON_RC=$rc; "
+                + f"python3 {script} {on}; rc=$?; echo POWER_ON_RC=$rc; trap - HUP INT TERM; "
                 + "[ $rc -eq 0 ] || exit $rc; "
                 + f"sleep {rescan_delay}; "
                 + _wait_ready(nvme_ctrl, boot_wait, rescan=True))

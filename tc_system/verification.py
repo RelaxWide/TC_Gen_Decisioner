@@ -777,6 +777,11 @@ def _bind_target_requirement(structured, steps, action, target):
     for req in matched:
         req["target_requirement_id"] = target["requirement_id"]
     _require_host_event(steps, matched, target)
+    reasons = [_target_unobserved(r, target, steps) for r in matched]
+    if all(reasons):
+        raise ValueError(f"TARGET_REQUIREMENT is not observed: {reasons[0]}. The requirement quoting it must read "
+                         "what the sentence is about (a data_field/result_bits/data_* check on the action or a later "
+                         "step), with the action expected to succeed unless the sentence itself is about a rejection")
     if target.get("kind") == "abort" and target.get("expected_status"):
         want = canonical_status(target["expected_status"])
         if canonical_status(steps[action].get("expected_status")) != want:
@@ -1224,6 +1229,25 @@ def validate_fixed_fields(step, constraints):
                              f"must satisfy mask={c['mask']} value={c['value']}")
 
 
+_NVM_DATA_OPCODES = {0x01, 0x02, 0x05}  # Write, Read, Compare
+
+
+def _bytes_surely_moved(step):
+    """None when the transfer size is known (not an NVM Read/Write/Compare, or
+    the LBA size was measured). Otherwise the bytes the device moved for
+    certain: (NLB + 1) x 512, the smallest LBA size (LBADS >= 9). The buffer
+    is sized from a guess, so a check past that reads bytes the device may
+    never have written (follow-up review: data_all/data_field still judged)."""
+    if step.get("mode") != "io-passthru" or step.get("lba_bytes"):
+        return None
+    try:
+        if integer(step.get("opcode", "0x0")) not in _NVM_DATA_OPCODES:
+            return None
+        return ((integer(step.get("cdw12", "0x0")) & 0xFFFF) + 1) * 512
+    except ValueError:
+        return 0
+
+
 def evaluate_check(check, steps, results):
     observed, expected = None, None
     try:
@@ -1258,6 +1282,14 @@ def evaluate_check(check, steps, results):
                 data = decode_payload(result)
                 if data is None:
                     raise ValueError("response bytes were not captured")
+                moved = _bytes_surely_moved(step)
+                if kind == "data_all" and moved is not None and len(data) > moved:
+                    raise ValueError(f"LBA 크기가 측정되지 않아 앞 {moved}바이트만 확실히 전송됨 — 버퍼 전체 검사"
+                                     "(data_all)는 하지 않음")
+                if kind == "data_field" and moved is not None \
+                        and integer(check["offset"]) + integer(check["width"]) > moved:
+                    raise ValueError(f"LBA 크기가 측정되지 않아 앞 {moved}바이트만 확실히 전송됨 — 그 뒤의 필드는 "
+                                     "읽지 않음")
                 if kind == "data_all":
                     # "every byte" is about the whole buffer: a short capture
                     # (one zero byte for a 512-byte read) proves nothing.
@@ -1297,8 +1329,7 @@ def evaluate_check(check, steps, results):
                         # The buffer is NLB x LBA size; without the size the
                         # device may have moved fewer bytes than the buffer
                         # (2026-11-06: 4 blocks into 4096 B, "differs from 2048").
-                        if s.get("mode") == "io-passthru" and s.get("opcode", "").lower() in ("0x01", "0x02", "0x05") \
-                                and not s.get("lba_bytes"):
+                        if _bytes_surely_moved(s) is not None:
                             raise ValueError("LBA 크기가 측정되지 않아 장치가 실제로 옮긴 범위를 알 수 없음 — 비교하지 않음")
                     other = _compared_slice(data, other, window)
                     # Equality on the full bytes; only a summary is stored. The
@@ -1494,38 +1525,77 @@ def _premise_refuted(req, checks, steps, results, conditions=()):
     return None
 
 
-# A sentence that is itself about a rejection or about unsupported values.
-_REJECTION_TEXT_RE = re.compile(r"\babort|not (?:be )?support|unsupported|status code|shall fail|reject", re.I)
+# A sentence that is itself about a rejection or about unsupported values,
+# including one that names the error it returns ("IEKEY ... shall return an
+# error of Invalid Field in Command").
+_REJECTION_TEXT_RE = re.compile(
+    r"\babort|not (?:be )?support|unsupported|status code|shall fail|reject"
+    r"|\b(?:return|report|post|complete)s?\b[^.]{0,40}\b(?:an? )?error\b"
+    r"|\binvalid (?:field|namespace|command|log|format|queue|parameter|controller|firmware|interrupt|number|sgl"
+    r"|use|prot|prp|resource|size|port)|command sequence error|not (?:saveable|changeable)"
+    r"|lba out of range|capacity exceeded|access denied|conflicting attributes", re.I)
+# A sentence whose observable is the completion itself: "shall complete
+# successfully", "post a completion queue entry", "shall be ignored by the
+# controller" (accepted, not refused), "shall not return this status value",
+# "shall succeed", "shall be supported".
+_COMPLETION_TEXT_RE = re.compile(
+    r"\bcomplet|\bsuccess|\bsucceed|completion queue entry|shall (?:be )?(?:process|execut|accept)"
+    r"|\bignored?\b|shall not return|shall (?:be )?support", re.I)
 
 
 def _target_unobserved(req, target, steps):
-    """The requirement quotes the target sentence, but observed only that the
-    command/log/feature was refused: the value the sentence is about was never
-    returned (review 2026-11-06 midrun §2: a DSLBA rule, an ANA Change Count
-    rollover, NRUH non-zero - each PASS on INVALID_OPCODE/INVALID_LOG_PAGE and
-    counted as a judged target). The refusal stays a fact about the drive
-    (UNSUPPORTED / unsupported-in-run); it is not this sentence's verdict."""
+    """Why a requirement that quotes the target sentence did not observe what
+    the sentence is about, or None. Planned statuses only, so the plan check
+    and verify_tc use the same rule.
+
+    - Only a refusal was looked at (review 2026-11-06 midrun §2: a DSLBA rule,
+      an ANA Change Count rollover, NRUH non-zero - each PASS on
+      INVALID_OPCODE/INVALID_LOG_PAGE). The refusal stays a fact about the
+      drive (UNSUPPORTED / unsupported-in-run); it is not this sentence's verdict.
+    - The action is planned to be refused for a sentence that is not about a
+      refusal: whatever else the chain checks (a later Identify succeeding)
+      does not observe the sentence (follow-up review: an unsupported action
+      plus an unrelated Identify check passed).
+    - Only "it completed successfully" was looked at for a sentence about a
+      value (follow-up review: DSLBA never read, PASS and judged). A sentence
+      about the completion itself ("shall complete successfully", "post a
+      completion queue entry") is observed by the action's completion."""
     if not req.get("target_requirement_id") or target.get("kind") in ("abort", "variant"):
         return None
-    if _REJECTION_TEXT_RE.search(plain_text(target.get("text", ""))):
+    text = plain_text(target.get("text", ""))
+    if _REJECTION_TEXT_RE.search(text):
         return None
     checks = [c for c in req.get("checks") or [] if isinstance(c, dict)]
+    if not checks:
+        return None
     action = next((i for i, s in enumerate(steps) if s.get("phase") == "action"), 0)
-    observing = []
+    about_completion = bool(_COMPLETION_TEXT_RE.search(text))
+    if expected_status(steps[action]) != "SUCCESS" and not about_completion:
+        return (f"타겟 문장은 거부를 말하지 않는데 action이 {expected_status(steps[action])}로 거부되도록 계획됨 — "
+                "거부 응답이나 다른 스텝의 확인은 이 문장을 관측하지 않음(미지원이면 SUCCESS를 기대하고 보내야 "
+                "UNSUPPORTED로 남음)")
+    observing, completion_only = [], False
     for c in checks:
         try:
             i = integer(c.get("step"))
         except ValueError:
             continue
-        if i < action:
-            continue  # a support-table read before the action is a premise
-        if c.get("kind") == "completion" and expected_status(steps[i]) != "SUCCESS":
-            continue
+        if i < action or c.get("kind") in SELF_REFERENCE_KINDS:
+            continue  # a support-table read before the action is a premise; data_length reads our request
+        if c.get("kind") == "completion":
+            completion_only = True
+            if not (about_completion and i == action):
+                # "It succeeded" is not the value the sentence is about, and
+                # another step's completion says nothing about the action.
+                continue
         observing.append(c)
-    if checks and not observing:
-        return ("타겟 문장이 말하는 값을 관측하지 않음 — 미지원/거부 응답만 확인(그 사실은 TC 결과로 남고 "
-                "이 문장의 판정은 아님)")
-    return None
+    if observing:
+        return None
+    if completion_only:
+        return ("타겟 문장이 말하는 값을 읽지 않음 — 성공 완료만 확인(문장이 말하는 필드·데이터·CQE 값을 "
+                "action이나 그 뒤 스텝에서 읽는 검증식이 필요)")
+    return ("타겟 문장이 말하는 값을 관측하지 않음 — 미지원/거부 응답만 확인(그 사실은 TC 결과로 남고 "
+            "이 문장의 판정은 아님)")
 
 
 def verify_tc(tc, execution):

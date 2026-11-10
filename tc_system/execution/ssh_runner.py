@@ -404,10 +404,20 @@ def _local_power_cycle(nvme_ctrl: str, pmu: dict, target: dict, log_record: dict
         # stop with a PMU error so nothing after it is judged.
         pmu_cmd("on")
         return result(96)
-    if bdf:
-        remote(ha.pcie_remove_command(bdf), "host_power_cycle_remove", 30)
-    time.sleep(off_wait)
-    on = pmu_cmd("on")
+    try:
+        if bdf:
+            remote(ha.pcie_remove_command(bdf), "host_power_cycle_remove", 30)
+        time.sleep(off_wait)
+        on = pmu_cmd("on")
+    except BaseException:
+        # Ctrl+C in the discharge wait, an SSH error on the remove: the drive
+        # must not be left without power (review: interrupted after OFF, no ON).
+        out.append("POWER_ON_AFTER_INTERRUPT")
+        try:
+            pmu_cmd("on")
+        except BaseException:  # noqa: BLE001 - the original interruption is what the caller sees
+            pass
+        raise
     out.append(f"POWER_ON_RC={on}")
     if on != 0:
         return result(97)
