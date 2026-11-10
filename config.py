@@ -23,7 +23,14 @@ RUN_MANIFESTS_DIR = DATA_DIR / "run_manifests"
 # Scenario/argument generation for upcoming targets runs this many at a time
 # while the device executes the current one (LLM time was 93% of a 294-minute
 # --all run, SSH 11 minutes). Execution itself stays strictly sequential.
-TC_GENERATION_WORKERS = 3
+TC_GENERATION_WORKERS = 5
+# How many targets ahead of the one executing are queued for generation. It
+# was the worker count (3): one slow target (a 90 s scenario, a retry) left
+# the other workers idle once the next two were ready - in the 2026-11-06 run
+# the main loop waited 215 of 284 minutes on generation while one call was
+# in flight for 120 of them. Results are still read in order; generation of
+# a command found unsupported mid-run is cancelled if not started yet.
+TC_GENERATION_LOOKAHEAD = 12
 # The same LLM, in an auditor role, adds review reasons to PASS/FAIL TCs.
 REVIEW_AUDIT_WITH_LLM = True
 INGEST_STATE_QST_PATH = DATA_DIR / "ingest_state_qst.json"

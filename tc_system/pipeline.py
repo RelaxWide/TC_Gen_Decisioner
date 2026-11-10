@@ -618,7 +618,7 @@ def _run_targets(targets, total, ctx, pool, futures, _ensure, unsupported_in_run
             if on_skip:
                 on_skip(i, total, section, opcode_entry, reason)
             continue
-        _ensure(i + max(workers or 1, 1))
+        _ensure(i + max(workers or 1, config.TC_GENERATION_LOOKAHEAD if pool else 1))
         future = futures.get(i - 1)
         if future is not None and future.cancelled():
             future = None

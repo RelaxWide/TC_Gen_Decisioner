@@ -280,6 +280,26 @@ class TestOneRunLearnsOnce(PipelineTestCase):
         self.assertEqual(started, [1, 2])
         self.assertEqual(result["executed"], 2)
 
+    def test_generation_is_queued_further_ahead_than_the_worker_count(self):
+        # 2026-11-06: the window was the worker count, so one slow target left
+        # the other workers idle (one call in flight for 120 of 284 minutes).
+        extra = [dict(SECTION_READ, section_id=f"nvm:1.{n}", clause=f"1.{n}") for n in (3, 4)]
+        index = dict(INDEX_JSON, sections=[SECTION_READ, SECTION_WRITE, SECTION_READ_SUBCLAUSE, *extra])
+        Path(config.active_coverage_index_path()).write_text(json.dumps(index), encoding="utf-8")
+        executor = _FakeExecutor([[_ok(0), _ok(1)]] * 5)
+        submitted, at_first_start = [], []
+        real_submit = pipeline._DaemonPool.submit
+
+        def submit(pool, fn, *args):
+            submitted.append(args[0]["section_id"])
+            return real_submit(pool, fn, *args)
+
+        with mock.patch.object(pipeline._DaemonPool, "submit", submit), \
+             mock.patch.object(config, "TC_GENERATION_LOOKAHEAD", 4):
+            pipeline.run_pipeline(count=5, executor=executor, allow_destructive=True, generation_workers=2,
+                                  on_start=lambda i, total, tc: at_first_start.append(len(submitted)) if i == 1 else None)
+        self.assertEqual(at_first_start, [5])  # all five queued before the first ran (was 3 = workers + 1)
+
     def test_every_tc_carries_its_run_and_a_review_and_the_run_has_a_manifest(self):
         self._run(_FakeExecutor([[_ok(0), _ok(1)]]))
         stored = json.loads(Path(config.TC_STORE_PATH).read_text(encoding="utf-8"))
